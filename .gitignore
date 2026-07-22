@@ -52,6 +52,11 @@ venv.bak/
 *.swo
 *~
 
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
 # Claude Code
 .claude/
 
