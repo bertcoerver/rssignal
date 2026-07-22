@@ -7,8 +7,8 @@ by shelling out to the [`signal-cli`](https://github.com/AsamK/signal-cli)
 command-line tool, so messages come from your own linked Signal account.
 
 > **Status:** early. Signal setup, message sending, feed parsing/sending, message
-> templates, and per-field filters work. De-duplication and the cloud service
-> (POST-triggered) come next.
+> templates, per-field filters, and link previews work. De-duplication and the
+> cloud service (POST-triggered) come next.
 
 ## Requirements
 
@@ -118,6 +118,10 @@ Each feed entry supports:
 | `max_age_hours`     | no       | Only send items published within this many hours.                      |
 | `max_age_days`      | no       | Added to `max_age_hours`. Omit both to send every item in the feed.    |
 | `message_template`  | no       | Message text with `{field}` placeholders. Omit for the built-in layout. |
+| `link_preview`      | no       | Send a link preview card. Defaults to on for `podcast`, off for `regular`. |
+| `preview_url`       | no       | Template for the card's link. Defaults to `{link}`.                    |
+| `preview_title`     | no       | Template for the card's title. Defaults to `{title}`.                  |
+| `preview_description` | no     | Template for the card's text. Defaults to the truncated description.   |
 | `<field>_contains`  | no       | Keep items whose field contains any of these terms.                    |
 | `<field>_excludes`  | no       | Drop items whose field contains any of these terms.                    |
 | `<field>_matches`   | no       | Keep items whose field matches any of these regexes.                   |
@@ -161,6 +165,7 @@ Fields for Some Podcast (item 1 of 25):
   published_date  2026-07-22
   enclosure_url   https://example.com/402.mp3
   enclosure_type  audio/mpeg
+  image_url       https://example.com/artwork.jpg
   author          Example Media
   categories      news, politics
   feed_name       Some Podcast
@@ -200,6 +205,37 @@ rssignal run --config other.json
 For `podcast` feeds the episode's audio enclosure is downloaded and sent with
 `signal-cli --voice-note`. Depending on the file's codec, Signal may show it as
 a regular audio attachment rather than an in-app voice note.
+
+### Link previews
+
+Podcast items also carry a link preview card — the episode title, a short
+description, and the artwork — so an episode is recognizable next to its voice
+note. Set `"link_preview": false` to turn it off, or `true` on a `regular` feed
+to turn it on.
+
+**A podcast episode with a card arrives as two messages:** the text and the card
+first, then the voice note on its own. Signal silently drops a preview card from
+any message that also has an attachment, so they cannot be combined. A podcast
+feed with `"link_preview": false` goes back to a single message.
+
+The card's artwork comes from `image_url`, which is the episode's own
+`<itunes:image>` or `<media:thumbnail>` when it has one and the show's artwork
+otherwise. It is downloaded per item; if that download fails the episode is still
+sent, just without the image.
+
+Signal requires the previewed URL to appear in the message body, so rssignal
+appends it if your template doesn't already include it. Many podcast feeds set
+each episode's `link` to the raw `.mp3`; point the card somewhere nicer with
+`preview_url`:
+
+```json
+"preview_url": "https://example.com/episodes",
+"preview_title": "🎧 {title} ({itunes_duration})"
+```
+
+All three `preview_*` keys take the same `{field}` placeholders as
+`message_template`. An item whose preview URL or title renders empty is sent
+without a card rather than failing.
 
 > **Note:** there is no de-duplication yet — running again while items are still
 > inside their `max_age` window resends them. Seen-tracking is the next milestone.

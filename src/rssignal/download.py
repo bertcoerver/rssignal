@@ -13,23 +13,28 @@ from urllib.request import urlopen
 from .feeds import FeedError
 
 
-def _suffix_for(url: str) -> str:
-    """Return a filename suffix for ``url`` (e.g. ``.mp3``), defaulting to .mp3."""
+def _suffix_for(url: str, default: str = ".mp3") -> str:
+    """Return a filename suffix for ``url`` (e.g. ``.mp3``), or ``default``."""
     path = urlparse(url).path
     _, dot, ext = path.rpartition(".")
     if dot and ext and len(ext) <= 5 and "/" not in ext:
         return "." + ext
-    return ".mp3"
+    return default
 
 
 @contextmanager
-def download_temp(url: str, *, timeout: float = 30) -> Iterator[str]:
+def download_temp(
+    url: str, *, timeout: float = 30, default_suffix: str = ".mp3"
+) -> Iterator[str]:
     """Download ``url`` to a temp file, yield its path, and delete it on exit.
+
+    ``default_suffix`` is used when the url has no usable extension; signal-cli
+    goes by the file name, so artwork downloads pass an image suffix.
 
     Raises :class:`FeedError` if the download fails. The file is always removed
     when the ``with`` block ends, whether or not sending succeeded.
     """
-    fd, path = tempfile.mkstemp(suffix=_suffix_for(url))
+    fd, path = tempfile.mkstemp(suffix=_suffix_for(url, default_suffix))
     try:
         # os.fdopen takes ownership of fd, closing it when ``out`` closes.
         with os.fdopen(fd, "wb") as out:

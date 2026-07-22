@@ -12,11 +12,14 @@ from .feeds import (
     item_fields,
     load_feeds,
     parse_feed,
+    preview_fields,
     render_message,
+    truncate,
 )
 from .run import run_feeds
 from .signal_cli import (
     AccountNotLinked,
+    LinkPreview,
     SignalCliNotFound,
     SignalError,
     SignalGroup,
@@ -45,6 +48,7 @@ __all__ = [
     "list_groups",
     "receive",
     "SignalGroup",
+    "LinkPreview",
     "is_account_registered",
     "SignalError",
     "SignalCliNotFound",
@@ -60,4 +64,6 @@ __all__ = [
     "apply_filters",
     "item_fields",
     "render_message",
+    "preview_fields",
+    "truncate",
 ]

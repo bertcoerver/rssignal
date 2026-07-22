@@ -35,6 +35,10 @@ KNOWN_KEYS = (
     "max_age_hours",
     "max_age_days",
     "message_template",
+    "link_preview",
+    "preview_url",
+    "preview_title",
+    "preview_description",
 )
 
 # The field names every item has, in the order item_fields lists them.
@@ -46,10 +50,17 @@ CORE_FIELDS = (
     "published_date",
     "enclosure_url",
     "enclosure_type",
+    "image_url",
     "author",
     "categories",
     "feed_name",
 )
+
+# Defaults for the link preview card, as {field} templates.
+DEFAULT_PREVIEW_URL = "{link}"
+DEFAULT_PREVIEW_TITLE = "{title}"
+# Preview descriptions render as a couple of lines on a card, not as a message.
+PREVIEW_DESCRIPTION_LIMIT = 200
 
 # Entry keys already mapped onto FeedItem, so they don't repeat in ``extra``.
 _MAPPED_ENTRY_KEYS = frozenset(
@@ -63,6 +74,8 @@ _MAPPED_ENTRY_KEYS = frozenset(
         "enclosures",
         "author",
         "tags",
+        "image",
+        "media_thumbnail",
     }
 )
 
@@ -95,6 +108,22 @@ class FeedConfig:
     max_age: timedelta | None = None
     message_template: str | None = None
     filters: tuple[FeedFilter, ...] = ()
+    link_preview: bool | None = None
+    preview_url: str | None = None
+    preview_title: str | None = None
+    preview_description: str | None = None
+
+    @property
+    def previews_enabled(self) -> bool:
+        """Whether items from this feed carry a Signal link preview.
+
+        Podcasts get one by default — the card is what makes an episode
+        recognizable next to its voice note. Regular feeds already show their
+        link in the body, so they opt in explicitly.
+        """
+        if self.link_preview is None:
+            return self.type == "podcast"
+        return self.link_preview
 
 
 @dataclass(frozen=True)
@@ -113,6 +142,7 @@ class FeedItem:
     published: datetime | None = None
     enclosure_url: str | None = None
     enclosure_type: str | None = None
+    image_url: str | None = None
     author: str | None = None
     categories: tuple[str, ...] = ()
     feed_name: str = ""
@@ -176,6 +206,17 @@ def _build_feed_config(raw: object, index: int) -> FeedConfig:
     if template is not None and not isinstance(template, str):
         raise FeedError(f"{where} message_template must be a string.")
 
+    link_preview = raw.get("link_preview")
+    if link_preview is not None and not isinstance(link_preview, bool):
+        raise FeedError(f"{where} link_preview must be true or false.")
+
+    previews = {}
+    for key in ("preview_url", "preview_title", "preview_description"):
+        value = raw.get(key)
+        if value is not None and not isinstance(value, str):
+            raise FeedError(f"{where} {key} must be a string.")
+        previews[key] = value
+
     return FeedConfig(
         url=url,
         type=feed_type,
@@ -184,6 +225,8 @@ def _build_feed_config(raw: object, index: int) -> FeedConfig:
         max_age=max_age,
         message_template=template,
         filters=_build_filters(raw, where),
+        link_preview=link_preview,
+        **previews,
     )
 
 
@@ -233,10 +276,26 @@ def parse_feed(cfg: FeedConfig) -> list[FeedItem]:
         raise FeedError(f"Could not read feed {cfg.url!r}: {exc}")
 
     feed_name = cfg.name or ""
-    return [_build_feed_item(entry, feed_name) for entry in parsed.entries]
+    # Most podcasts set artwork once on the channel rather than per episode, so
+    # it stands in when an entry has no image of its own.
+    feed_image = _href(getattr(parsed, "feed", {}).get("image"))
+    return [
+        _build_feed_item(entry, feed_name, feed_image) for entry in parsed.entries
+    ]
 
 
-def _build_feed_item(entry: object, feed_name: str = "") -> FeedItem:
+def _href(value: object) -> str | None:
+    """Pull a URL out of a feedparser image/thumbnail mapping, if there is one."""
+    if not value:
+        return None
+    get = value.get if hasattr(value, "get") else lambda k, d=None: getattr(value, k, d)
+    url = get("href") or get("url")
+    return str(url) if url else None
+
+
+def _build_feed_item(
+    entry: object, feed_name: str = "", feed_image: str | None = None
+) -> FeedItem:
     """Map a single feedparser entry to a :class:`FeedItem`."""
     get = entry.get if isinstance(entry, dict) else lambda k, d=None: getattr(entry, k, d)
 
@@ -259,6 +318,13 @@ def _build_feed_item(entry: object, feed_name: str = "") -> FeedItem:
         enclosure_url = fget("href") or fget("url") or None
         enclosure_type = fget("type") or None
 
+    # Episode artwork: <itunes:image> lands in "image", media RSS in
+    # "media_thumbnail"; the channel's own artwork is the last resort.
+    thumbnails = get("media_thumbnail") or []
+    image_url = (
+        _href(get("image")) or _href(thumbnails[0] if thumbnails else None) or feed_image
+    )
+
     # feedparser exposes categories as tags: [{"term": "news", ...}, ...].
     categories = []
     for tag in get("tags") or []:
@@ -274,6 +340,7 @@ def _build_feed_item(entry: object, feed_name: str = "") -> FeedItem:
         published=published,
         enclosure_url=enclosure_url,
         enclosure_type=enclosure_type,
+        image_url=image_url,
         author=get("author") or None,
         categories=tuple(categories),
         feed_name=feed_name,
@@ -374,6 +441,7 @@ def item_fields(item: FeedItem) -> dict[str, str]:
         "published_date": item.published.strftime("%Y-%m-%d") if item.published else "",
         "enclosure_url": item.enclosure_url or "",
         "enclosure_type": item.enclosure_type or "",
+        "image_url": item.image_url or "",
         "author": item.author or "",
         "categories": ", ".join(item.categories),
         "feed_name": item.feed_name,
@@ -423,26 +491,94 @@ class _DefaultingFields(dict):
         return ""
 
 
+def _render_template(template: str, item: FeedItem, cfg: FeedConfig, what: str) -> str:
+    """Fill ``{field}`` placeholders in ``template`` from ``item``.
+
+    ``what`` names the config key, so a malformed template says which one.
+    """
+    try:
+        return template.format_map(_DefaultingFields(item_fields(item)))
+    except (ValueError, IndexError) as exc:
+        label = cfg.name or cfg.url
+        raise FeedError(f"{what} for feed {label!r} is malformed: {exc}") from exc
+
+
+def truncate(text: str, limit: int) -> str:
+    """Shorten ``text`` to ``limit`` characters, cutting at a word boundary."""
+    if len(text) <= limit:
+        return text
+    # One character is reserved for the ellipsis. Only drop a trailing partial
+    # word — if the cut lands on a space, the last word is whole already.
+    cut = text[: limit - 1]
+    if not text[limit - 1].isspace():
+        head, sep, _ = cut.rpartition(" ")
+        if sep:
+            cut = head
+    return cut.rstrip() + "…"
+
+
+def preview_fields(item: FeedItem, cfg: FeedConfig) -> dict[str, str] | None:
+    """Return the link-preview card for ``item``, or ``None`` for no preview.
+
+    The card is rendered from the same fields as message templates, so anything
+    ``rssignal fields`` lists can go in it. ``image_url`` is the *remote* URL —
+    signal-cli wants a local file, so :mod:`rssignal.run` downloads it.
+
+    Returns ``None`` when previews are off for this feed, or when the url or
+    title render empty: signal-cli requires both, and a card with no title is
+    not worth sending.
+    """
+    if not cfg.previews_enabled:
+        return None
+
+    url = _render_template(
+        cfg.preview_url or DEFAULT_PREVIEW_URL, item, cfg, "preview_url"
+    ).strip()
+    title = _render_template(
+        cfg.preview_title or DEFAULT_PREVIEW_TITLE, item, cfg, "preview_title"
+    ).strip()
+    if not url or not title:
+        return None
+
+    if cfg.preview_description is None:
+        description = truncate(item.description, PREVIEW_DESCRIPTION_LIMIT)
+    else:
+        description = _render_template(
+            cfg.preview_description, item, cfg, "preview_description"
+        ).strip()
+
+    return {
+        "url": url,
+        "title": title,
+        "description": description,
+        "image_url": item.image_url or "",
+    }
+
+
 def render_message(item: FeedItem, cfg: FeedConfig) -> str:
     """Build the Signal message text for ``item`` under ``cfg``.
 
     Without a ``message_template`` this is the built-in layout from
     :func:`format_message`. With one, ``{field}`` placeholders are filled from
     :func:`item_fields`.
+
+    When the feed sends a link preview, the preview url is appended unless the
+    text already contains it — signal-cli requires the url to appear in the body,
+    and the built-in podcast layout has no link at all.
     """
     if cfg.message_template is None:
-        return format_message(item, cfg.type)
+        text = format_message(item, cfg.type)
+    else:
+        text = _render_template(
+            cfg.message_template, item, cfg, "message_template"
+        )
+        # Placeholders that resolved to nothing would otherwise leave blank gaps.
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
 
-    try:
-        text = cfg.message_template.format_map(_DefaultingFields(item_fields(item)))
-    except (ValueError, IndexError) as exc:
-        label = cfg.name or cfg.url
-        raise FeedError(
-            f"message_template for feed {label!r} is malformed: {exc}"
-        ) from exc
-
-    # Placeholders that resolved to nothing would otherwise leave blank gaps.
-    return re.sub(r"\n{3,}", "\n\n", text).strip()
+    preview = preview_fields(item, cfg)
+    if preview and preview["url"] not in text:
+        text = f"{text}\n\n{preview['url']}".strip()
+    return text
 
 
 def format_message(item: FeedItem, feed_type: str) -> str:

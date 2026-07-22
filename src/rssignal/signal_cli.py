@@ -63,6 +63,31 @@ class SignalSendError(SignalError):
         super().__init__(message)
 
 
+@dataclass(frozen=True)
+class LinkPreview:
+    """The card Signal shows for a link, mirroring signal-cli's preview flags.
+
+    ``url`` must also appear in the message body — signal-cli rejects a preview
+    whose url is not in the text. ``title`` is mandatory; ``description`` and
+    ``image`` are optional and omitted when empty. ``image`` is a **local file
+    path**, not a URL: whoever builds the preview downloads the artwork first.
+
+    Signal renders the card from these values rather than fetching the url, so a
+    preview pointing at a media file still shows properly.
+    """
+
+    url: str
+    title: str
+    description: str = ""
+    image: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.url:
+            raise ValueError("A link preview needs a url.")
+        if not self.title:
+            raise ValueError("A link preview needs a title; signal-cli requires it.")
+
+
 def find_signal_cli() -> str:
     """Return the path to the ``signal-cli`` binary, or raise :class:`SignalCliNotFound`."""
     path = shutil.which("signal-cli")
@@ -262,6 +287,7 @@ def send_msg(
     account: str | None = None,
     attachments: list[str] | None = None,
     voice_note: bool = False,
+    preview: LinkPreview | None = None,
     timeout: float = 120,
 ) -> None:
     """Send ``msg`` as a Signal message, optionally with attachments.
@@ -272,7 +298,8 @@ def send_msg(
     ``group:<base64 id>`` — run ``rssignal groups`` to list the ids.
 
     ``attachments`` is a list of local file paths to attach; ``voice_note``
-    flags a (single) audio attachment to be sent as a Signal voice note. The
+    flags a (single) audio attachment to be sent as a Signal voice note.
+    ``preview`` adds a link preview card, whose url must appear in ``msg``. The
     default ``timeout`` is generous because attachment uploads take longer than
     plain text.
 
@@ -304,6 +331,14 @@ def send_msg(
         argv.extend(attachments)
     if voice_note:
         argv.append("--voice-note")
+    if preview is not None:
+        # Each preview flag takes exactly one argument, so they are safe here:
+        # past --attachment's greedy list, and still ahead of the recipient.
+        argv.extend(["--preview-url", preview.url, "--preview-title", preview.title])
+        if preview.description:
+            argv.extend(["--preview-description", preview.description])
+        if preview.image:
+            argv.extend(["--preview-image", preview.image])
     argv.extend(["-m", msg])
     # Groups are addressed with -g rather than as a positional recipient.
     if recipient.startswith(GROUP_PREFIX):

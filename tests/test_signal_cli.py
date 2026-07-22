@@ -8,6 +8,7 @@ import pytest
 from rssignal import signal_cli
 from rssignal.signal_cli import (
     AccountNotLinked,
+    LinkPreview,
     SignalCliNotFound,
     SignalGroup,
     SignalSendError,
@@ -357,6 +358,97 @@ def test_send_msg_bare_group_id_raises(have_binary, monkeypatch):
     with pytest.raises(ValueError) as excinfo:
         send_msg("hi", recipient="AAAA1111bbbb=", account="+31600000000")
     assert "group:" in str(excinfo.value)
+
+
+# --- link previews ---------------------------------------------------------
+
+
+def _capture_argv(monkeypatch):
+    calls = {}
+
+    def fake_run(argv, **kwargs):
+        calls["argv"] = argv
+        return _completed(returncode=0)
+
+    monkeypatch.setattr(signal_cli.subprocess, "run", fake_run)
+    return calls
+
+
+def test_send_msg_with_full_preview(have_binary, monkeypatch):
+    calls = _capture_argv(monkeypatch)
+
+    send_msg(
+        "Episode 402\n\nhttps://a/402",
+        recipient="+31611111111",
+        account="+31600000000",
+        preview=LinkPreview(
+            url="https://a/402",
+            title="Episode 402",
+            description="Show notes",
+            image="/tmp/art.jpg",
+        ),
+    )
+
+    assert calls["argv"] == [
+        FAKE_BIN,
+        "-a",
+        "+31600000000",
+        "send",
+        "--preview-url",
+        "https://a/402",
+        "--preview-title",
+        "Episode 402",
+        "--preview-description",
+        "Show notes",
+        "--preview-image",
+        "/tmp/art.jpg",
+        "-m",
+        "Episode 402\n\nhttps://a/402",
+        "+31611111111",
+    ]
+
+
+def test_send_msg_omits_empty_preview_options(have_binary, monkeypatch):
+    calls = _capture_argv(monkeypatch)
+
+    send_msg(
+        "hi https://a/1",
+        recipient="+31611111111",
+        account="+31600000000",
+        preview=LinkPreview(url="https://a/1", title="One"),
+    )
+
+    assert "--preview-description" not in calls["argv"]
+    assert "--preview-image" not in calls["argv"]
+    assert "--preview-url" in calls["argv"]
+
+
+def test_send_msg_preview_with_voice_note_to_group(have_binary, monkeypatch):
+    calls = _capture_argv(monkeypatch)
+
+    send_msg(
+        "Episode https://a/402",
+        recipient="group:abc123=",
+        account="+31600000000",
+        attachments=["/tmp/ep.mp3"],
+        voice_note=True,
+        preview=LinkPreview(url="https://a/402", title="Ep", image="/tmp/art.jpg"),
+    )
+
+    argv = calls["argv"]
+    # The preview flags are fixed-arity and sit past --attachment's greedy list,
+    # so the mp3 isn't swallowed and -g still ends the line.
+    assert argv[argv.index("--attachment") + 1] == "/tmp/ep.mp3"
+    assert argv[-2:] == ["-g", "abc123="]
+    assert argv.index("--preview-url") > argv.index("--voice-note")
+    assert argv.index("--preview-image") < argv.index("-m")
+
+
+def test_link_preview_requires_a_url_and_title():
+    with pytest.raises(ValueError):
+        LinkPreview(url="", title="Ep")
+    with pytest.raises(ValueError):
+        LinkPreview(url="https://a/1", title="")
 
 
 def test_link_device_prints_uri_when_no_qrencode(have_binary, monkeypatch, capsys):

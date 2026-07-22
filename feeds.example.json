@@ -16,6 +16,8 @@
       "max_age_days": 7,
       "recipient": "+31600000000",
       "message_template": "🎧 {title} ({published_date})\n\n{description}",
+      "preview_url": "https://example.com/episodes",
+      "preview_title": "🎧 {title}",
       "title_contains": ["interview", "special"]
     }
   ]

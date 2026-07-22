@@ -16,8 +16,10 @@ from rssignal.feeds import (
     item_fields,
     load_feeds,
     parse_feed,
+    preview_fields,
     render_message,
     strip_html,
+    truncate,
 )
 
 
@@ -357,3 +359,227 @@ def test_load_feeds_filter_value_must_be_string_or_list(tmp_path):
     )
     with pytest.raises(FeedError):
         load_feeds(path)
+
+
+# --- artwork ---------------------------------------------------------------
+
+
+def _parsed(entries, feed=None):
+    """A stand-in for a feedparser result."""
+    fake = type("Parsed", (), {})()
+    fake.bozo = False
+    fake.entries = entries
+    fake.feed = feed or {}
+    return fake
+
+
+def _parse_one(monkeypatch, entry, feed=None, feed_type="podcast"):
+    monkeypatch.setattr(
+        feeds.feedparser, "parse", lambda url: _parsed([entry], feed)
+    )
+    return parse_feed(FeedConfig(url="https://a", type=feed_type))[0]
+
+
+def test_parse_feed_takes_episode_itunes_image(monkeypatch):
+    item = _parse_one(
+        monkeypatch,
+        {"title": "Ep", "image": {"href": "https://a/ep.jpg"}},
+        feed={"image": {"href": "https://a/show.jpg"}},
+    )
+    # The episode's own artwork wins over the channel's.
+    assert item.image_url == "https://a/ep.jpg"
+
+
+def test_parse_feed_takes_media_thumbnail(monkeypatch):
+    item = _parse_one(
+        monkeypatch,
+        {"title": "Ep", "media_thumbnail": [{"url": "https://a/thumb.jpg"}]},
+    )
+    assert item.image_url == "https://a/thumb.jpg"
+
+
+def test_parse_feed_falls_back_to_channel_artwork(monkeypatch):
+    # The common podcast case: artwork set once on the show, not per episode.
+    item = _parse_one(
+        monkeypatch, {"title": "Ep"}, feed={"image": {"href": "https://a/show.jpg"}}
+    )
+    assert item.image_url == "https://a/show.jpg"
+
+
+def test_parse_feed_without_any_image(monkeypatch):
+    assert _parse_one(monkeypatch, {"title": "Ep"}).image_url is None
+
+
+def test_image_keys_do_not_leak_into_extra(monkeypatch):
+    item = _parse_one(
+        monkeypatch,
+        {"title": "Ep", "image": {"href": "https://a/ep.jpg"}, "id": "abc"},
+    )
+    assert "image" not in item.extra
+    assert item.extra["id"] == "abc"
+
+
+def test_item_fields_includes_image_url():
+    item = FeedItem(title="Ep", description="d", image_url="https://a/ep.jpg")
+    assert item_fields(item)["image_url"] == "https://a/ep.jpg"
+
+
+# --- link previews ---------------------------------------------------------
+
+_EPISODE = FeedItem(
+    title="Episode 402",
+    description="A long look at something interesting.",
+    link="https://a/402.mp3",
+    image_url="https://a/show.jpg",
+    feed_name="Pod",
+)
+
+
+def test_preview_fields_defaults_for_a_podcast():
+    cfg = FeedConfig(url="https://a", type="podcast", name="Pod")
+
+    assert preview_fields(_EPISODE, cfg) == {
+        "url": "https://a/402.mp3",
+        "title": "Episode 402",
+        "description": "A long look at something interesting.",
+        "image_url": "https://a/show.jpg",
+    }
+
+
+def test_preview_fields_is_none_for_a_regular_feed():
+    cfg = FeedConfig(url="https://a", type="regular")
+    assert preview_fields(_EPISODE, cfg) is None
+
+
+def test_preview_fields_honours_link_preview_toggle():
+    off = FeedConfig(url="https://a", type="podcast", link_preview=False)
+    on = FeedConfig(url="https://a", type="regular", link_preview=True)
+
+    assert preview_fields(_EPISODE, off) is None
+    assert preview_fields(_EPISODE, on) is not None
+
+
+def test_preview_fields_uses_templates():
+    cfg = FeedConfig(
+        url="https://a",
+        type="podcast",
+        preview_url="https://pod.example/{feed_name}",
+        preview_title="🎧 {title}",
+        preview_description="from {feed_name}",
+    )
+
+    card = preview_fields(_EPISODE, cfg)
+
+    assert card["url"] == "https://pod.example/Pod"
+    assert card["title"] == "🎧 Episode 402"
+    assert card["description"] == "from Pod"
+
+
+def test_preview_fields_is_none_without_a_url():
+    # An item with no link can't anchor a preview card.
+    item = FeedItem(title="Ep", description="d")
+    cfg = FeedConfig(url="https://a", type="podcast")
+    assert preview_fields(item, cfg) is None
+
+
+def test_preview_fields_is_none_without_a_title():
+    cfg = FeedConfig(url="https://a", type="podcast", preview_title="{nonexistent}")
+    assert preview_fields(_EPISODE, cfg) is None
+
+
+def test_preview_description_is_truncated():
+    item = FeedItem(title="Ep", description="word " * 100, link="https://a/1")
+    cfg = FeedConfig(url="https://a", type="podcast")
+
+    description = preview_fields(item, cfg)["description"]
+
+    assert len(description) <= feeds.PREVIEW_DESCRIPTION_LIMIT
+    assert description.endswith("…")
+
+
+def test_truncate_cuts_at_a_word_boundary():
+    assert truncate("hello there friend", 12) == "hello there…"
+    assert truncate("short", 12) == "short"
+
+
+def test_render_message_appends_the_preview_url():
+    # The built-in podcast layout has no link, but signal-cli needs the preview
+    # url to appear in the body.
+    cfg = FeedConfig(url="https://a", type="podcast")
+
+    text = render_message(_EPISODE, cfg)
+
+    assert text.endswith("\n\nhttps://a/402.mp3")
+
+
+def test_render_message_does_not_duplicate_an_existing_url():
+    cfg = FeedConfig(
+        url="https://a", type="podcast", message_template="{title}\n{link}"
+    )
+
+    text = render_message(_EPISODE, cfg)
+
+    assert text.count("https://a/402.mp3") == 1
+
+
+def test_render_message_leaves_body_alone_without_a_preview():
+    cfg = FeedConfig(url="https://a", type="podcast", link_preview=False)
+    assert render_message(_EPISODE, cfg) == format_message(_EPISODE, "podcast")
+
+
+# --- preview configuration -------------------------------------------------
+
+
+def test_load_feeds_parses_preview_keys(tmp_path):
+    path = _write_config(
+        tmp_path,
+        {
+            "feeds": [
+                {
+                    "url": "https://a",
+                    "type": "podcast",
+                    "link_preview": False,
+                    "preview_url": "https://pod.example",
+                    "preview_title": "🎧 {title}",
+                    "preview_description": "{feed_name}",
+                }
+            ]
+        },
+    )
+
+    cfg = load_feeds(path)[0]
+
+    assert cfg.link_preview is False
+    assert cfg.previews_enabled is False
+    assert cfg.preview_url == "https://pod.example"
+    assert cfg.preview_title == "🎧 {title}"
+    assert cfg.preview_description == "{feed_name}"
+
+
+def test_load_feeds_preview_defaults_are_none(tmp_path):
+    path = _write_config(tmp_path, {"feeds": [{"url": "https://a", "type": "podcast"}]})
+
+    cfg = load_feeds(path)[0]
+
+    assert cfg.link_preview is None
+    # Unset means "podcast yes, regular no".
+    assert cfg.previews_enabled is True
+
+
+def test_load_feeds_link_preview_must_be_boolean(tmp_path):
+    path = _write_config(
+        tmp_path,
+        {"feeds": [{"url": "https://a", "type": "podcast", "link_preview": "yes"}]},
+    )
+    with pytest.raises(FeedError):
+        load_feeds(path)
+
+
+def test_load_feeds_unknown_preview_key_raises(tmp_path):
+    path = _write_config(
+        tmp_path,
+        {"feeds": [{"url": "https://a", "type": "podcast", "preview_image": "x"}]},
+    )
+    with pytest.raises(FeedError) as excinfo:
+        load_feeds(path)
+    assert "preview_image" in str(excinfo.value)
