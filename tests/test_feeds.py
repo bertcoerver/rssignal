@@ -9,11 +9,14 @@ from rssignal import feeds
 from rssignal.feeds import (
     FeedConfig,
     FeedError,
+    FeedFilter,
     FeedItem,
     filter_recent,
     format_message,
+    item_fields,
     load_feeds,
     parse_feed,
+    render_message,
     strip_html,
 )
 
@@ -169,3 +172,188 @@ def test_format_message_regular():
 def test_format_message_podcast_omits_link():
     item = FeedItem(title="Ep", description="Notes", link="https://a/1")
     assert format_message(item, "podcast") == "Ep\n\nNotes"
+
+
+# --- item fields -----------------------------------------------------------
+
+
+def test_parse_feed_lifts_author_categories_and_extras(monkeypatch):
+    fake = type("Parsed", (), {})()
+    fake.bozo = False
+    fake.entries = [
+        {
+            "title": "Episode 1",
+            "description": "Show notes",
+            "author": "Example Media",
+            "tags": [{"term": "news"}, {"term": "politics"}],
+            "id": "urn:uuid:1234",
+            "itunes_duration": "00:42:11",
+            "itunes_episode": 402,
+            "published_parsed": (2026, 7, 21, 8, 0, 0, 0, 0, 0),
+            "title_detail": {"value": "Episode 1"},
+        }
+    ]
+    monkeypatch.setattr(feeds.feedparser, "parse", lambda url: fake)
+
+    item = parse_feed(FeedConfig(url="https://a", type="podcast", name="Pod"))[0]
+
+    assert item.author == "Example Media"
+    assert item.categories == ("news", "politics")
+    assert item.feed_name == "Pod"
+    assert item.extra == {
+        "id": "urn:uuid:1234",
+        "itunes_duration": "00:42:11",
+        "itunes_episode": "402",
+    }
+    # Structured mirrors feedparser adds carry no useful string form.
+    assert "title_detail" not in item.extra
+
+
+def test_item_fields_includes_core_and_extras():
+    item = FeedItem(
+        title="T",
+        description="D",
+        published=datetime(2026, 7, 22, 6, 0, 0, tzinfo=timezone.utc),
+        categories=("news", "politics"),
+        feed_name="Pod",
+        extra={"itunes_duration": "00:42:11"},
+    )
+
+    fields = item_fields(item)
+
+    assert fields["title"] == "T"
+    assert fields["published"] == "2026-07-22T06:00:00+00:00"
+    assert fields["published_date"] == "2026-07-22"
+    assert fields["categories"] == "news, politics"
+    assert fields["feed_name"] == "Pod"
+    assert fields["itunes_duration"] == "00:42:11"
+    # Absent values are empty strings, never None.
+    assert fields["link"] == ""
+    assert fields["author"] == ""
+
+
+def test_item_fields_extra_cannot_shadow_a_core_field():
+    item = FeedItem(title="Real", description="D", extra={"title": "Impostor"})
+    assert item_fields(item)["title"] == "Real"
+
+
+# --- message templates -----------------------------------------------------
+
+
+def test_render_message_without_template_uses_default():
+    item = FeedItem(title="Title", description="Body", link="https://a/1")
+    cfg = FeedConfig(url="https://a", type="regular")
+    assert render_message(item, cfg) == format_message(item, "regular")
+
+
+def test_render_message_with_template():
+    item = FeedItem(
+        title="Ep",
+        description="Notes",
+        published=datetime(2026, 7, 22, tzinfo=timezone.utc),
+        extra={"itunes_duration": "00:42:11"},
+    )
+    cfg = FeedConfig(
+        url="https://a",
+        type="podcast",
+        message_template="🎧 {title} ({published_date}) [{itunes_duration}]\n\n{description}",
+    )
+    assert render_message(item, cfg) == (
+        "🎧 Ep (2026-07-22) [00:42:11]\n\nNotes"
+    )
+
+
+def test_render_message_unknown_field_renders_empty_without_gap():
+    item = FeedItem(title="Ep", description="Notes")
+    cfg = FeedConfig(
+        url="https://a",
+        type="regular",
+        message_template="{title}\n\n{nope}\n\n{description}",
+    )
+    # The missing field collapses instead of leaving a blank paragraph.
+    assert render_message(item, cfg) == "Ep\n\nNotes"
+
+
+def test_render_message_malformed_template_raises():
+    cfg = FeedConfig(
+        url="https://a", type="regular", name="Blog", message_template="{title"
+    )
+    with pytest.raises(FeedError) as excinfo:
+        render_message(FeedItem(title="T", description="D"), cfg)
+    assert "Blog" in str(excinfo.value)
+
+
+# --- filter configuration --------------------------------------------------
+
+
+def test_load_feeds_parses_message_template(tmp_path):
+    path = _write_config(
+        tmp_path,
+        {
+            "feeds": [
+                {
+                    "url": "https://a",
+                    "type": "regular",
+                    "message_template": "{title} — {link}",
+                }
+            ]
+        },
+    )
+    assert load_feeds(path)[0].message_template == "{title} — {link}"
+
+
+def test_load_feeds_parses_filters(tmp_path):
+    path = _write_config(
+        tmp_path,
+        {
+            "feeds": [
+                {
+                    "url": "https://a",
+                    "type": "regular",
+                    "title_contains": ["one", "two"],
+                    "description_excludes": "rerun",
+                    "title_matches": r"^Ep \d+",
+                }
+            ]
+        },
+    )
+
+    filters = load_feeds(path)[0].filters
+
+    assert FeedFilter("title", "contains", ("one", "two")) in filters
+    # A bare string becomes a single-value filter.
+    assert FeedFilter("description", "excludes", ("rerun",)) in filters
+    assert FeedFilter("title", "matches", (r"^Ep \d+",)) in filters
+
+
+def test_load_feeds_no_filters_is_empty_tuple(tmp_path):
+    path = _write_config(tmp_path, {"feeds": [{"url": "https://a", "type": "regular"}]})
+    assert load_feeds(path)[0].filters == ()
+
+
+def test_load_feeds_unknown_key_raises(tmp_path):
+    # A typo like max_age_hour must not be silently ignored.
+    path = _write_config(
+        tmp_path, {"feeds": [{"url": "https://a", "type": "regular", "max_age_hour": 5}]}
+    )
+    with pytest.raises(FeedError) as excinfo:
+        load_feeds(path)
+    assert "max_age_hour" in str(excinfo.value)
+
+
+def test_load_feeds_bad_regex_raises(tmp_path):
+    path = _write_config(
+        tmp_path,
+        {"feeds": [{"url": "https://a", "type": "regular", "title_matches": "([unclosed"}]},
+    )
+    with pytest.raises(FeedError):
+        load_feeds(path)
+
+
+def test_load_feeds_filter_value_must_be_string_or_list(tmp_path):
+    path = _write_config(
+        tmp_path,
+        {"feeds": [{"url": "https://a", "type": "regular", "title_contains": 42}]},
+    )
+    with pytest.raises(FeedError):
+        load_feeds(path)

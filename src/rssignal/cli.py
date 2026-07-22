@@ -5,6 +5,7 @@ Subcommands:
     link [--name]   link this machine to your Signal account (scan a QR code)
     send MESSAGE    send a text message (uses configured account/recipient)
     run [--config]  parse configured feeds and send their recent items
+    fields          show the fields an item exposes, for writing templates
 """
 
 from __future__ import annotations
@@ -13,7 +14,15 @@ import argparse
 import sys
 
 from .config import ConfigError, get_config
-from .feeds import FeedError
+from .feeds import (
+    CORE_FIELDS,
+    FeedConfig,
+    FeedError,
+    item_fields,
+    load_feeds,
+    parse_feed,
+    render_message,
+)
 from .run import run_feeds
 from .signal_cli import (
     SignalError,
@@ -73,6 +82,67 @@ def _cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_feed(args: argparse.Namespace) -> FeedConfig:
+    """Pick the feed the ``fields`` command should sample.
+
+    ``--url`` names a feed directly, which is handy before it's in the config at
+    all; otherwise ``--feed`` matches a configured feed by name or URL substring,
+    and with neither the first configured feed is used.
+    """
+    if args.url:
+        return FeedConfig(url=args.url, type="regular", name=args.url)
+
+    feeds = load_feeds(args.config)
+    if not feeds:
+        raise FeedError(f"No feeds configured in {args.config!r}.")
+
+    if not args.feed:
+        return feeds[0]
+
+    needle = args.feed.lower()
+    for cfg in feeds:
+        if needle in (cfg.name or "").lower() or needle in cfg.url.lower():
+            return cfg
+    known = ", ".join(repr(cfg.name or cfg.url) for cfg in feeds)
+    raise FeedError(f"No feed matching {args.feed!r}. Configured feeds: {known}.")
+
+
+def _cmd_fields(args: argparse.Namespace) -> int:
+    cfg = _resolve_feed(args)
+    items = parse_feed(cfg)
+    if not items:
+        print(f"Feed {cfg.name or cfg.url!r} has no items.")
+        return 1
+    if not 1 <= args.item <= len(items):
+        raise ValueError(
+            f"--item {args.item} is out of range; the feed has {len(items)} item(s)."
+        )
+
+    item = items[args.item - 1]
+    fields = item_fields(item)
+    print(f"Fields for {cfg.name or cfg.url} (item {args.item} of {len(items)}):\n")
+
+    width = max(len(name) for name in fields)
+    for name, value in fields.items():
+        flat = " ".join(value.split())
+        if len(flat) > 70:
+            flat = flat[:69] + "…"
+        suffix = "  (extra)" if name not in CORE_FIELDS else ""
+        print(f"  {name:<{width}}  {flat}{suffix}")
+
+    print(f"\nUse any name above in a template, e.g. \"{{{next(iter(fields))}}}\".")
+
+    if args.template:
+        preview = render_message(
+            item,
+            FeedConfig(url=cfg.url, type=cfg.type, name=cfg.name,
+                       message_template=args.template),
+        )
+        print("\n--- rendered message ---")
+        print(preview)
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rssignal", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -115,6 +185,37 @@ def _build_parser() -> argparse.ArgumentParser:
         help="print what would be sent without sending or downloading",
     )
     run.set_defaults(func=_cmd_run)
+
+    fields = subparsers.add_parser(
+        "fields", help="show the fields an item exposes, for writing templates"
+    )
+    fields.add_argument(
+        "--config",
+        default="feeds.json",
+        help="path to the feeds JSON config (default: feeds.json)",
+    )
+    fields.add_argument(
+        "--feed",
+        default=None,
+        help="configured feed to sample, by name or URL (default: the first one)",
+    )
+    fields.add_argument(
+        "--url",
+        default=None,
+        help="sample this feed URL directly, without adding it to the config",
+    )
+    fields.add_argument(
+        "--item",
+        type=int,
+        default=1,
+        help="which item to sample, 1-based (default: 1)",
+    )
+    fields.add_argument(
+        "--template",
+        default=None,
+        help="also render this message_template against the sampled item",
+    )
+    fields.set_defaults(func=_cmd_fields)
 
     return parser
 

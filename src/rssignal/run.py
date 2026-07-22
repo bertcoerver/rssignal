@@ -2,7 +2,8 @@
 
 This ties the pieces together: :func:`rssignal.feeds.load_feeds` /
 :func:`~rssignal.feeds.parse_feed` produce items, :func:`~rssignal.feeds.filter_recent`
-narrows them, and each survivor is sent with :func:`rssignal.signal_cli.send_msg`.
+and :func:`~rssignal.feeds.apply_filters` narrow them, :func:`~rssignal.feeds.render_message`
+turns each survivor into text, and it is sent with :func:`rssignal.signal_cli.send_msg`.
 Podcast items download their audio enclosure and send it as a voice note.
 
 There is no de-duplication yet: running twice within a feed's ``max_age`` window
@@ -17,10 +18,11 @@ from .download import download_temp
 from .feeds import (
     FeedConfig,
     FeedItem,
+    apply_filters,
     filter_recent,
-    format_message,
     load_feeds,
     parse_feed,
+    render_message,
 )
 from .signal_cli import send_msg
 
@@ -41,6 +43,7 @@ def run_feeds(
     sent = 0
     for cfg in feeds:
         items = filter_recent(parse_feed(cfg), cfg.max_age, now=now)
+        items = apply_filters(items, cfg.filters)
         label = cfg.name or cfg.url
         for item in items:
             _handle_item(cfg, item, label, dry_run=dry_run)
@@ -52,7 +55,7 @@ def _handle_item(
     cfg: FeedConfig, item: FeedItem, label: str, *, dry_run: bool
 ) -> None:
     """Send (or, in dry-run, describe) a single item from feed ``cfg``."""
-    text = format_message(item, cfg.type)
+    text = render_message(item, cfg)
     is_podcast = cfg.type == "podcast" and bool(item.enclosure_url)
 
     if dry_run:

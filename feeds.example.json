@@ -4,14 +4,18 @@
       "name": "Some Blog",
       "url": "https://example.com/rss",
       "type": "regular",
-      "max_age_hours": 24
+      "max_age_hours": 24,
+      "message_template": "📰 {title}\n\n{description}\n\n{link}",
+      "title_excludes": ["sponsored", "newsletter roundup"]
     },
     {
       "name": "Some Podcast",
       "url": "https://example.com/podcast.rss",
       "type": "podcast",
       "max_age_days": 7,
-      "recipient": "+31600000000"
+      "recipient": "+31600000000",
+      "message_template": "🎧 {title} ({published_date})\n\n{description}",
+      "title_contains": ["interview", "special"]
     }
   ]
 }

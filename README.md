@@ -6,8 +6,9 @@ rssignal parses RSS feeds and forwards items as Signal text messages. It sends
 by shelling out to the [`signal-cli`](https://github.com/AsamK/signal-cli)
 command-line tool, so messages come from your own linked Signal account.
 
-> **Status:** early. Signal setup, message sending, and feed parsing/sending
-> work. De-duplication and the cloud service (POST-triggered) come next.
+> **Status:** early. Signal setup, message sending, feed parsing/sending, message
+> templates, and per-field filters work. De-duplication and the cloud service
+> (POST-triggered) come next.
 
 ## Requirements
 
@@ -81,14 +82,85 @@ cp feeds.example.json feeds.json
 
 Each feed entry supports:
 
-| Key             | Required | Description                                                            |
-| --------------- | -------- | ---------------------------------------------------------------------- |
-| `url`           | yes      | The RSS/Atom feed URL.                                                  |
-| `type`          | yes      | `regular` (title + description + link) or `podcast` (audio voice note). |
-| `name`          | no       | Label used in logs / dry-run output.                                   |
-| `recipient`     | no       | Per-feed recipient; falls back to `RSSIGNAL_RECIPIENT`.                 |
-| `max_age_hours` | no       | Only send items published within this many hours.                      |
-| `max_age_days`  | no       | Added to `max_age_hours`. Omit both to send every item in the feed.    |
+| Key                 | Required | Description                                                            |
+| ------------------- | -------- | ---------------------------------------------------------------------- |
+| `url`               | yes      | The RSS/Atom feed URL.                                                  |
+| `type`              | yes      | `regular` (title + description + link) or `podcast` (audio voice note). |
+| `name`              | no       | Label used in logs / dry-run output, and available as `{feed_name}`.    |
+| `recipient`         | no       | Per-feed recipient; falls back to `RSSIGNAL_RECIPIENT`.                 |
+| `max_age_hours`     | no       | Only send items published within this many hours.                      |
+| `max_age_days`      | no       | Added to `max_age_hours`. Omit both to send every item in the feed.    |
+| `message_template`  | no       | Message text with `{field}` placeholders. Omit for the built-in layout. |
+| `<field>_contains`  | no       | Keep items whose field contains any of these terms.                    |
+| `<field>_excludes`  | no       | Drop items whose field contains any of these terms.                    |
+| `<field>_matches`   | no       | Keep items whose field matches any of these regexes.                   |
+
+Unknown keys are rejected, so a typo like `max_age_hour` is an error rather than a
+silently ignored setting.
+
+### Message templates
+
+`message_template` is filled in with `{field}` placeholders — the same fields the
+filters use:
+
+```json
+"message_template": "🎧 {title} ({published_date})\n\n{description}"
+```
+
+A placeholder the item doesn't have renders as empty text rather than failing the
+run, and the resulting blank gap is collapsed. Without a `message_template`, a
+`regular` feed sends title + description + link and a `podcast` feed sends title +
+description.
+
+### Discovering fields
+
+Which fields exist depends on the feed — most publish more than the standard few.
+The `fields` command samples a real item and lists what you can use:
+
+```bash
+rssignal fields                                  # first feed in feeds.json
+rssignal fields --feed "Some Podcast"            # by name or URL
+rssignal fields --url https://example.com/rss    # not yet in the config
+rssignal fields --item 3                         # sample the 3rd item
+```
+
+```
+Fields for Some Podcast (item 1 of 25):
+
+  title           Episode 402: the interview
+  description     In this episode we talk to …
+  link            https://example.com/402
+  published       2026-07-22T06:00:00+00:00
+  published_date  2026-07-22
+  enclosure_url   https://example.com/402.mp3
+  enclosure_type  audio/mpeg
+  author          Example Media
+  categories      news, politics
+  feed_name       Some Podcast
+  itunes_duration 00:42:11                        (extra)
+  id              urn:uuid:8f2c…                  (extra)
+```
+
+Add `--template` to preview a message against that item without sending anything:
+
+```bash
+rssignal fields --feed "Some Podcast" --template "🎧 {title} — {itunes_duration}"
+```
+
+### Filters
+
+Filters test a single field and are written as `<field>_<op>`, where the field is any
+name from `rssignal fields`:
+
+```json
+"title_contains": ["interview", "special"],
+"description_excludes": "rerun",
+"title_matches": "^Episode \\d+"
+```
+
+Each takes a string or a list. `contains` and `matches` keep an item when **any**
+value hits; `excludes` keeps it when **none** do. Matching is case-insensitive, and
+multiple filters must **all** pass. Recency (`max_age_*`) is applied first.
 
 Check what would be sent, then send for real:
 

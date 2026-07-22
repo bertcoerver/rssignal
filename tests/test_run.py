@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from rssignal import run
-from rssignal.feeds import FeedConfig, FeedItem
+from rssignal.feeds import FeedConfig, FeedFilter, FeedItem
 from rssignal.run import run_feeds
 
 NOW = datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc)
@@ -83,6 +83,41 @@ def test_run_podcast_without_enclosure_falls_back_to_text(monkeypatch):
     assert count == 1
     assert sends[0]["voice_note"] is False
     assert sends[0]["attachments"] is None
+
+
+def test_run_uses_message_template(monkeypatch):
+    cfg = FeedConfig(
+        url="https://a",
+        type="regular",
+        name="Blog",
+        message_template="📰 {title} [{feed_name}]\n\n{link}",
+    )
+    item = FeedItem(title="One", description="d1", link="https://a/1", feed_name="Blog")
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    sends = _capture_sends(monkeypatch)
+
+    run_feeds("feeds.json", now=NOW)
+
+    assert sends[0]["text"] == "📰 One [Blog]\n\nhttps://a/1"
+
+
+def test_run_applies_field_filters(monkeypatch):
+    cfg = FeedConfig(
+        url="https://a",
+        type="regular",
+        filters=(FeedFilter("title", "excludes", ("sponsored",)),),
+    )
+    items = [
+        FeedItem(title="Real post", description="d1"),
+        FeedItem(title="Sponsored post", description="d2"),
+    ]
+    _patch_feeds(monkeypatch, [cfg], {"https://a": items})
+    sends = _capture_sends(monkeypatch)
+
+    count = run_feeds("feeds.json", now=NOW)
+
+    assert count == 1
+    assert sends[0]["text"].startswith("Real post")
 
 
 def test_run_dry_run_sends_nothing(monkeypatch, capsys):

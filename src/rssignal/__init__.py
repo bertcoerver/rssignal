@@ -6,9 +6,13 @@ from .config import Config, ConfigError, get_config
 from .feeds import (
     FeedConfig,
     FeedError,
+    FeedFilter,
     FeedItem,
+    apply_filters,
+    item_fields,
     load_feeds,
     parse_feed,
+    render_message,
 )
 from .run import run_feeds
 from .signal_cli import (
@@ -46,4 +50,8 @@ __all__ = [
     "FeedConfig",
     "FeedItem",
     "FeedError",
+    "FeedFilter",
+    "apply_filters",
+    "item_fields",
+    "render_message",
 ]
