@@ -3,6 +3,14 @@
 from importlib.metadata import version, PackageNotFoundError
 
 from .config import Config, ConfigError, get_config
+from .feeds import (
+    FeedConfig,
+    FeedError,
+    FeedItem,
+    load_feeds,
+    parse_feed,
+)
+from .run import run_feeds
 from .signal_cli import (
     AccountNotLinked,
     SignalCliNotFound,
@@ -32,4 +40,10 @@ __all__ = [
     "SignalCliNotFound",
     "AccountNotLinked",
     "SignalSendError",
+    "run_feeds",
+    "load_feeds",
+    "parse_feed",
+    "FeedConfig",
+    "FeedItem",
+    "FeedError",
 ]

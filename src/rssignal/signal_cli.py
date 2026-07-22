@@ -160,12 +160,19 @@ def send_msg(
     recipient: str | None = None,
     *,
     account: str | None = None,
-    timeout: float = 60,
+    attachments: list[str] | None = None,
+    voice_note: bool = False,
+    timeout: float = 120,
 ) -> None:
-    """Send ``msg`` as a Signal text message.
+    """Send ``msg`` as a Signal message, optionally with attachments.
 
     ``account`` (the sender) and ``recipient`` fall back to the configured
     ``RSSIGNAL_ACCOUNT`` / ``RSSIGNAL_RECIPIENT`` values when not given.
+
+    ``attachments`` is a list of local file paths to attach; ``voice_note``
+    flags a (single) audio attachment to be sent as a Signal voice note. The
+    default ``timeout`` is generous because attachment uploads take longer than
+    plain text.
 
     Raises :class:`SignalSendError` on a non-zero exit or timeout,
     :class:`SignalCliNotFound` if the binary is missing, and ``ValueError`` if no
@@ -186,9 +193,20 @@ def send_msg(
             "`recipient=` or set a default in your environment / .env file."
         )
 
+    # Options that take a fixed number of args go before ``-m msg``, so the
+    # trailing positional recipient can't be swallowed by ``--attachment``'s
+    # greedy arg list.
+    argv = [binary, "-a", account, "send"]
+    if attachments:
+        argv.append("--attachment")
+        argv.extend(attachments)
+    if voice_note:
+        argv.append("--voice-note")
+    argv.extend(["-m", msg, recipient])
+
     try:
         result = subprocess.run(
-            [binary, "-a", account, "send", "-m", msg, recipient],
+            argv,
             capture_output=True,
             text=True,
             timeout=timeout,

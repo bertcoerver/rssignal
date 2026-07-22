@@ -17,9 +17,9 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 
-# No Python runtime dependencies: rssignal shells out to the Java `signal-cli`
-# binary (install separately, e.g. `brew install signal-cli`).
-dependencies = []
+# rssignal shells out to the Java `signal-cli` binary for Signal (install
+# separately, e.g. `brew install signal-cli`); feedparser handles RSS/Atom.
+dependencies = ["feedparser>=6.0"]
 
 [project.scripts]
 rssignal = "rssignal.cli:main"

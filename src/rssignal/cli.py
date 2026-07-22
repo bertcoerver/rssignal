@@ -4,6 +4,7 @@ Subcommands:
     doctor          check the signal-cli install, linked accounts, and config
     link [--name]   link this machine to your Signal account (scan a QR code)
     send MESSAGE    send a text message (uses configured account/recipient)
+    run [--config]  parse configured feeds and send their recent items
 """
 
 from __future__ import annotations
@@ -12,6 +13,8 @@ import argparse
 import sys
 
 from .config import ConfigError, get_config
+from .feeds import FeedError
+from .run import run_feeds
 from .signal_cli import (
     SignalError,
     find_signal_cli,
@@ -61,6 +64,15 @@ def _cmd_send(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_run(args: argparse.Namespace) -> int:
+    count = run_feeds(args.config, dry_run=args.dry_run)
+    if args.dry_run:
+        print(f"{count} item(s) would be sent (dry run).")
+    else:
+        print(f"{count} item(s) sent.")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rssignal", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -89,6 +101,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     send.set_defaults(func=_cmd_send)
 
+    run = subparsers.add_parser(
+        "run", help="parse configured feeds and send their recent items"
+    )
+    run.add_argument(
+        "--config",
+        default="feeds.json",
+        help="path to the feeds JSON config (default: feeds.json)",
+    )
+    run.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print what would be sent without sending or downloading",
+    )
+    run.set_defaults(func=_cmd_run)
+
     return parser
 
 
@@ -98,7 +125,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except (SignalError, ConfigError, ValueError) as exc:
+    except (SignalError, ConfigError, FeedError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 

@@ -97,6 +97,63 @@ def test_send_msg_builds_correct_argv(have_binary, monkeypatch):
     ]
 
 
+def test_send_msg_with_voice_note_builds_correct_argv(have_binary, monkeypatch):
+    calls = {}
+
+    def fake_run(argv, **kwargs):
+        calls["argv"] = argv
+        return _completed(returncode=0)
+
+    monkeypatch.setattr(signal_cli.subprocess, "run", fake_run)
+
+    send_msg(
+        "episode text",
+        recipient="+31611111111",
+        account="+31600000000",
+        attachments=["/tmp/ep.mp3"],
+        voice_note=True,
+    )
+
+    assert calls["argv"] == [
+        FAKE_BIN,
+        "-a",
+        "+31600000000",
+        "send",
+        "--attachment",
+        "/tmp/ep.mp3",
+        "--voice-note",
+        "-m",
+        "episode text",
+        "+31611111111",
+    ]
+    # Recipient stays the final positional, not swallowed by --attachment.
+    assert calls["argv"][-1] == "+31611111111"
+
+
+def test_send_msg_no_attachments_argv_unchanged(have_binary, monkeypatch):
+    calls = {}
+
+    def fake_run(argv, **kwargs):
+        calls["argv"] = argv
+        return _completed(returncode=0)
+
+    monkeypatch.setattr(signal_cli.subprocess, "run", fake_run)
+
+    send_msg("hello", recipient="+31611111111", account="+31600000000")
+
+    assert "--attachment" not in calls["argv"]
+    assert "--voice-note" not in calls["argv"]
+    assert calls["argv"] == [
+        FAKE_BIN,
+        "-a",
+        "+31600000000",
+        "send",
+        "-m",
+        "hello",
+        "+31611111111",
+    ]
+
+
 def test_send_msg_uses_config_defaults(have_binary, monkeypatch):
     monkeypatch.setattr(
         signal_cli,

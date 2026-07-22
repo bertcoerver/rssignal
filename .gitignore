@@ -57,6 +57,9 @@ venv.bak/
 .env.*
 !.env.example
 
+# Local feed configuration
+feeds.json
+
 # Claude Code
 .claude/
 

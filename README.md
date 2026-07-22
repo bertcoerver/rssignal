@@ -6,8 +6,8 @@ rssignal parses RSS feeds and forwards items as Signal text messages. It sends
 by shelling out to the [`signal-cli`](https://github.com/AsamK/signal-cli)
 command-line tool, so messages come from your own linked Signal account.
 
-> **Status:** early. This milestone covers Signal setup and message sending.
-> RSS parsing, filtering, and the cloud service (POST-triggered) come next.
+> **Status:** early. Signal setup, message sending, and feed parsing/sending
+> work. De-duplication and the cloud service (POST-triggered) come next.
 
 ## Requirements
 
@@ -70,6 +70,40 @@ from rssignal import send_msg
 send_msg("hello from rssignal")                       # uses configured recipient
 send_msg("hi there", recipient="+31611111111")        # explicit recipient
 ```
+
+## Feeds
+
+Describe the feeds to follow in a JSON config (git-ignored):
+
+```bash
+cp feeds.example.json feeds.json
+```
+
+Each feed entry supports:
+
+| Key             | Required | Description                                                            |
+| --------------- | -------- | ---------------------------------------------------------------------- |
+| `url`           | yes      | The RSS/Atom feed URL.                                                  |
+| `type`          | yes      | `regular` (title + description + link) or `podcast` (audio voice note). |
+| `name`          | no       | Label used in logs / dry-run output.                                   |
+| `recipient`     | no       | Per-feed recipient; falls back to `RSSIGNAL_RECIPIENT`.                 |
+| `max_age_hours` | no       | Only send items published within this many hours.                      |
+| `max_age_days`  | no       | Added to `max_age_hours`. Omit both to send every item in the feed.    |
+
+Check what would be sent, then send for real:
+
+```bash
+rssignal run --dry-run          # prints matching items, sends nothing
+rssignal run                    # sends one Signal message per item
+rssignal run --config other.json
+```
+
+For `podcast` feeds the episode's audio enclosure is downloaded and sent with
+`signal-cli --voice-note`. Depending on the file's codec, Signal may show it as
+a regular audio attachment rather than an in-app voice note.
+
+> **Note:** there is no de-duplication yet — running again while items are still
+> inside their `max_age` window resends them. Seen-tracking is the next milestone.
 
 ## Development
 
