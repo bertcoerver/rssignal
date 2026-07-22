@@ -12,8 +12,10 @@ reach for once the cloud service sends many messages per run.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
+from dataclasses import dataclass
 
 from .config import get_config
 
@@ -21,6 +23,8 @@ from .config import get_config
 DEFAULT_DEVICE_NAME = "rssignal"
 # Where signal-cli keeps its state, for error hints.
 _CONFIG_DIR_HINT = "~/.local/share/signal-cli"
+# Marks a recipient as a group id rather than a phone number.
+GROUP_PREFIX = "group:"
 
 
 class SignalError(Exception):
@@ -97,6 +101,102 @@ def list_accounts() -> list[str]:
     return accounts
 
 
+def receive(*, account: str | None = None, timeout: float = 10) -> None:
+    """Drain the incoming message queue, updating local state.
+
+    rssignal runs as a linked secondary device, so it only learns about new
+    groups (and profile or membership changes) from sync messages sitting in the
+    queue. ``listGroups`` reads local state, so a group created on the phone
+    stays invisible until those messages are received at least once.
+
+    Incoming message content is discarded — this is called for its side effect on
+    local state. ``timeout`` is how long signal-cli waits for more messages
+    before returning.
+    """
+    binary = find_signal_cli()
+    if account is None:
+        account = get_config().account
+
+    result = subprocess.run(
+        [binary, "-a", account, "receive", "--timeout", str(timeout)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise SignalSendError(
+            "`signal-cli receive` failed.",
+            returncode=result.returncode,
+            stderr=result.stderr.strip(),
+        )
+
+
+@dataclass(frozen=True)
+class SignalGroup:
+    """One group from ``signal-cli listGroups``.
+
+    ``id`` is the base64 group id to send to; ``name`` is the display name, which
+    is not unique and may be empty.
+    """
+
+    id: str
+    name: str
+    active: bool = True
+    blocked: bool = False
+
+    @property
+    def recipient(self) -> str:
+        """The value to use as a recipient in a config or ``--to``."""
+        return f"{GROUP_PREFIX}{self.id}"
+
+
+# listGroups prints one group per line:
+#   Id: <base64> Name: <name>  Active: true Blocked: false
+# The name can contain spaces (and the odd emoji), so it is matched lazily up to
+# the next known field label.
+_GROUP_LINE = re.compile(
+    r"^Id:\s*(?P<id>\S+)\s+Name:\s*(?P<name>.*?)\s+"
+    r"(?:Description:.*?\s+)?Active:\s*(?P<active>\S+)\s+Blocked:\s*(?P<blocked>\S+)"
+)
+
+
+def list_groups(*, account: str | None = None) -> list[SignalGroup]:
+    """Return the groups the account belongs to, newest signal-cli order.
+
+    Parses ``signal-cli listGroups``. Groups you have left show up with
+    ``active=False``; they are kept here and filtered at the call site so the
+    caller can decide what to show.
+    """
+    binary = find_signal_cli()
+    if account is None:
+        account = get_config().account
+
+    result = subprocess.run(
+        [binary, "-a", account, "listGroups"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise SignalSendError(
+            "`signal-cli listGroups` failed.",
+            returncode=result.returncode,
+            stderr=result.stderr.strip(),
+        )
+
+    groups: list[SignalGroup] = []
+    for line in result.stdout.splitlines():
+        match = _GROUP_LINE.match(line.strip())
+        if match:
+            groups.append(
+                SignalGroup(
+                    id=match["id"],
+                    name=match["name"].strip(),
+                    active=match["active"].lower() == "true",
+                    blocked=match["blocked"].lower() == "true",
+                )
+            )
+    return groups
+
+
 def is_account_registered(account: str) -> bool:
     """Return True if ``account`` appears in signal-cli's list of accounts."""
     return account in list_accounts()
@@ -167,7 +267,9 @@ def send_msg(
     """Send ``msg`` as a Signal message, optionally with attachments.
 
     ``account`` (the sender) and ``recipient`` fall back to the configured
-    ``RSSIGNAL_ACCOUNT`` / ``RSSIGNAL_RECIPIENT`` values when not given.
+    ``RSSIGNAL_ACCOUNT`` / ``RSSIGNAL_RECIPIENT`` values when not given. A
+    recipient is either an E.164 number (``+31600000000``) or a group, written
+    ``group:<base64 id>`` — run ``rssignal groups`` to list the ids.
 
     ``attachments`` is a list of local file paths to attach; ``voice_note``
     flags a (single) audio attachment to be sent as a Signal voice note. The
@@ -202,7 +304,18 @@ def send_msg(
         argv.extend(attachments)
     if voice_note:
         argv.append("--voice-note")
-    argv.extend(["-m", msg, recipient])
+    argv.extend(["-m", msg])
+    # Groups are addressed with -g rather than as a positional recipient.
+    if recipient.startswith(GROUP_PREFIX):
+        argv.extend(["-g", recipient[len(GROUP_PREFIX):]])
+    elif recipient.startswith("+"):
+        argv.append(recipient)
+    else:
+        raise ValueError(
+            f"Recipient {recipient!r} is neither an E.164 number (starting with "
+            f"'+') nor a group. To send to a group, prefix its id with "
+            f"'{GROUP_PREFIX}' — `rssignal groups` prints ready-to-use values."
+        )
 
     try:
         result = subprocess.run(

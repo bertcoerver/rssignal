@@ -9,12 +9,15 @@ from rssignal import signal_cli
 from rssignal.signal_cli import (
     AccountNotLinked,
     SignalCliNotFound,
+    SignalGroup,
     SignalSendError,
     check_account,
     find_signal_cli,
     is_account_registered,
     link_device,
     list_accounts,
+    list_groups,
+    receive,
     send_msg,
 )
 
@@ -203,6 +206,157 @@ def test_send_msg_timeout_raises(have_binary, monkeypatch):
     monkeypatch.setattr(signal_cli.subprocess, "run", fake_run)
     with pytest.raises(SignalSendError):
         send_msg("hi", recipient="+31611111111", account="+31600000000")
+
+
+# --- groups ----------------------------------------------------------------
+
+# Made-up output in signal-cli's real shape: the INFO line it writes on a cold
+# start, and names with spaces, an ampersand, and an emoji. The ids are fake but
+# use the same base64 alphabet (including / and +) as real ones.
+GROUPS_OUTPUT = """INFO  AccountHelper - The Signal protocol expects that incoming messages are regularly received.
+Id: AAAA1111bbbb+cccc/dddd2222eeee3333ffff4444g= Name: Book club & friends  Active: true Blocked: false
+Id: BBBB2222cccc/dddd+eeee3333ffff4444gggg5555h= Name: 🎉 party 3.0  Active: true Blocked: false
+Id: CCCC3333dddd+eeee/ffff4444gggg5555hhhh6666i= Name: Old crew  Active: false Blocked: false
+Id: DDDD4444eeee/ffff+gggg5555hhhh6666iiii7777j= Name: Spam group  Active: true Blocked: true
+"""
+
+
+def _patch_groups_output(monkeypatch, output=GROUPS_OUTPUT, returncode=0):
+    calls = {}
+
+    def fake_run(argv, **kwargs):
+        calls["argv"] = argv
+        return _completed(returncode=returncode, stdout=output, stderr="boom")
+
+    monkeypatch.setattr(signal_cli.subprocess, "run", fake_run)
+    return calls
+
+
+def test_list_groups_parses_output(have_binary, monkeypatch):
+    calls = _patch_groups_output(monkeypatch)
+
+    groups = list_groups(account="+31600000000")
+
+    assert calls["argv"] == [FAKE_BIN, "-a", "+31600000000", "listGroups"]
+    assert groups[0] == SignalGroup(
+        id="AAAA1111bbbb+cccc/dddd2222eeee3333ffff4444g=",
+        name="Book club & friends",
+        active=True,
+        blocked=False,
+    )
+    # Log lines are ignored, not mistaken for groups.
+    assert len(groups) == 4
+    assert groups[1].name == "🎉 party 3.0"
+    assert groups[2].active is False
+    assert groups[3].blocked is True
+
+
+def test_list_groups_recipient_is_prefixed(have_binary, monkeypatch):
+    _patch_groups_output(monkeypatch)
+    group = list_groups(account="+31600000000")[0]
+    assert group.recipient == f"group:{group.id}"
+
+
+def test_list_groups_uses_configured_account(have_binary, monkeypatch):
+    monkeypatch.setattr(
+        signal_cli,
+        "get_config",
+        lambda: SimpleNamespace(account="+31600000000", recipient=None),
+    )
+    calls = _patch_groups_output(monkeypatch)
+
+    list_groups()
+
+    assert calls["argv"][2] == "+31600000000"
+
+
+def test_list_groups_failure_raises(have_binary, monkeypatch):
+    _patch_groups_output(monkeypatch, output="", returncode=1)
+    with pytest.raises(SignalSendError):
+        list_groups(account="+31600000000")
+
+
+def test_receive_builds_correct_argv(have_binary, monkeypatch):
+    calls = {}
+
+    def fake_run(argv, **kwargs):
+        calls["argv"] = argv
+        return _completed(returncode=0, stdout="Envelope from: ...")
+
+    monkeypatch.setattr(signal_cli.subprocess, "run", fake_run)
+
+    receive(account="+31600000000", timeout=5)
+
+    assert calls["argv"] == [
+        FAKE_BIN,
+        "-a",
+        "+31600000000",
+        "receive",
+        "--timeout",
+        "5",
+    ]
+
+
+def test_receive_failure_raises(have_binary, monkeypatch):
+    monkeypatch.setattr(
+        signal_cli.subprocess,
+        "run",
+        lambda *a, **k: _completed(returncode=1, stderr="boom"),
+    )
+    with pytest.raises(SignalSendError):
+        receive(account="+31600000000")
+
+
+def test_send_msg_to_group_uses_g_flag(have_binary, monkeypatch):
+    calls = {}
+
+    def fake_run(argv, **kwargs):
+        calls["argv"] = argv
+        return _completed(returncode=0)
+
+    monkeypatch.setattr(signal_cli.subprocess, "run", fake_run)
+
+    send_msg("hi", recipient="group:abc123=", account="+31600000000")
+
+    assert calls["argv"] == [
+        FAKE_BIN,
+        "-a",
+        "+31600000000",
+        "send",
+        "-m",
+        "hi",
+        "-g",
+        "abc123=",
+    ]
+
+
+def test_send_msg_to_group_with_voice_note(have_binary, monkeypatch):
+    calls = {}
+
+    def fake_run(argv, **kwargs):
+        calls["argv"] = argv
+        return _completed(returncode=0)
+
+    monkeypatch.setattr(signal_cli.subprocess, "run", fake_run)
+
+    send_msg(
+        "episode",
+        recipient="group:abc123=",
+        account="+31600000000",
+        attachments=["/tmp/ep.mp3"],
+        voice_note=True,
+    )
+
+    # -g stays last, so --attachment's greedy arg list can't swallow it.
+    assert calls["argv"][-2:] == ["-g", "abc123="]
+    assert "--voice-note" in calls["argv"]
+
+
+def test_send_msg_bare_group_id_raises(have_binary, monkeypatch):
+    monkeypatch.setattr(signal_cli.subprocess, "run", lambda *a, **k: _completed())
+    with pytest.raises(ValueError) as excinfo:
+        send_msg("hi", recipient="AAAA1111bbbb=", account="+31600000000")
+    assert "group:" in str(excinfo.value)
 
 
 def test_link_device_prints_uri_when_no_qrencode(have_binary, monkeypatch, capsys):

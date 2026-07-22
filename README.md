@@ -39,7 +39,7 @@ pip install -e ".[dev]"
    - `RSSIGNAL_ACCOUNT` — the E.164 number rssignal sends from (the account you
      link below).
    - `RSSIGNAL_RECIPIENT` — default recipient for `send`; use your own number for
-     a note-to-self.
+     a note-to-self, or a `group:<id>` from `rssignal groups`.
 
 2. Link this machine to your Signal account (acts like Signal Desktop):
    ```bash
@@ -62,6 +62,33 @@ Send a message from the command line:
 rssignal send "hello from rssignal"
 rssignal send "to someone else" --to +31611111111
 ```
+
+### Sending to a group
+
+A recipient is either an E.164 number or a group, written `group:<id>`. Signal's
+group ids are base64 blobs, so `rssignal groups` lists them next to their names:
+
+```bash
+$ rssignal groups
+  Book club       group:AAAA1111bbbb+cccc/dddd2222eeee3333ffff4444g=
+  Weekend plans   group:BBBB2222cccc/dddd+eeee3333ffff4444gggg5555h=
+
+$ rssignal send "hi all" --to "group:AAAA1111bbbb+cccc/dddd2222eeee3333ffff4444g="
+```
+
+Quote the value: group ids contain `+` and `/`, and may end in `=`.
+
+**A group you just created won't appear yet.** rssignal runs as a linked
+secondary device, so it only learns about new groups from sync messages waiting
+in the incoming queue, and `listGroups` reads local state. Drain the queue first:
+
+```bash
+rssignal groups --refresh
+```
+
+Groups you have left or blocked are hidden; pass `--all` to see them, or
+`--quiet` to print just the recipient values. The same `group:` value works as a
+feed's `recipient` in `feeds.json` and as `RSSIGNAL_RECIPIENT`.
 
 Or from Python:
 
@@ -87,7 +114,7 @@ Each feed entry supports:
 | `url`               | yes      | The RSS/Atom feed URL.                                                  |
 | `type`              | yes      | `regular` (title + description + link) or `podcast` (audio voice note). |
 | `name`              | no       | Label used in logs / dry-run output, and available as `{feed_name}`.    |
-| `recipient`         | no       | Per-feed recipient; falls back to `RSSIGNAL_RECIPIENT`.                 |
+| `recipient`         | no       | Per-feed number or `group:<id>`; falls back to `RSSIGNAL_RECIPIENT`.    |
 | `max_age_hours`     | no       | Only send items published within this many hours.                      |
 | `max_age_days`      | no       | Added to `max_age_hours`. Omit both to send every item in the feed.    |
 | `message_template`  | no       | Message text with `{field}` placeholders. Omit for the built-in layout. |

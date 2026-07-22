@@ -8,7 +8,7 @@ import pytest
 from rssignal import cli
 from rssignal.config import ConfigError
 from rssignal.feeds import FeedConfig, FeedItem
-from rssignal.signal_cli import SignalSendError
+from rssignal.signal_cli import SignalGroup, SignalSendError
 
 
 def test_send_success(monkeypatch, capsys):
@@ -175,3 +175,97 @@ def test_fields_renders_template_preview(patched_feeds, capsys):
     assert rc == 0
     assert "rendered message" in out
     assert "Episode 402 - 00:42:11" in out
+
+
+# --- groups ----------------------------------------------------------------
+
+_GROUPS = [
+    SignalGroup(id="aaa=", name="Book club", active=True, blocked=False),
+    SignalGroup(id="bbb=", name="Old crew", active=False, blocked=False),
+    SignalGroup(id="ccc=", name="Spam group", active=True, blocked=True),
+]
+
+
+@pytest.fixture
+def patched_groups(monkeypatch):
+    monkeypatch.setattr(cli, "list_groups", lambda: _GROUPS)
+    # Guard: listing must not touch the network unless --refresh asks it to.
+    monkeypatch.setattr(
+        cli,
+        "receive",
+        lambda: pytest.fail("groups should not receive without --refresh"),
+    )
+
+
+def test_groups_lists_active_groups(patched_groups, capsys):
+    rc = cli.main(["groups"])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Book club" in out
+    assert "group:aaa=" in out
+    # Left and blocked groups are hidden unless asked for.
+    assert "Old crew" not in out
+    assert "Spam group" not in out
+
+
+def test_groups_all_includes_inactive_and_blocked(patched_groups, capsys):
+    rc = cli.main(["groups", "--all"])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Old crew" in out and "(inactive)" in out
+    assert "Spam group" in out and "(blocked)" in out
+
+
+def test_groups_quiet_prints_only_recipients(patched_groups, capsys):
+    rc = cli.main(["groups", "--quiet"])
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "group:aaa="
+
+
+def test_groups_hints_at_refresh(patched_groups, capsys):
+    cli.main(["groups"])
+    assert "--refresh" in capsys.readouterr().out
+
+
+def test_groups_quiet_output_stays_pipeable(patched_groups, capsys):
+    # The hint would corrupt the output if it leaked into --quiet.
+    cli.main(["groups", "--quiet"])
+    assert "--refresh" not in capsys.readouterr().out
+
+
+def test_groups_refresh_receives_first(monkeypatch, capsys):
+    order = []
+    monkeypatch.setattr(cli, "receive", lambda: order.append("receive"))
+    monkeypatch.setattr(
+        cli, "list_groups", lambda: (order.append("list"), _GROUPS)[1]
+    )
+
+    rc = cli.main(["groups", "--refresh"])
+
+    assert rc == 0
+    assert order == ["receive", "list"]
+    # Already refreshed, so the hint would be noise.
+    assert "--refresh" not in capsys.readouterr().out
+
+
+def test_groups_none_found_returns_1(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "list_groups", list)
+    monkeypatch.setattr(cli, "receive", lambda: None)
+
+    assert cli.main(["groups"]) == 1
+    out = capsys.readouterr().out
+    assert "No groups found" in out
+    assert "--refresh" in out
+
+
+def test_groups_signal_error_returns_1(monkeypatch, capsys):
+    def boom():
+        raise SignalSendError("listGroups failed", returncode=1, stderr="x")
+
+    monkeypatch.setattr(cli, "list_groups", boom)
+
+    assert cli.main(["groups"]) == 1
+    assert "error:" in capsys.readouterr().err

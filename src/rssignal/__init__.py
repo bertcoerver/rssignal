@@ -19,10 +19,13 @@ from .signal_cli import (
     AccountNotLinked,
     SignalCliNotFound,
     SignalError,
+    SignalGroup,
     SignalSendError,
     is_account_registered,
     link_device,
     list_accounts,
+    list_groups,
+    receive,
     send_msg,
 )
 
@@ -39,6 +42,9 @@ __all__ = [
     "send_msg",
     "link_device",
     "list_accounts",
+    "list_groups",
+    "receive",
+    "SignalGroup",
     "is_account_registered",
     "SignalError",
     "SignalCliNotFound",

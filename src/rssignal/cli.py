@@ -6,6 +6,7 @@ Subcommands:
     send MESSAGE    send a text message (uses configured account/recipient)
     run [--config]  parse configured feeds and send their recent items
     fields          show the fields an item exposes, for writing templates
+    groups          list the Signal groups you can send to
 """
 
 from __future__ import annotations
@@ -29,7 +30,16 @@ from .signal_cli import (
     find_signal_cli,
     link_device,
     list_accounts,
+    list_groups,
+    receive,
     send_msg,
+)
+
+# Groups reach a linked device as sync messages, so a freshly created one stays
+# invisible until the incoming queue is drained at least once.
+_REFRESH_HINT = (
+    "Missing a group you just created? Run `rssignal groups --refresh` to "
+    "receive pending messages first."
 )
 
 
@@ -143,6 +153,43 @@ def _cmd_fields(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_groups(args: argparse.Namespace) -> int:
+    """Print the groups this account can send to, with copy-pasteable ids."""
+    if args.refresh:
+        print("Receiving pending messages…")
+        receive()
+
+    groups = list_groups()
+    if not args.all:
+        groups = [g for g in groups if g.active and not g.blocked]
+
+    if not groups:
+        print("No groups found. (Groups you have left need --all.)")
+        if not args.refresh:
+            print(_REFRESH_HINT)
+        return 1
+
+    if args.quiet:
+        for group in groups:
+            print(group.recipient)
+        return 0
+
+    width = max(len(g.name) for g in groups)
+    for group in groups:
+        flags = "".join(
+            [" (inactive)" if not group.active else "", " (blocked)" if group.blocked else ""]
+        )
+        print(f"  {group.name:<{width}}  {group.recipient}{flags}")
+
+    print(
+        "\nUse a value above as a `recipient` in feeds.json, as `--to`, or as "
+        "RSSIGNAL_RECIPIENT."
+    )
+    if not args.refresh:
+        print(_REFRESH_HINT)
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rssignal", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -216,6 +263,27 @@ def _build_parser() -> argparse.ArgumentParser:
         help="also render this message_template against the sampled item",
     )
     fields.set_defaults(func=_cmd_fields)
+
+    groups = subparsers.add_parser(
+        "groups", help="list the Signal groups you can send to"
+    )
+    groups.add_argument(
+        "--all",
+        action="store_true",
+        help="also show groups you have left or blocked",
+    )
+    groups.add_argument(
+        "--refresh",
+        action="store_true",
+        help="receive pending messages first, to pick up newly created groups",
+    )
+    groups.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="print only the recipient values, one per line",
+    )
+    groups.set_defaults(func=_cmd_groups)
 
     return parser
 
