@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from html import unescape
 from html.parser import HTMLParser
@@ -31,10 +31,10 @@ KNOWN_KEYS = (
     "url",
     "type",
     "name",
-    "recipient",
     "max_age_hours",
     "max_age_days",
     "message_template",
+    "extract",
     "link_preview",
     "preview_url",
     "preview_title",
@@ -59,8 +59,6 @@ CORE_FIELDS = (
 # Defaults for the link preview card, as {field} templates.
 DEFAULT_PREVIEW_URL = "{link}"
 DEFAULT_PREVIEW_TITLE = "{title}"
-# Preview descriptions render as a couple of lines on a card, not as a message.
-PREVIEW_DESCRIPTION_LIMIT = 200
 
 # Entry keys already mapped onto FeedItem, so they don't repeat in ``extra``.
 _MAPPED_ENTRY_KEYS = frozenset(
@@ -98,16 +96,36 @@ class FeedFilter:
 
 
 @dataclass(frozen=True)
+class FieldExtract:
+    """A new field cut out of an existing one, e.g. an id buried in a URL.
+
+    ``pattern`` is matched against the ``source`` field; the new field takes the
+    first capture group, or the whole match when the regex has no groups. Feeds
+    routinely bury the only per-item identifier inside a media URL, and this is
+    what makes it addressable as ``{name}`` in a template or a filter.
+    """
+
+    name: str
+    source: str
+    pattern: str
+
+
+@dataclass(frozen=True)
 class FeedConfig:
-    """Configuration for a single feed, as read from ``feeds.json``."""
+    """Configuration for a single feed, as read from ``feeds.json``.
+
+    ``name`` doubles as the name of the Signal group this feed sends to, so
+    :func:`load_feeds` requires it. It defaults to empty here only so that the
+    pure rendering helpers can be exercised without one.
+    """
 
     url: str
     type: str
-    name: str | None = None
-    recipient: str | None = None
+    name: str = ""
     max_age: timedelta | None = None
     message_template: str | None = None
     filters: tuple[FeedFilter, ...] = ()
+    extract: tuple[FieldExtract, ...] = ()
     link_preview: bool | None = None
     preview_url: str | None = None
     preview_title: str | None = None
@@ -149,12 +167,28 @@ class FeedItem:
     extra: dict[str, str] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ParsedFeed:
+    """A parsed feed: its entries plus the channel-level data rssignal uses.
+
+    ``image_url`` is the show's / site's own artwork and ``description`` is what
+    the feed says about itself. Items deliberately never inherit either (see
+    :func:`_build_feed_item`) — on a preview card the same logo and blurb every
+    time say nothing. On the *group* they are exactly right, which is the only
+    thing they are used for.
+    """
+
+    items: list[FeedItem]
+    image_url: str | None = None
+    description: str = ""
+
+
 def load_feeds(path: str = "feeds.json") -> list[FeedConfig]:
     """Read ``path`` and return the list of :class:`FeedConfig` it describes.
 
-    Expects ``{"feeds": [ {...}, ... ]}``. Each feed needs a ``url`` and a
-    ``type`` (one of :data:`FEED_TYPES`); ``name`` and ``recipient`` are
-    optional, and recency comes from optional ``max_age_hours`` /
+    Expects ``{"feeds": [ {...}, ... ]}``. Each feed needs a ``url``, a ``type``
+    (one of :data:`FEED_TYPES`), and a ``name`` — the name is the Signal group
+    the feed sends to. Recency comes from optional ``max_age_hours`` /
     ``max_age_days`` keys (summed). Raises :class:`FeedError` on a missing file,
     invalid JSON, or a malformed / unknown-type entry.
     """
@@ -196,6 +230,13 @@ def _build_feed_config(raw: object, index: int) -> FeedConfig:
             f"{where} has type {feed_type!r}; expected one of {FEED_TYPES}."
         )
 
+    name = raw.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise FeedError(
+            f"{where} is missing a non-empty \"name\". The name is the Signal "
+            "group this feed sends to; rssignal creates it if it doesn't exist."
+        )
+
     hours = raw.get("max_age_hours", 0) or 0
     days = raw.get("max_age_days", 0) or 0
     if not isinstance(hours, (int, float)) or not isinstance(days, (int, float)):
@@ -220,14 +261,53 @@ def _build_feed_config(raw: object, index: int) -> FeedConfig:
     return FeedConfig(
         url=url,
         type=feed_type,
-        name=raw.get("name"),
-        recipient=raw.get("recipient"),
+        name=name.strip(),
         max_age=max_age,
         message_template=template,
         filters=_build_filters(raw, where),
+        extract=_build_extracts(raw.get("extract"), where),
         link_preview=link_preview,
         **previews,
     )
+
+
+def _build_extracts(raw: object, where: str) -> tuple[FieldExtract, ...]:
+    """Validate the ``extract`` block into :class:`FieldExtract` rules.
+
+    Patterns are compiled here rather than per item: a typo in a regex should
+    fail the run up front, not halfway through sending a feed.
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, dict):
+        raise FeedError(
+            f"{where} extract must be an object mapping a field name to "
+            "{\"from\": ..., \"pattern\": ...}."
+        )
+
+    rules: list[FieldExtract] = []
+    for name, spec in raw.items():
+        at = f"{where} extract[{name!r}]"
+        if not isinstance(spec, dict):
+            raise FeedError(f"{at} must be an object with \"from\" and \"pattern\".")
+
+        source = spec.get("from")
+        pattern = spec.get("pattern")
+        for key, value in (("from", source), ("pattern", pattern)):
+            if not isinstance(value, str) or not value:
+                raise FeedError(f"{at} is missing a non-empty string {key!r}.")
+
+        unknown = set(spec) - {"from", "pattern"}
+        if unknown:
+            raise FeedError(f"{at} has unknown key(s) {sorted(unknown)}.")
+
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise FeedError(f"{at} has an invalid regex {pattern!r}: {exc}") from exc
+
+        rules.append(FieldExtract(name=name, source=source, pattern=pattern))
+    return tuple(rules)
 
 
 def _build_filters(raw: dict, where: str) -> tuple[FeedFilter, ...]:
@@ -241,6 +321,13 @@ def _build_filters(raw: dict, where: str) -> tuple[FeedFilter, ...]:
     for key, value in raw.items():
         if key in KNOWN_KEYS:
             continue
+        if key == "recipient":
+            raise FeedError(
+                f"{where} still has a \"recipient\". Feeds now send to a Signal "
+                "group named after the feed's \"name\", created on the first "
+                "send if it doesn't exist yet, so drop the key. To send "
+                "somewhere else for a test, use `rssignal run --to`."
+            )
 
         field_name, _, op = key.rpartition("_")
         if not field_name or op not in FILTER_OPS:
@@ -267,21 +354,29 @@ def _build_filters(raw: dict, where: str) -> tuple[FeedFilter, ...]:
     return tuple(filters)
 
 
-def parse_feed(cfg: FeedConfig) -> list[FeedItem]:
-    """Fetch and parse ``cfg.url``, returning its entries as :class:`FeedItem`."""
+def parse_feed(cfg: FeedConfig) -> ParsedFeed:
+    """Fetch and parse ``cfg.url`` into a :class:`ParsedFeed`."""
     parsed = feedparser.parse(cfg.url)
     # feedparser doesn't raise on network/parse trouble; it records it instead.
     if getattr(parsed, "bozo", False) and not parsed.entries:
         exc = getattr(parsed, "bozo_exception", "unknown error")
         raise FeedError(f"Could not read feed {cfg.url!r}: {exc}")
 
-    feed_name = cfg.name or ""
-    # Most podcasts set artwork once on the channel rather than per episode, so
-    # it stands in when an entry has no image of its own.
-    feed_image = _href(getattr(parsed, "feed", {}).get("image"))
-    return [
-        _build_feed_item(entry, feed_name, feed_image) for entry in parsed.entries
-    ]
+    channel = getattr(parsed, "feed", None) or {}
+    cget = channel.get if hasattr(channel, "get") else lambda k, d=None: getattr(channel, k, d)
+
+    # "summary" is the channel's <description>; "subtitle" is the shorter
+    # <itunes:subtitle>, which some feeds fill in instead.
+    description = strip_html(cget("summary") or cget("subtitle") or "")
+
+    return ParsedFeed(
+        items=[
+            apply_extracts(_build_feed_item(entry, cfg.name), cfg.extract)
+            for entry in parsed.entries
+        ],
+        image_url=_href(cget("image")),
+        description=description,
+    )
 
 
 def _href(value: object) -> str | None:
@@ -293,9 +388,7 @@ def _href(value: object) -> str | None:
     return str(url) if url else None
 
 
-def _build_feed_item(
-    entry: object, feed_name: str = "", feed_image: str | None = None
-) -> FeedItem:
+def _build_feed_item(entry: object, feed_name: str = "") -> FeedItem:
     """Map a single feedparser entry to a :class:`FeedItem`."""
     get = entry.get if isinstance(entry, dict) else lambda k, d=None: getattr(entry, k, d)
 
@@ -318,12 +411,12 @@ def _build_feed_item(
         enclosure_url = fget("href") or fget("url") or None
         enclosure_type = fget("type") or None
 
-    # Episode artwork: <itunes:image> lands in "image", media RSS in
-    # "media_thumbnail"; the channel's own artwork is the last resort.
+    # Episode artwork only: <itunes:image> lands in "image", media RSS in
+    # "media_thumbnail". The channel's artwork is deliberately not a fallback —
+    # the same show logo on every item makes a preview card less informative,
+    # not more.
     thumbnails = get("media_thumbnail") or []
-    image_url = (
-        _href(get("image")) or _href(thumbnails[0] if thumbnails else None) or feed_image
-    )
+    image_url = _href(get("image")) or _href(thumbnails[0] if thumbnails else None)
 
     # feedparser exposes categories as tags: [{"term": "news", ...}, ...].
     categories = []
@@ -451,6 +544,32 @@ def item_fields(item: FeedItem) -> dict[str, str]:
     return fields
 
 
+def apply_extracts(item: FeedItem, rules: tuple[FieldExtract, ...]) -> FeedItem:
+    """Return ``item`` with the fields ``rules`` cut out of it added to ``extra``.
+
+    Landing them in ``extra`` is what makes them ordinary fields: templates,
+    filters, and ``rssignal fields`` all read :func:`item_fields`, which merges
+    extras behind the named fields. A rule can therefore never shadow ``title``
+    or ``link``, and it reads the item as it came off the feed — extracts do not
+    chain into one another.
+
+    A pattern that doesn't match yields an empty field rather than an error, in
+    keeping with how templates treat a missing placeholder.
+    """
+    if not rules:
+        return item
+
+    fields = item_fields(item)
+    extra = dict(item.extra)
+    for rule in rules:
+        match = re.search(rule.pattern, fields.get(rule.source, ""))
+        if match is None:
+            extra[rule.name] = ""
+        else:
+            extra[rule.name] = match.group(1) if match.re.groups else match.group(0)
+    return replace(item, extra=extra)
+
+
 def apply_filters(
     items: list[FeedItem], filters: tuple[FeedFilter, ...]
 ) -> list[FeedItem]:
@@ -503,26 +622,16 @@ def _render_template(template: str, item: FeedItem, cfg: FeedConfig, what: str) 
         raise FeedError(f"{what} for feed {label!r} is malformed: {exc}") from exc
 
 
-def truncate(text: str, limit: int) -> str:
-    """Shorten ``text`` to ``limit`` characters, cutting at a word boundary."""
-    if len(text) <= limit:
-        return text
-    # One character is reserved for the ellipsis. Only drop a trailing partial
-    # word — if the cut lands on a space, the last word is whole already.
-    cut = text[: limit - 1]
-    if not text[limit - 1].isspace():
-        head, sep, _ = cut.rpartition(" ")
-        if sep:
-            cut = head
-    return cut.rstrip() + "…"
-
-
 def preview_fields(item: FeedItem, cfg: FeedConfig) -> dict[str, str] | None:
     """Return the link-preview card for ``item``, or ``None`` for no preview.
 
     The card is rendered from the same fields as message templates, so anything
     ``rssignal fields`` lists can go in it. ``image_url`` is the *remote* URL —
     signal-cli wants a local file, so :mod:`rssignal.run` downloads it.
+
+    The card carries no description unless ``preview_description`` asks for one:
+    the body of the message is right underneath it, so repeating the item's text
+    on the card only crowds it.
 
     Returns ``None`` when previews are off for this feed, or when the url or
     title render empty: signal-cli requires both, and a card with no title is
@@ -540,9 +649,8 @@ def preview_fields(item: FeedItem, cfg: FeedConfig) -> dict[str, str] | None:
     if not url or not title:
         return None
 
-    if cfg.preview_description is None:
-        description = truncate(item.description, PREVIEW_DESCRIPTION_LIMIT)
-    else:
+    description = ""
+    if cfg.preview_description is not None:
         description = _render_template(
             cfg.preview_description, item, cfg, "preview_description"
         ).strip()
@@ -565,9 +673,15 @@ def render_message(item: FeedItem, cfg: FeedConfig) -> str:
     When the feed sends a link preview, the preview url is appended unless the
     text already contains it — signal-cli requires the url to appear in the body,
     and the built-in podcast layout has no link at all.
+
+    A card already shows the title, so the built-in layout drops it in that case
+    rather than printing it twice in a row. A ``message_template`` is left alone:
+    if you wrote the layout, you decide what is in it.
     """
+    preview = preview_fields(item, cfg)
+
     if cfg.message_template is None:
-        text = format_message(item, cfg.type)
+        text = format_message(item, cfg.type, include_title=preview is None)
     else:
         text = _render_template(
             cfg.message_template, item, cfg, "message_template"
@@ -575,19 +689,20 @@ def render_message(item: FeedItem, cfg: FeedConfig) -> str:
         # Placeholders that resolved to nothing would otherwise leave blank gaps.
         text = re.sub(r"\n{3,}", "\n\n", text).strip()
 
-    preview = preview_fields(item, cfg)
     if preview and preview["url"] not in text:
         text = f"{text}\n\n{preview['url']}".strip()
     return text
 
 
-def format_message(item: FeedItem, feed_type: str) -> str:
+def format_message(item: FeedItem, feed_type: str, *, include_title: bool = True) -> str:
     """Build the default Signal message text for ``item``.
 
     For ``regular`` feeds the link is appended; for ``podcast`` feeds it is
-    omitted, since the audio enclosure is sent as an attachment instead.
+    omitted, since the audio enclosure is sent as an attachment instead. Clear
+    ``include_title`` when something else in the message already shows it — a
+    link preview card, for instance.
     """
-    parts = [item.title, item.description]
+    parts = [item.title if include_title else "", item.description]
     if feed_type == "regular":
         parts.append(item.link or "")
     return "\n\n".join(part for part in parts if part)

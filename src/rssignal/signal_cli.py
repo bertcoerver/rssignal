@@ -12,12 +12,29 @@ reach for once the cloud service sends many messages per run.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import shutil
 import subprocess
+import sys
+import tempfile
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 
+from PIL import Image, UnidentifiedImageError
+
 from .config import get_config
+
+# Signal silently drops a group avatar that is too large: the upload is accepted,
+# signal-cli exits 0, and the group simply keeps no picture. 1400x1400 is dropped,
+# 512x512 goes through, so anything bigger is scaled down before it is sent.
+GROUP_AVATAR_MAX_PX = 512
+
+# Signal caps group descriptions, but signal-cli documents no figure and rejects
+# nothing locally. This is a conservative cap so a long feed blurb is shortened
+# by rssignal — where it can be cut on a word — rather than by the server.
+GROUP_DESCRIPTION_MAX_CHARS = 480
 
 # Default name shown in Signal's "Linked Devices" list.
 DEFAULT_DEVICE_NAME = "rssignal"
@@ -220,6 +237,290 @@ def list_groups(*, account: str | None = None) -> list[SignalGroup]:
                 )
             )
     return groups
+
+
+def match_group(groups: list[SignalGroup], name: str) -> SignalGroup | None:
+    """Pick the group called ``name`` out of ``groups``, or ``None``.
+
+    Matching is case-insensitive on the trimmed name, and only groups you are
+    still in and haven't blocked are considered. Two groups sharing a name raise
+    :class:`SignalError` rather than picking one — sending a feed to the wrong
+    group is worse than stopping to ask.
+
+    Kept separate from :func:`find_group` so a caller resolving many names can
+    list the groups once and match against that one listing.
+    """
+    needle = name.strip().lower()
+    found = [
+        group
+        for group in groups
+        if group.active
+        and not group.blocked
+        and group.name.strip().lower() == needle
+    ]
+    if len(found) > 1:
+        raise SignalError(
+            f"{len(found)} groups are called {name!r}. rssignal can't tell which "
+            "one you mean — rename one in Signal, or point the feed at a "
+            "different name."
+        )
+    return found[0] if found else None
+
+
+def find_group(
+    name: str, *, account: str | None = None, refresh: bool = True
+) -> SignalGroup | None:
+    """Return the group called ``name``, or ``None`` if there isn't one.
+
+    On a miss, ``receive()`` is called once and the list re-read: rssignal runs
+    as a linked secondary device, so a group created on your phone is invisible
+    until the sync messages are drained. Skipping that step would make rssignal
+    create a duplicate of a group you already have. Pass ``refresh=False`` for a
+    read-only lookup that never touches the message queue.
+    """
+    group = match_group(list_groups(account=account), name)
+    if group is None and refresh:
+        receive(account=account)
+        group = match_group(list_groups(account=account), name)
+    return group
+
+
+def _parse_new_group_id(stdout: str) -> str | None:
+    """Pull the new group's id out of ``updateGroup -o json`` output.
+
+    Returns ``None`` when the output isn't the expected JSON — the caller then
+    falls back to diffing ``listGroups``, so the exact output format is not
+    something rssignal has to be right about.
+    """
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        group_id = payload.get("groupId")
+        if isinstance(group_id, str) and group_id:
+            return group_id
+    return None
+
+
+def create_group(
+    name: str,
+    *,
+    description: str | None = None,
+    avatar: str | None = None,
+    announcement_only: bool = False,
+    account: str | None = None,
+    timeout: float = 120,
+) -> SignalGroup:
+    """Create a new Signal group containing only you, and return it.
+
+    Runs ``signal-cli updateGroup`` with no ``--group-id``, which is how
+    signal-cli creates a group rather than editing one. The account creating the
+    group is its only member and its admin.
+
+    **No one else is ever added.** There is deliberately no ``members``
+    parameter: adding someone to a group is an action they cannot undo without
+    leaving it, and rssignal exists to send feeds, not to manage anyone's
+    contacts. Invite people from Signal on your phone once the group exists.
+
+    ``avatar`` is a **local image file path** (signal-cli uploads it), not a URL.
+    ``announcement_only`` restricts sending to admins, which is usually what you
+    want for a group that exists to receive a feed.
+
+    The description and avatar are applied by a **second** ``updateGroup`` call
+    once the group has an id. signal-cli accepts ``--avatar`` on the creating
+    call, exits 0, and leaves the group with no picture; the same flag against an
+    existing ``--group-id`` works. That was measured; whether ``--description``
+    fares any better there was not, so it takes the path known to work.
+    ``--name`` and ``--set-permission-send-messages`` do take effect on creation
+    and stay put. A group that can't be decorated is still returned, with a
+    warning: losing the blurb or the picture is not a reason to lose the group.
+
+    The returned :class:`SignalGroup` carries the new base64 id; its
+    :attr:`~SignalGroup.recipient` is ready to send to.
+    """
+    binary = find_signal_cli()
+    if account is None:
+        account = get_config().account
+
+    if not name.strip():
+        raise ValueError("A group needs a name.")
+    if avatar is not None and not os.path.isfile(avatar):
+        raise ValueError(
+            f"Group avatar {avatar!r} is not a file. --avatar takes a local image "
+            "path, not a URL — download the image first."
+        )
+
+    # Recorded up front so the new group can be identified by elimination if the
+    # command's output can't be parsed.
+    before = {group.id for group in list_groups(account=account)}
+
+    # No -g means "create"; no -m means the group starts with only this account.
+    # --avatar and --description are deliberately absent: see the docstring.
+    argv = [binary, "-o", "json", "-a", account, "updateGroup", "--name", name]
+    if announcement_only:
+        argv.extend(["--set-permission-send-messages", "only-admins"])
+
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise SignalSendError(
+            f"`signal-cli updateGroup` timed out after {timeout}s. The group may "
+            "or may not have been created — check `rssignal groups`.",
+            stderr=(exc.stderr or "") if isinstance(exc.stderr, str) else "",
+        ) from exc
+
+    if result.returncode != 0:
+        raise SignalSendError(
+            f"`signal-cli updateGroup` failed with status {result.returncode}: "
+            f"{result.stderr.strip()}",
+            returncode=result.returncode,
+            stderr=result.stderr.strip(),
+        )
+
+    group_id = _parse_new_group_id(result.stdout)
+    if group_id is None:
+        created = [g for g in list_groups(account=account) if g.id not in before]
+        if len(created) != 1:
+            raise SignalSendError(
+                "The group was created, but its id could not be determined from "
+                "signal-cli's output. Run `rssignal groups` to find it."
+            )
+        group_id = created[0].id
+
+    if description or avatar:
+        try:
+            update_group(
+                group_id,
+                description=description or None,
+                avatar=avatar or None,
+                account=account,
+                timeout=timeout,
+            )
+        except SignalError as exc:
+            print(
+                f"Group {name!r} was created, but setting its description and "
+                f"picture failed: {exc}",
+                file=sys.stderr,
+            )
+
+    return SignalGroup(id=group_id, name=name)
+
+
+def _clip(text: str, limit: int = GROUP_DESCRIPTION_MAX_CHARS) -> str:
+    """Shorten ``text`` to ``limit`` characters, cutting on a word where possible."""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    cut = text[: limit - 1]
+    space = cut.rfind(" ")
+    if space > limit // 2:
+        cut = cut[:space]
+    return cut.rstrip(" ,;:.—-") + "…"
+
+
+@contextmanager
+def _avatar_within_limits(path: str):
+    """Yield a path to ``path`` scaled down to what Signal will accept.
+
+    The original is yielded untouched when it already fits, and also when it
+    can't be read as an image — a picture rssignal doesn't understand is better
+    handed to signal-cli than rejected outright. Anything larger is written to a
+    temporary JPEG that is removed on the way out.
+    """
+    try:
+        with Image.open(path) as img:
+            if max(img.size) <= GROUP_AVATAR_MAX_PX:
+                yield path
+                return
+            shrunk = img.convert("RGB")
+            shrunk.thumbnail((GROUP_AVATAR_MAX_PX, GROUP_AVATAR_MAX_PX))
+    except (UnidentifiedImageError, OSError):
+        yield path
+        return
+
+    fd, small = tempfile.mkstemp(suffix=".jpg")
+    os.close(fd)
+    try:
+        shrunk.save(small, "JPEG", quality=85)
+        yield small
+    finally:
+        os.unlink(small)
+
+
+def update_group(
+    group_id: str,
+    *,
+    description: str | None = None,
+    avatar: str | None = None,
+    account: str | None = None,
+    timeout: float = 120,
+) -> None:
+    """Set an existing group's description and/or picture, in one call.
+
+    ``avatar`` is a **local image file path**, not a URL; images larger than
+    :data:`GROUP_AVATAR_MAX_PX` are scaled down first, because Signal drops an
+    oversized avatar without reporting anything. ``description`` is trimmed to
+    :data:`GROUP_DESCRIPTION_MAX_CHARS`.
+
+    Separate from :func:`create_group` because signal-cli does not honour
+    ``--avatar`` on the call that creates a group. Anything left as ``None`` is
+    not touched, and asking for no change at all runs nothing.
+
+    Membership is deliberately not settable here, for the same reason
+    :func:`create_group` has no ``members``: who is in a group is not rssignal's
+    decision to make.
+    """
+    if avatar is not None and not os.path.isfile(avatar):
+        raise ValueError(
+            f"Group avatar {avatar!r} is not a file. An avatar is a local image "
+            "path, not a URL — download the image first."
+        )
+    if description is None and avatar is None:
+        return
+
+    binary = find_signal_cli()
+    if account is None:
+        account = get_config().account
+
+    with ExitStack() as stack:
+        argv = [binary, "-a", account, "updateGroup", "--group-id", group_id]
+        if description is not None:
+            argv.extend(["--description", _clip(description)])
+        if avatar is not None:
+            argv.extend(["--avatar", stack.enter_context(_avatar_within_limits(avatar))])
+
+        try:
+            result = subprocess.run(
+                argv, capture_output=True, text=True, timeout=timeout
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise SignalSendError(
+                f"`signal-cli updateGroup` timed out after {timeout}s.",
+                stderr=(exc.stderr or "") if isinstance(exc.stderr, str) else "",
+            ) from exc
+
+    if result.returncode != 0:
+        raise SignalSendError(
+            f"`signal-cli updateGroup` failed with status {result.returncode}: "
+            f"{result.stderr.strip()}",
+            returncode=result.returncode,
+            stderr=result.stderr.strip(),
+        )
+
+
+def set_group_avatar(
+    group_id: str,
+    avatar: str,
+    *,
+    account: str | None = None,
+    timeout: float = 120,
+) -> None:
+    """Set an existing group's picture. Shorthand for :func:`update_group`."""
+    update_group(group_id, avatar=avatar, account=account, timeout=timeout)
 
 
 def is_account_registered(account: str) -> bool:

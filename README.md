@@ -6,13 +6,14 @@ rssignal parses RSS feeds and forwards items as Signal text messages. It sends
 by shelling out to the [`signal-cli`](https://github.com/AsamK/signal-cli)
 command-line tool, so messages come from your own linked Signal account.
 
-> **Status:** early. Signal setup, message sending, feed parsing/sending, message
-> templates, per-field filters, and link previews work. De-duplication and the
-> cloud service (POST-triggered) come next.
+> **Status:** early. Signal setup, message sending, one auto-created group per
+> feed, feed parsing/sending, message templates, per-field filters, extracted
+> fields, and link previews work.
+> De-duplication and the cloud service (POST-triggered) come next.
 
 ## Requirements
 
-- Python 3.13+
+- Python 3.13+ (installs `feedparser` and `Pillow`)
 - `signal-cli` on your PATH:
   ```bash
   brew install signal-cli        # macOS
@@ -39,7 +40,8 @@ pip install -e ".[dev]"
    - `RSSIGNAL_ACCOUNT` — the E.164 number rssignal sends from (the account you
      link below).
    - `RSSIGNAL_RECIPIENT` — default recipient for `send`; use your own number for
-     a note-to-self, or a `group:<id>` from `rssignal groups`.
+     a note-to-self, or a `group:<id>` from `rssignal groups`. Optional, and not
+     used by `run` — feeds send to the group named after them.
 
 2. Link this machine to your Signal account (acts like Signal Desktop):
    ```bash
@@ -87,8 +89,30 @@ rssignal groups --refresh
 ```
 
 Groups you have left or blocked are hidden; pass `--all` to see them, or
-`--quiet` to print just the recipient values. The same `group:` value works as a
-feed's `recipient` in `feeds.json` and as `RSSIGNAL_RECIPIENT`.
+`--quiet` to print just the recipient values. The same `group:` value works with
+`send --to`, `run --to`, and as `RSSIGNAL_RECIPIENT`. Feeds don't need one: they
+find their group by name (see [One group per feed](#one-group-per-feed)).
+
+### Creating a group
+
+Feeds create their own group on the first send, so this is for making one ahead
+of time — or for a group you just want to have:
+
+```bash
+rssignal create-group "Podcast drops" \
+  --description "One episode a day" \
+  --avatar ./artwork.jpg \
+  --announcement
+```
+
+Name a feed after it and that feed will send there. `--avatar` sets the group
+image and takes a **local file path**, not a URL. `--announcement` restricts
+sending to admins, which suits a group that exists to receive a feed.
+
+**The new group contains only you.** rssignal has no way to add anyone else —
+there is no `--member` flag, and nothing here reads your contacts. Invite people
+from Signal on your phone once the group exists; that keeps the decision about
+who joins a group where it belongs.
 
 Or from Python:
 
@@ -113,21 +137,93 @@ Each feed entry supports:
 | ------------------- | -------- | ---------------------------------------------------------------------- |
 | `url`               | yes      | The RSS/Atom feed URL.                                                  |
 | `type`              | yes      | `regular` (title + description + link) or `podcast` (audio voice note). |
-| `name`              | no       | Label used in logs / dry-run output, and available as `{feed_name}`.    |
-| `recipient`         | no       | Per-feed number or `group:<id>`; falls back to `RSSIGNAL_RECIPIENT`.    |
+| `name`              | yes      | The Signal group this feed sends to. Also `{feed_name}` in templates.  |
 | `max_age_hours`     | no       | Only send items published within this many hours.                      |
 | `max_age_days`      | no       | Added to `max_age_hours`. Omit both to send every item in the feed.    |
 | `message_template`  | no       | Message text with `{field}` placeholders. Omit for the built-in layout. |
+| `extract`           | no       | Define new fields by regex against existing ones. See below.           |
 | `link_preview`      | no       | Send a link preview card. Defaults to on for `podcast`, off for `regular`. |
 | `preview_url`       | no       | Template for the card's link. Defaults to `{link}`.                    |
 | `preview_title`     | no       | Template for the card's title. Defaults to `{title}`.                  |
-| `preview_description` | no     | Template for the card's text. Defaults to the truncated description.   |
+| `preview_description` | no     | Template for the card's text. Omit for a card with no description.     |
 | `<field>_contains`  | no       | Keep items whose field contains any of these terms.                    |
 | `<field>_excludes`  | no       | Drop items whose field contains any of these terms.                    |
 | `<field>_matches`   | no       | Keep items whose field matches any of these regexes.                   |
 
 Unknown keys are rejected, so a typo like `max_age_hour` is an error rather than a
 silently ignored setting.
+
+### One group per feed
+
+A feed's `name` is the Signal group it sends to. There is no recipient to look up
+or paste in: on the first send rssignal finds the group of that name, and creates
+it if there isn't one.
+
+```
+$ rssignal run
+Created group 'Podcast drops' for this feed.
+3 item(s) sent.
+```
+
+A created group holds **only you** and is announcement-only, so it stays a feed
+rather than becoming a chat. It also takes the feed's own identity: the channel
+artwork (`<itunes:image>` for a podcast, the site's logo for a blog) as its
+picture, and the channel's description as its group description. Both are
+channel-level — an episode's own image and notes stay on the message, where they
+belong. Invite people from Signal on your phone; rssignal never adds anyone.
+
+Those settings are applied **only when rssignal creates the group.** A group you
+already had is used exactly as it is — rssignal will not restyle a group you made
+yourself. To set them yourself:
+
+```python
+from rssignal import update_group
+update_group("<group id>", description="A daily podcast.", avatar="./artwork.jpg")
+```
+
+Group pictures have two traps, both of which fail **silently** — the command
+exits 0 and the group simply has no image:
+
+- `updateGroup` ignores `--avatar` on the call that *creates* a group (though it
+  does honour `--name` and `--set-permission-send-messages` there). rssignal
+  therefore sets the picture in a second call against the new group id, and puts
+  the description there too rather than trust it to the creating call.
+- Signal drops an avatar that is too large. A 1400×1400 podcast cover vanishes;
+  512×512 arrives. rssignal scales anything bigger down to 512px on its longest
+  side before sending, keeping the aspect ratio.
+
+Long feed descriptions are trimmed to 480 characters on a word boundary. If
+setting either fails you get a warning on stderr and still keep the group.
+
+> **Note:** deleting a group *chat* in the Signal app does not leave the group —
+> it only removes the conversation from your list. rssignal still sees it and will
+> keep sending there. Use **Leave group** if you want a feed to start over with a
+> fresh one.
+
+Every run drains the incoming message queue before reading the group list.
+`listGroups` reads local state on a linked device, and that state lags: a group
+you made on your phone is invisible until it syncs, and a group you *left* still
+reads as active. Matching a group you left is the dangerous half — signal-cli
+exits 0 sending into it, so the message is counted as sent and simply never
+arrives. Refreshing up front costs one `signal-cli` call per run and removes the
+whole class of problem.
+
+Matching is case-insensitive and ignores surrounding whitespace. Groups you have
+left or blocked don't count, so a feed named after one of those gets a fresh
+group. If two groups share a name rssignal stops and asks you to rename one
+rather than guess.
+
+**Before the first real run, check `rssignal groups`.** If the group you mean is
+named differently from the feed, rssignal will make a second one — rename the
+group in Signal, or change the feed's `name`.
+
+To try a real send without touching any group:
+
+```bash
+rssignal run --to +31611111111      # your own number; creates nothing
+```
+
+`RSSIGNAL_RECIPIENT` is the default for `rssignal send` only. `run` ignores it.
 
 ### Message templates
 
@@ -171,13 +267,41 @@ Fields for Some Podcast (item 1 of 25):
   feed_name       Some Podcast
   itunes_duration 00:42:11                        (extra)
   id              urn:uuid:8f2c…                  (extra)
+  episode_id      54321                           (extra)
 ```
+
+Anything you define with `extract` shows up here too, which is the quickest way to check
+a pattern actually matches.
 
 Add `--template` to preview a message against that item without sending anything:
 
 ```bash
 rssignal fields --feed "Some Podcast" --template "🎧 {title} — {itunes_duration}"
 ```
+
+### Extracting fields
+
+Feeds often bury the one value you want inside another. Podcasts in particular
+frequently have no episode webpage in the feed at all — the episode's id exists only
+inside the audio URL. `extract` defines a new field by running a regex over an existing
+one:
+
+```json
+"extract": {
+  "episode_id": { "from": "link", "pattern": "/file/[^/]+/(\\d+)/" }
+},
+"preview_url": "https://example.com/listen/{episode_id}"
+```
+
+The new field takes the first capture group, or the whole match when the pattern has no
+groups. From there it behaves like any other field: usable in `message_template`, in the
+`preview_*` templates, as a filter target, and listed by `rssignal fields`. Remember JSON
+needs backslashes doubled (`\\d`, not `\d`).
+
+Rules read the item as it came off the feed, so they can't chain into one another, and an
+extracted name can never shadow a built-in field like `title`. A pattern that doesn't
+match yields an empty field rather than an error — check yours with `rssignal fields`
+before relying on it.
 
 ### Filters
 
@@ -197,10 +321,15 @@ multiple filters must **all** pass. Recency (`max_age_*`) is applied first.
 Check what would be sent, then send for real:
 
 ```bash
-rssignal run --dry-run          # prints matching items, sends nothing
-rssignal run                    # sends one Signal message per item
+rssignal run --dry-run          # prints matching items; sends and creates nothing
+rssignal run --to +31611111111  # real send, to you instead of the feeds' groups
+rssignal run                    # sends to each feed's group, creating it if needed
 rssignal run --config other.json
 ```
+
+`--dry-run` also tells you which group each feed resolved to, and whether it
+would have to be created — worth reading before the first real run. It refreshes
+the group list like a real run does, so its answer is the one a real run gets.
 
 For `podcast` feeds the episode's audio enclosure is downloaded and sent with
 `signal-cli --voice-note`. Depending on the file's codec, Signal may show it as
@@ -208,28 +337,35 @@ a regular audio attachment rather than an in-app voice note.
 
 ### Link previews
 
-Podcast items also carry a link preview card — the episode title, a short
-description, and the artwork — so an episode is recognizable next to its voice
-note. Set `"link_preview": false` to turn it off, or `true` on a `regular` feed
-to turn it on.
+Podcast items also carry a link preview card — the episode title and its artwork —
+so an episode is recognizable next to its voice note. Set `"link_preview": false`
+to turn it off, or `true` on a `regular` feed to turn it on.
 
 **A podcast episode with a card arrives as two messages:** the text and the card
 first, then the voice note on its own. Signal silently drops a preview card from
 any message that also has an attachment, so they cannot be combined. A podcast
 feed with `"link_preview": false` goes back to a single message.
 
-The card's artwork comes from `image_url`, which is the episode's own
-`<itunes:image>` or `<media:thumbnail>` when it has one and the show's artwork
-otherwise. It is downloaded per item; if that download fails the episode is still
-sent, just without the image.
+The card and the body split the item between them rather than repeating it. The
+card gets the title, so the built-in layout leaves it out of the body and sends
+the description plus the URL. The card carries no description unless you ask for
+one with `preview_description`. A `message_template` is never touched — if you
+wrote the layout, you decide what is in it.
+
+The card's artwork comes from `image_url`: the episode's own `<itunes:image>` or
+`<media:thumbnail>`. The show's channel artwork is deliberately *not* a fallback —
+the same logo on every episode tells you nothing — so an episode without its own
+image gets a card without one. Artwork is downloaded per item; if that download
+fails the episode is still sent, just without the image.
 
 Signal requires the previewed URL to appear in the message body, so rssignal
 appends it if your template doesn't already include it. Many podcast feeds set
-each episode's `link` to the raw `.mp3`; point the card somewhere nicer with
-`preview_url`:
+each episode's `link` to the raw `.mp3`; combine `extract` with `preview_url` to
+point the card at the real episode page:
 
 ```json
-"preview_url": "https://example.com/episodes",
+"extract": { "episode_id": { "from": "link", "pattern": "/file/[^/]+/(\\d+)/" } },
+"preview_url": "https://example.com/listen/{episode_id}",
 "preview_title": "🎧 {title} ({itunes_duration})"
 ```
 

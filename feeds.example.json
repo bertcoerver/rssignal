@@ -5,7 +5,6 @@
       "url": "https://example.com/rss",
       "type": "regular",
       "max_age_hours": 24,
-      "recipient": "group:AAAA1111bbbb+cccc/dddd2222eeee3333ffff4444g=",
       "message_template": "📰 {title}\n\n{description}\n\n{link}",
       "title_excludes": ["sponsored", "newsletter roundup"]
     },
@@ -14,9 +13,10 @@
       "url": "https://example.com/podcast.rss",
       "type": "podcast",
       "max_age_days": 7,
-      "recipient": "+31600000000",
-      "message_template": "🎧 {title} ({published_date})\n\n{description}",
-      "preview_url": "https://example.com/episodes",
+      "extract": {
+        "episode_id": { "from": "link", "pattern": "/file/[^/]+/(\\d+)/" }
+      },
+      "preview_url": "https://example.com/listen/{episode_id}",
       "preview_title": "🎧 {title}",
       "title_contains": ["interview", "special"]
     }

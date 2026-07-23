@@ -4,9 +4,11 @@ Subcommands:
     doctor          check the signal-cli install, linked accounts, and config
     link [--name]   link this machine to your Signal account (scan a QR code)
     send MESSAGE    send a text message (uses configured account/recipient)
-    run [--config]  parse configured feeds and send their recent items
+    run [--config]  parse configured feeds and send their recent items to the
+                    Signal group named after each feed (created if missing)
     fields          show the fields an item exposes, for writing templates
     groups          list the Signal groups you can send to
+    create-group    create a new group containing only you
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from .feeds import (
 from .run import run_feeds
 from .signal_cli import (
     SignalError,
+    create_group,
     find_signal_cli,
     link_device,
     list_accounts,
@@ -60,7 +63,8 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         return 1
 
     print(f"config account: {config.account}")
-    print(f"config recipient: {config.recipient or '(none set)'}")
+    # Only `send` uses this; `run` sends to each feed's own group.
+    print(f"config recipient (for `send`): {config.recipient or '(none set)'}")
 
     if config.account not in accounts:
         print(
@@ -84,7 +88,7 @@ def _cmd_send(args: argparse.Namespace) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    count = run_feeds(args.config, dry_run=args.dry_run)
+    count = run_feeds(args.config, dry_run=args.dry_run, to=args.to)
     if args.dry_run:
         print(f"{count} item(s) would be sent (dry run).")
     else:
@@ -119,7 +123,7 @@ def _resolve_feed(args: argparse.Namespace) -> FeedConfig:
 
 def _cmd_fields(args: argparse.Namespace) -> int:
     cfg = _resolve_feed(args)
-    items = parse_feed(cfg)
+    items = parse_feed(cfg).items
     if not items:
         print(f"Feed {cfg.name or cfg.url!r} has no items.")
         return 1
@@ -182,11 +186,33 @@ def _cmd_groups(args: argparse.Namespace) -> int:
         print(f"  {group.name:<{width}}  {group.recipient}{flags}")
 
     print(
-        "\nUse a value above as a `recipient` in feeds.json, as `--to`, or as "
-        "RSSIGNAL_RECIPIENT."
+        "\nUse a value above with `rssignal send --to`, `rssignal run --to`, or "
+        "as RSSIGNAL_RECIPIENT.\nFeeds pick their group by name, so they don't "
+        "need one of these."
     )
     if not args.refresh:
         print(_REFRESH_HINT)
+    return 0
+
+
+def _cmd_create_group(args: argparse.Namespace) -> int:
+    """Create a group containing only this account, and print its recipient."""
+    group = create_group(
+        args.name,
+        description=args.description,
+        avatar=args.avatar,
+        announcement_only=args.announcement,
+    )
+    if args.quiet:
+        print(group.recipient)
+        return 0
+
+    print(f"Created group {group.name!r} with only you in it.")
+    print(f"\n  {group.recipient}\n")
+    print(
+        "Name a feed after this group and it will send here on its own.\n"
+        "Add people from Signal on your phone — rssignal never adds members."
+    )
     return 0
 
 
@@ -229,7 +255,15 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--dry-run",
         action="store_true",
-        help="print what would be sent without sending or downloading",
+        help="print what would be sent without sending, downloading, or creating",
+    )
+    run.add_argument(
+        "--to",
+        default=None,
+        help=(
+            "send everything to this recipient instead of each feed's own group, "
+            "and create no groups (use your own number to try a real send)"
+        ),
     )
     run.set_defaults(func=_cmd_run)
 
@@ -284,6 +318,39 @@ def _build_parser() -> argparse.ArgumentParser:
         help="print only the recipient values, one per line",
     )
     groups.set_defaults(func=_cmd_groups)
+
+    create = subparsers.add_parser(
+        "create-group",
+        help="create a new group containing only you",
+        description=(
+            "Create a Signal group with you as its only member and admin. "
+            "rssignal never adds anyone else — invite people from Signal on "
+            "your phone."
+        ),
+    )
+    create.add_argument("name", help="the group name")
+    create.add_argument(
+        "--description",
+        default=None,
+        help="group description",
+    )
+    create.add_argument(
+        "--avatar",
+        default=None,
+        help="group image: a path to a local image file (not a URL)",
+    )
+    create.add_argument(
+        "--announcement",
+        action="store_true",
+        help="only admins may send messages (useful for a feed-only group)",
+    )
+    create.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="print only the recipient value",
+    )
+    create.set_defaults(func=_cmd_create_group)
 
     return parser
 

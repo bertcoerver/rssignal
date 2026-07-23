@@ -7,7 +7,7 @@ import pytest
 
 from rssignal import cli
 from rssignal.config import ConfigError
-from rssignal.feeds import FeedConfig, FeedItem
+from rssignal.feeds import FeedConfig, FeedItem, ParsedFeed
 from rssignal.signal_cli import SignalGroup, SignalSendError
 
 
@@ -127,7 +127,7 @@ _CONFIGS = [
 @pytest.fixture
 def patched_feeds(monkeypatch):
     monkeypatch.setattr(cli, "load_feeds", lambda path: _CONFIGS)
-    monkeypatch.setattr(cli, "parse_feed", lambda cfg: [_ITEM, _ITEM])
+    monkeypatch.setattr(cli, "parse_feed", lambda cfg: ParsedFeed([_ITEM, _ITEM]))
 
 
 def test_fields_lists_core_and_extra_fields(patched_feeds, capsys):
@@ -157,7 +157,7 @@ def test_fields_url_bypasses_the_config(monkeypatch, capsys):
         raise AssertionError("--url should not read the config")
 
     monkeypatch.setattr(cli, "load_feeds", fail)
-    monkeypatch.setattr(cli, "parse_feed", lambda cfg: [_ITEM])
+    monkeypatch.setattr(cli, "parse_feed", lambda cfg: ParsedFeed([_ITEM]))
 
     assert cli.main(["fields", "--url", "https://c/rss"]) == 0
     assert "https://c/rss" in capsys.readouterr().out
@@ -269,3 +269,97 @@ def test_groups_signal_error_returns_1(monkeypatch, capsys):
 
     assert cli.main(["groups"]) == 1
     assert "error:" in capsys.readouterr().err
+
+
+# --- create-group ----------------------------------------------------------
+
+
+@pytest.fixture
+def patched_create(monkeypatch):
+    calls = {}
+
+    def fake_create(name, *, description=None, avatar=None, announcement_only=False):
+        calls.update(
+            name=name,
+            description=description,
+            avatar=avatar,
+            announcement_only=announcement_only,
+        )
+        return SignalGroup(id="new=", name=name)
+
+    monkeypatch.setattr(cli, "create_group", fake_create)
+    return calls
+
+
+def test_create_group_prints_the_recipient(patched_create, capsys):
+    rc = cli.main(["create-group", "Feed group"])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert patched_create["name"] == "Feed group"
+    assert "group:new=" in out
+    assert "only you" in out
+
+
+def test_create_group_passes_options_through(patched_create):
+    rc = cli.main(
+        [
+            "create-group",
+            "Pod",
+            "--description",
+            "episodes",
+            "--avatar",
+            "art.jpg",
+            "--announcement",
+        ]
+    )
+
+    assert rc == 0
+    assert patched_create == {
+        "name": "Pod",
+        "description": "episodes",
+        "avatar": "art.jpg",
+        "announcement_only": True,
+    }
+
+
+def test_create_group_quiet_output_stays_pipeable(patched_create, capsys):
+    rc = cli.main(["create-group", "Pod", "--quiet"])
+
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "group:new="
+
+
+def test_create_group_has_no_way_to_add_members(capsys):
+    # A --member flag must not exist: adding someone to a group is not
+    # something rssignal is allowed to do on anyone's behalf.
+    with pytest.raises(SystemExit):
+        cli.main(["create-group", "Pod", "--member", "+31611111111"])
+    assert "unrecognized arguments" in capsys.readouterr().err
+
+
+def test_create_group_error_returns_1(monkeypatch, capsys):
+    def boom(name, **kwargs):
+        raise SignalSendError("updateGroup failed", returncode=1, stderr="x")
+
+    monkeypatch.setattr(cli, "create_group", boom)
+
+    assert cli.main(["create-group", "Pod"]) == 1
+    assert "error:" in capsys.readouterr().err
+
+
+def test_run_to_is_threaded_through(monkeypatch):
+    captured = {}
+
+    def fake_run_feeds(config, *, dry_run=False, to=None):
+        captured.update(config=config, dry_run=dry_run, to=to)
+        return 0
+
+    monkeypatch.setattr(cli, "run_feeds", fake_run_feeds)
+
+    assert cli.main(["run", "--to", "+31611111111"]) == 0
+    assert captured == {
+        "config": "feeds.json",
+        "dry_run": False,
+        "to": "+31611111111",
+    }
