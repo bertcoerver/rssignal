@@ -694,11 +694,47 @@ def test_run_records_the_newest_item_it_sent(monkeypatch):
 
     run_feeds("feeds.json")
 
-    assert len(calls["updated"]) == 1
-    written = calls["updated"][0]
-    assert written["id"] == "blog="
+    # One marker per item, since each goes up before its own messages.
+    assert [c["id"] for c in calls["updated"]] == ["blog="] * 2
     # The stamp is the item's publication date, not the time of the run.
-    assert read_watermark(written["description"]) == LATEST.published
+    assert [read_watermark(c["description"]) for c in calls["updated"]] == [
+        MIDDLE.published,
+        LATEST.published,
+    ]
+
+
+def test_run_records_an_item_before_it_sends_it(monkeypatch):
+    # The group-detail line Signal adds to the chat should sit above the item it
+    # belongs to, not after its messages.
+    _patch_feeds(
+        monkeypatch,
+        [_blog()],
+        {"https://a": [LATEST, MIDDLE]},
+        groups=[_group_at(OLDEST.published)],
+    )
+
+    trace = []
+    monkeypatch.setattr(
+        run,
+        "update_group",
+        lambda group_id, *, description=None, avatar=None: trace.append(
+            f"mark {read_watermark(description).isoformat()}"
+        ),
+    )
+    monkeypatch.setattr(
+        run,
+        "send_msg",
+        lambda text, **kwargs: trace.append(f"send {text.splitlines()[0]}"),
+    )
+
+    run_feeds("feeds.json")
+
+    assert trace == [
+        f"mark {MIDDLE.published.isoformat()}",
+        "send Middle",
+        f"mark {LATEST.published.isoformat()}",
+        "send Latest",
+    ]
 
 
 def test_run_sends_oldest_first(monkeypatch):
@@ -717,7 +753,7 @@ def test_run_sends_oldest_first(monkeypatch):
     assert [s["text"].splitlines()[0] for s in sends] == ["Oldest", "Middle", "Latest"]
 
 
-def test_run_records_progress_when_a_send_fails_part_way(monkeypatch):
+def test_run_rolls_the_watermark_back_when_a_send_fails_part_way(monkeypatch):
     calls = _patch_feeds(
         monkeypatch,
         [_blog()],
@@ -737,18 +773,26 @@ def test_run_records_progress_when_a_send_fails_part_way(monkeypatch):
     with pytest.raises(SignalError):
         run_feeds("feeds.json")
 
-    # Oldest got through, so the watermark moves to it and Middle and Latest
-    # are retried next run. Losing them would be the worse failure.
+    # Middle's marker went up before its messages, as designed; when the send
+    # failed it was rolled back, so the run ends on Oldest and Middle and Latest
+    # are both retried next time. Losing them would be the worse failure.
     assert [t.splitlines()[0] for t in sent] == ["Oldest"]
-    assert read_watermark(calls["updated"][0]["description"]) == OLDEST.published
+    assert [read_watermark(c["description"]) for c in calls["updated"]] == [
+        OLDEST.published,
+        MIDDLE.published,
+        OLDEST.published,  # the rollback
+    ]
 
 
-def test_run_records_nothing_when_the_very_first_send_fails(monkeypatch):
+def test_run_rolls_back_to_no_watermark_when_there_was_none(monkeypatch):
+    # A group rssignal has never written to must be left exactly as it was, not
+    # marked with an item that never arrived.
+    blurb = "A blurb somebody typed themselves."
     calls = _patch_feeds(
         monkeypatch,
         [_blog()],
         {"https://a": [LATEST]},
-        groups=[_group_at(NOW - timedelta(days=10))],
+        groups=[SignalGroup(id="blog=", name="Blog", description=blurb)],
     )
 
     def failing_send(text, recipient=None, **kwargs):
@@ -759,7 +803,40 @@ def test_run_records_nothing_when_the_very_first_send_fails(monkeypatch):
     with pytest.raises(SignalError):
         run_feeds("feeds.json")
 
-    assert calls["updated"] == []
+    assert calls["updated"][-1]["description"] == blurb
+    assert read_watermark(calls["updated"][-1]["description"]) is None
+
+
+def test_run_reports_a_rollback_that_itself_fails(monkeypatch, capsys):
+    # Two failures in a row is the one case where an item really is lost. Say so
+    # plainly, and point at the way to get it back.
+    _patch_feeds(
+        monkeypatch,
+        [_blog()],
+        {"https://a": [LATEST]},
+        groups=[_group_at(OLDEST.published)],
+    )
+
+    updates = []
+
+    def flaky_update(group_id, *, description=None, avatar=None):
+        updates.append(description)
+        if len(updates) > 1:  # the rollback
+            raise SignalError("group update rejected")
+
+    def failing_send(text, recipient=None, **kwargs):
+        raise SignalError("no route to host")
+
+    monkeypatch.setattr(run, "update_group", flaky_update)
+    monkeypatch.setattr(run, "send_msg", failing_send)
+
+    with pytest.raises(SignalError, match="no route to host"):
+        run_feeds("feeds.json")
+
+    # The send failure is what propagates; the rollback failure is reported.
+    err = capsys.readouterr().err
+    assert "undoing its watermark failed" in err
+    assert "--since" in err
 
 
 def test_run_keeps_a_hand_edited_blurb_when_it_records(monkeypatch):
@@ -850,7 +927,8 @@ def test_run_dry_run_records_nothing(monkeypatch, capsys):
 
 
 def test_run_recording_failure_does_not_fail_the_run(monkeypatch, capsys):
-    # The items really were sent. Raising here would only mean sending again.
+    # Sending the item is the point; a marker that didn't land only means it
+    # goes out once more on the next run.
     _patch_feeds(
         monkeypatch,
         [_blog()],

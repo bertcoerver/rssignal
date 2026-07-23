@@ -8,14 +8,14 @@ field that is writable, readable back, and stored server-side.
 
 So the watermark lives there, on its own line after the feed's blurb::
 
-    Iedere werkdag van 13.30 tot 14.00 uur op NPO Radio 1 met nieuws en
-    achtergronden uit het buitenland.
+    Two people argue about films they have not seen. New episode every Thursday.
 
     [rssignal 2026-07-23T10:03:00+00:00]
 
-The stamp is the publication date of the newest item that was actually sent, not
-the time of the run: it is compared against feed timestamps, so it has to be one
-of them. Everything here is pure string and datetime work — the reading and
+The stamp is the publication date of the item being sent, not the time of the
+run: it is compared against feed timestamps, so it has to be one of them. It is
+written just before that item's messages go out, so the group-detail line Signal
+shows in the chat sits above the item rather than after it. Everything here is pure string and datetime work — the reading and
 writing of the description itself is :mod:`rssignal.signal_cli`'s job.
 """
 

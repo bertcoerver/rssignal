@@ -148,8 +148,13 @@ def _send_feed(
     The order here is deliberate. The group is looked up *before* deciding what
     to send, because the watermark lives on it — but it is only ever *created*
     once there is something to send, so a typo in a feed's name can't leave a
-    stray group behind. The watermark is written last, from the items that
-    actually went out.
+    stray group behind.
+
+    Each item's watermark is written *before* that item is sent, so the
+    "changed the group description" line Signal adds to the chat sits above the
+    item it belongs to rather than below it. A send that then fails puts the
+    previous description back, so the item is retried next run instead of being
+    lost to a marker for something that never arrived.
     """
     parsed: ParsedFeed = parse_feed(cfg)
     items = apply_filters(parsed.items, cfg.filters)
@@ -185,44 +190,83 @@ def _send_feed(
         group = group or resolver.resolve(cfg.name, parsed)
         recipient = group.recipient
 
-    # due is oldest-first, so a send that fails part-way leaves the watermark on
-    # the last item that made it and the rest are retried next run. The finally
-    # is what makes that true even when send_msg raises.
-    done: FeedItem | None = None
+    # due is oldest-first: each item's marker goes up, then the item itself, so
+    # a send that fails part-way leaves the ones behind it untouched and they
+    # are retried next run. `current` tracks what the group's description says
+    # now, since SignalGroup is frozen and its own copy goes stale immediately.
+    current = "" if to else group.description
     sent = 0
-    try:
-        for item in due:
+    for item in due:
+        marked = current if to else _record_progress(group, parsed, item, current)
+        try:
             _handle_item(cfg, item, recipient, dry_run=False)
-            done = item
-            sent += 1
-    finally:
-        if done is not None and not to:
-            _record_progress(group, parsed, done)
+        except Exception:
+            # The marker promised an item that never arrived. Put the old
+            # description back so the next run tries again.
+            if marked != current:
+                _rollback(group, current, item)
+            raise
+        current = marked
+        sent += 1
 
     return sent
 
 
-def _record_progress(group: SignalGroup, parsed: ParsedFeed, done: FeedItem) -> None:
-    """Move ``group``'s watermark to ``done``, keeping its blurb.
+def _record_progress(
+    group: SignalGroup, parsed: ParsedFeed, item: FeedItem, current: str
+) -> str:
+    """Move ``group``'s watermark to ``item``, and return the description now on it.
+
+    Called just before ``item`` is sent, so the group-detail line Signal puts in
+    the chat appears above the item rather than after it. ``current`` is what the
+    description says at this point in the run — not ``group.description``, which
+    is a snapshot from the listing and goes stale after the first item.
 
     The blurb kept is the group's own, not the feed's: edit a group description
     in Signal and rssignal moves the marker around your text instead of pasting
     the feed's boilerplate back over it every run. The feed's blurb is only the
     fallback, for a group that hasn't got one.
 
-    Failing to record is reported but not raised. The items really were sent;
-    turning that into a failed run would only mean sending them again.
+    Failing to record is reported but not raised, and ``current`` comes back
+    unchanged. Sending the item is the point; a marker that didn't land only
+    means it goes out again on the next run.
     """
-    blurb = strip_watermark(group.description) or parsed.description
+    blurb = strip_watermark(current) or parsed.description
     description = compose_description(
-        blurb, done.published, limit=GROUP_DESCRIPTION_MAX_CHARS
+        blurb, item.published, limit=GROUP_DESCRIPTION_MAX_CHARS
     )
     try:
         update_group(group.id, description=description)
     except SignalError as exc:
         print(
-            f"[{group.name}] sent, but recording how far the feed got failed: "
-            f"{exc}\nThose items will be sent again on the next run.",
+            f"[{group.name}] recording how far the feed got failed: {exc}\n"
+            f"{item.title!r} is still being sent, and will be sent again on the "
+            "next run.",
+            file=sys.stderr,
+        )
+        return current
+    return description
+
+
+def _rollback(group: SignalGroup, description: str, item: FeedItem) -> None:
+    """Put ``description`` back after ``item``'s send failed.
+
+    The marker went up first so it would appear above the item in the chat; when
+    the item never arrives, that marker is a promise about something that isn't
+    there, and leaving it would mean the item is never sent at all. Undoing it
+    hands the item back to the next run.
+
+    A rollback that itself fails is only reported. The send failure is what gets
+    raised — it is the real problem, and burying it under a second one would
+    help nobody.
+    """
+    try:
+        update_group(group.id, description=description)
+    except SignalError as exc:
+        print(
+            f"[{group.name}] {item.title!r} failed to send, and undoing its "
+            f"watermark failed too: {exc}\nIt will not be sent again — replay it "
+            "with `rssignal run --since`.",
             file=sys.stderr,
         )
 

@@ -386,7 +386,9 @@ Two people argue about films they have not seen. New episode every Thursday.
 ```
 
 The stamp is the publication date of the newest item that went out. On the next
-run, anything published after it is sent, oldest first, and the marker moves.
+run, anything published after it is sent, oldest first. Each item's marker is
+written just *before* that item's messages, so the group-detail line Signal adds
+to the chat sits above the item it belongs to.
 
 There is nowhere better. `signal-cli` cannot read back messages it has sent — the
 server hands each message over once, and a linked secondary device never receives
@@ -395,9 +397,9 @@ only free-text field that is writable, readable back, and stored server-side. Th
 upside is that the record lives with the group: reinstall signal-cli, or link a
 new machine, and nothing is resent.
 
-**The cost:** Signal shows a group-detail change in the chat, so every run that
-sends something also leaves one *"You changed the group description"* line in that
-group. Runs with nothing new write nothing and stay completely silent.
+**The cost:** Signal shows a group-detail change in the chat, so every item sent
+also leaves one *"You changed the group description"* line above it in that group.
+Runs with nothing new write nothing and stay completely silent.
 
 Worth knowing:
 
@@ -419,8 +421,11 @@ Worth knowing:
 
   The marker still ends up on the newest item actually sent, so a replay leaves it
   correct rather than rewound.
-- **A send that fails part-way is safe.** Items go out oldest first and the marker
-  lands on the last one that made it; the rest are retried on the next run.
+- **A send that fails part-way is safe.** Items go out oldest first, each marked
+  just before it is sent. If that send then fails, the previous description is
+  put back, so the item is retried on the next run along with everything queued
+  behind it. (Should the rollback *also* fail — two Signal errors in a row — that
+  one item is lost; rssignal says so on stderr and `--since` replays it.)
 
 ## Development
 
