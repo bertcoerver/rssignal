@@ -12,10 +12,11 @@ from rssignal.feeds import (
     FeedFilter,
     FeedItem,
     FieldExtract,
-    filter_recent,
+    filter_since,
     format_message,
     item_fields,
     load_feeds,
+    newest,
     parse_feed,
     preview_fields,
     render_message,
@@ -34,33 +35,29 @@ def test_load_feeds_valid(tmp_path):
         tmp_path,
         {
             "feeds": [
-                {"name": "Blog", "url": "https://a/rss", "type": "regular", "max_age_hours": 12},
-                {"name": "Pod", "url": "https://b/rss", "type": "podcast", "max_age_days": 2},
+                {"name": "Blog", "url": "https://a/rss", "type": "regular"},
+                {"name": "Pod", "url": "https://b/rss", "type": "podcast"},
             ]
         },
     )
 
     configs = load_feeds(path)
 
-    assert configs[0] == FeedConfig(
-        url="https://a/rss", type="regular", name="Blog", max_age=timedelta(hours=12)
-    )
+    assert configs[0] == FeedConfig(url="https://a/rss", type="regular", name="Blog")
     assert configs[1].type == "podcast"
     assert configs[1].name == "Pod"
-    assert configs[1].max_age == timedelta(days=2)
 
 
-def test_load_feeds_max_age_combines_hours_and_days(tmp_path):
+@pytest.mark.parametrize("key", ["max_age_hours", "max_age_days"])
+def test_load_feeds_max_age_is_rejected_with_a_migration_hint(tmp_path, key):
+    # The window is gone: how far a feed got now lives in its group description.
     path = _write_config(
-        tmp_path,
-        {"feeds": [{"name": "F", "url": "https://a", "type": "regular", "max_age_days": 1, "max_age_hours": 6}]},
+        tmp_path, {"feeds": [{"name": "F", "url": "https://a", "type": "regular", key: 12}]}
     )
-    assert load_feeds(path)[0].max_age == timedelta(days=1, hours=6)
-
-
-def test_load_feeds_no_max_age_is_none(tmp_path):
-    path = _write_config(tmp_path, {"feeds": [{"name": "F", "url": "https://a", "type": "regular"}]})
-    assert load_feeds(path)[0].max_age is None
+    with pytest.raises(FeedError) as excinfo:
+        load_feeds(path)
+    assert key in str(excinfo.value)
+    assert "--since" in str(excinfo.value)
 
 
 def test_load_feeds_missing_file_raises():
@@ -150,20 +147,49 @@ def _item(published):
     return FeedItem(title="t", description="d", published=published)
 
 
-def test_filter_recent_no_max_age_passes_all():
-    items = [_item(None), _item(datetime(2020, 1, 1, tzinfo=timezone.utc))]
-    assert filter_recent(items, None) == items
+MARK = datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc)
 
 
-def test_filter_recent_window():
-    now = datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc)
-    inside = _item(now - timedelta(hours=1))
-    outside = _item(now - timedelta(hours=30))
-    undated = _item(None)
+def test_filter_since_none_keeps_every_dated_item():
+    old = _item(MARK - timedelta(days=400))
+    new = _item(MARK)
+    assert filter_since([new, old], None) == [old, new]
 
-    result = filter_recent([inside, outside, undated], timedelta(hours=24), now=now)
 
-    assert result == [inside]
+def test_filter_since_drops_undated_items():
+    # Whether an undated item is new can't be known, and guessing either way is
+    # worse than skipping it.
+    dated = _item(MARK)
+    assert filter_since([dated, _item(None)], None) == [dated]
+
+
+def test_filter_since_is_strict_at_the_watermark():
+    # The watermark is the last item sent, so that item must not go again.
+    at = _item(MARK)
+    after = _item(MARK + timedelta(seconds=1))
+    before = _item(MARK - timedelta(seconds=1))
+
+    assert filter_since([after, at, before], MARK) == [after]
+
+
+def test_filter_since_returns_items_oldest_first():
+    first = _item(MARK)
+    second = _item(MARK + timedelta(hours=1))
+    third = _item(MARK + timedelta(hours=2))
+
+    # Feeds list newest-first; sending in that order would strand older items
+    # behind the watermark if a send failed part-way.
+    assert filter_since([third, first, second], None) == [first, second, third]
+
+
+def test_newest_picks_the_latest_item():
+    latest = _item(MARK + timedelta(hours=1))
+    assert newest([_item(MARK), latest, _item(MARK - timedelta(days=2))]) is latest
+
+
+def test_newest_of_nothing_datable_is_none():
+    assert newest([]) is None
+    assert newest([_item(None)]) is None
 
 
 def test_format_message_regular():
@@ -344,13 +370,13 @@ def test_load_feeds_no_filters_is_empty_tuple(tmp_path):
 
 
 def test_load_feeds_unknown_key_raises(tmp_path):
-    # A typo like max_age_hour must not be silently ignored.
+    # A typo like title_contain must not be silently ignored.
     path = _write_config(
-        tmp_path, {"feeds": [{"name": "F", "url": "https://a", "type": "regular", "max_age_hour": 5}]}
+        tmp_path, {"feeds": [{"name": "F", "url": "https://a", "type": "regular", "title_contain": "x"}]}
     )
     with pytest.raises(FeedError) as excinfo:
         load_feeds(path)
-    assert "max_age_hour" in str(excinfo.value)
+    assert "title_contain" in str(excinfo.value)
 
 
 def test_load_feeds_bad_regex_raises(tmp_path):

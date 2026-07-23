@@ -4,7 +4,7 @@ Subcommands:
     doctor          check the signal-cli install, linked accounts, and config
     link [--name]   link this machine to your Signal account (scan a QR code)
     send MESSAGE    send a text message (uses configured account/recipient)
-    run [--config]  parse configured feeds and send their recent items to the
+    run [--config]  parse configured feeds and send whatever is new to the
                     Signal group named after each feed (created if missing)
     fields          show the fields an item exposes, for writing templates
     groups          list the Signal groups you can send to
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import datetime, timezone
 
 from .config import ConfigError, get_config
 from .feeds import (
@@ -88,12 +89,36 @@ def _cmd_send(args: argparse.Namespace) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    count = run_feeds(args.config, dry_run=args.dry_run, to=args.to)
+    count = run_feeds(
+        args.config,
+        dry_run=args.dry_run,
+        to=args.to,
+        since=_parse_since(args.since),
+    )
     if args.dry_run:
         print(f"{count} item(s) would be sent (dry run).")
     else:
         print(f"{count} item(s) sent.")
     return 0
+
+
+def _parse_since(value: str | None) -> datetime | None:
+    """Read ``--since`` as a UTC datetime, or ``None`` when it wasn't given.
+
+    A bare date means midnight, and a timestamp without a zone is read as UTC —
+    feed publication dates are compared in UTC, so a naive one would raise on
+    the comparison rather than here.
+    """
+    if not value:
+        return None
+    try:
+        when = datetime.fromisoformat(value)
+    except ValueError:
+        raise SystemExit(
+            f"--since {value!r} is not an ISO timestamp. Try 2026-07-01 or "
+            "2026-07-01T09:00+02:00."
+        )
+    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
 
 
 def _resolve_feed(args: argparse.Namespace) -> FeedConfig:
@@ -245,7 +270,7 @@ def _build_parser() -> argparse.ArgumentParser:
     send.set_defaults(func=_cmd_send)
 
     run = subparsers.add_parser(
-        "run", help="parse configured feeds and send their recent items"
+        "run", help="parse configured feeds and send whatever is new"
     )
     run.add_argument(
         "--config",
@@ -263,6 +288,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "send everything to this recipient instead of each feed's own group, "
             "and create no groups (use your own number to try a real send)"
+        ),
+    )
+    run.add_argument(
+        "--since",
+        default=None,
+        metavar="TIMESTAMP",
+        help=(
+            "send items published after this ISO timestamp, ignoring what each "
+            "group remembers (e.g. 2026-07-01, or 2026-07-01T09:00+02:00)"
         ),
     )
     run.set_defaults(func=_cmd_run)

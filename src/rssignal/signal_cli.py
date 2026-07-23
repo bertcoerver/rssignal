@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -25,6 +24,7 @@ from dataclasses import dataclass
 from PIL import Image, UnidentifiedImageError
 
 from .config import get_config
+from .watermark import compose_description, read_watermark, shorten
 
 # Signal silently drops a group avatar that is too large: the upload is accepted,
 # signal-cli exits 0, and the group simply keeps no picture. 1400x1400 is dropped,
@@ -177,13 +177,16 @@ class SignalGroup:
     """One group from ``signal-cli listGroups``.
 
     ``id`` is the base64 group id to send to; ``name`` is the display name, which
-    is not unique and may be empty.
+    is not unique and may be empty. ``description`` is the group's blurb, which
+    for a group rssignal manages also carries the feed's watermark — see
+    :mod:`rssignal.watermark`.
     """
 
     id: str
     name: str
     active: bool = True
     blocked: bool = False
+    description: str = ""
 
     @property
     def recipient(self) -> str:
@@ -191,29 +194,23 @@ class SignalGroup:
         return f"{GROUP_PREFIX}{self.id}"
 
 
-# listGroups prints one group per line:
-#   Id: <base64> Name: <name>  Active: true Blocked: false
-# The name can contain spaces (and the odd emoji), so it is matched lazily up to
-# the next known field label.
-_GROUP_LINE = re.compile(
-    r"^Id:\s*(?P<id>\S+)\s+Name:\s*(?P<name>.*?)\s+"
-    r"(?:Description:.*?\s+)?Active:\s*(?P<active>\S+)\s+Blocked:\s*(?P<blocked>\S+)"
-)
-
-
 def list_groups(*, account: str | None = None) -> list[SignalGroup]:
     """Return the groups the account belongs to, newest signal-cli order.
 
-    Parses ``signal-cli listGroups``. Groups you have left show up with
-    ``active=False``; they are kept here and filtered at the call site so the
-    caller can decide what to show.
+    Reads ``signal-cli -o json listGroups``. JSON rather than the plain-text
+    listing for two reasons: the plain listing doesn't print the description at
+    all, and a watermarked description is multi-line, which no line-based parse
+    survives. In JSON mode listGroups is always detailed.
+
+    Groups you have left show up with ``active=False``; they are kept here and
+    filtered at the call site so the caller can decide what to show.
     """
     binary = find_signal_cli()
     if account is None:
         account = get_config().account
 
     result = subprocess.run(
-        [binary, "-a", account, "listGroups"],
+        [binary, "-o", "json", "-a", account, "listGroups"],
         capture_output=True,
         text=True,
     )
@@ -224,19 +221,24 @@ def list_groups(*, account: str | None = None) -> list[SignalGroup]:
             stderr=result.stderr.strip(),
         )
 
-    groups: list[SignalGroup] = []
-    for line in result.stdout.splitlines():
-        match = _GROUP_LINE.match(line.strip())
-        if match:
-            groups.append(
-                SignalGroup(
-                    id=match["id"],
-                    name=match["name"].strip(),
-                    active=match["active"].lower() == "true",
-                    blocked=match["blocked"].lower() == "true",
-                )
-            )
-    return groups
+    try:
+        raw = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise SignalError(f"Could not read `signal-cli listGroups` output: {exc}")
+
+    return [
+        SignalGroup(
+            id=entry.get("id", ""),
+            name=(entry.get("name") or "").strip(),
+            # A group you have left reports isMember: false rather than
+            # disappearing, which is how `rssignal groups` can still show it.
+            active=bool(entry.get("isMember", True)),
+            blocked=bool(entry.get("isBlocked", False)),
+            description=entry.get("description") or "",
+        )
+        for entry in raw
+        if entry.get("id")
+    ]
 
 
 def match_group(groups: list[SignalGroup], name: str) -> SignalGroup | None:
@@ -391,6 +393,7 @@ def create_group(
             )
         group_id = created[0].id
 
+    applied = ""
     if description or avatar:
         try:
             update_group(
@@ -400,6 +403,7 @@ def create_group(
                 account=account,
                 timeout=timeout,
             )
+            applied = _clip(description) if description else ""
         except SignalError as exc:
             print(
                 f"Group {name!r} was created, but setting its description and "
@@ -407,19 +411,23 @@ def create_group(
                 file=sys.stderr,
             )
 
-    return SignalGroup(id=group_id, name=name)
+    # The description comes back on the group so the caller doesn't have to
+    # re-list to find out what actually landed there — empty if it didn't.
+    return SignalGroup(id=group_id, name=name, description=applied)
 
 
 def _clip(text: str, limit: int = GROUP_DESCRIPTION_MAX_CHARS) -> str:
-    """Shorten ``text`` to ``limit`` characters, cutting on a word where possible."""
-    text = text.strip()
-    if len(text) <= limit:
-        return text
-    cut = text[: limit - 1]
-    space = cut.rfind(" ")
-    if space > limit // 2:
-        cut = cut[:space]
-    return cut.rstrip(" ,;:.—-") + "…"
+    """Shorten ``text`` to ``limit`` characters, cutting on a word where possible.
+
+    A trailing rssignal watermark is never cut off, however long the blurb in
+    front of it: the marker is what the next run reads to know how far the feed
+    got, so losing it would silently resend items. The blurb is shortened
+    instead. See :mod:`rssignal.watermark`.
+    """
+    mark = read_watermark(text)
+    if mark is not None:
+        return compose_description(text, mark, limit=limit)
+    return shorten(text, limit)
 
 
 @contextmanager

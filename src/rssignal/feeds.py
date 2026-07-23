@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from html import unescape
 from html.parser import HTMLParser
 
@@ -31,8 +31,6 @@ KNOWN_KEYS = (
     "url",
     "type",
     "name",
-    "max_age_hours",
-    "max_age_days",
     "message_template",
     "extract",
     "link_preview",
@@ -122,7 +120,6 @@ class FeedConfig:
     url: str
     type: str
     name: str = ""
-    max_age: timedelta | None = None
     message_template: str | None = None
     filters: tuple[FeedFilter, ...] = ()
     extract: tuple[FieldExtract, ...] = ()
@@ -188,9 +185,10 @@ def load_feeds(path: str = "feeds.json") -> list[FeedConfig]:
 
     Expects ``{"feeds": [ {...}, ... ]}``. Each feed needs a ``url``, a ``type``
     (one of :data:`FEED_TYPES`), and a ``name`` — the name is the Signal group
-    the feed sends to. Recency comes from optional ``max_age_hours`` /
-    ``max_age_days`` keys (summed). Raises :class:`FeedError` on a missing file,
-    invalid JSON, or a malformed / unknown-type entry.
+    the feed sends to. There is no recency setting: how far a feed got is
+    remembered in its group's description (see :mod:`rssignal.watermark`).
+    Raises :class:`FeedError` on a missing file, invalid JSON, or a malformed /
+    unknown-type entry.
     """
     try:
         with open(path, encoding="utf-8") as fh:
@@ -237,12 +235,6 @@ def _build_feed_config(raw: object, index: int) -> FeedConfig:
             "group this feed sends to; rssignal creates it if it doesn't exist."
         )
 
-    hours = raw.get("max_age_hours", 0) or 0
-    days = raw.get("max_age_days", 0) or 0
-    if not isinstance(hours, (int, float)) or not isinstance(days, (int, float)):
-        raise FeedError(f"{where} max_age_hours/max_age_days must be numbers.")
-    max_age = timedelta(hours=hours, days=days) or None
-
     template = raw.get("message_template")
     if template is not None and not isinstance(template, str):
         raise FeedError(f"{where} message_template must be a string.")
@@ -262,7 +254,6 @@ def _build_feed_config(raw: object, index: int) -> FeedConfig:
         url=url,
         type=feed_type,
         name=name.strip(),
-        max_age=max_age,
         message_template=template,
         filters=_build_filters(raw, where),
         extract=_build_extracts(raw.get("extract"), where),
@@ -314,13 +305,21 @@ def _build_filters(raw: dict, where: str) -> tuple[FeedFilter, ...]:
     """Collect the ``<field>_<op>`` keys of ``raw`` into :class:`FeedFilter`s.
 
     Any key that is neither a known setting nor a filter suffix is an error —
-    silently ignoring a typo like ``max_age_hour`` would quietly send the wrong
+    silently ignoring a typo like ``title_contain`` would quietly send the wrong
     items.
     """
     filters: list[FeedFilter] = []
     for key, value in raw.items():
         if key in KNOWN_KEYS:
             continue
+        if key in ("max_age_hours", "max_age_days"):
+            raise FeedError(
+                f"{where} still has a {key!r}. rssignal no longer works from a "
+                "fixed window: it remembers how far each feed got in that feed's "
+                "Signal group description, and sends what is newer. Drop the "
+                "key. To replay from a particular moment, use "
+                "`rssignal run --since`."
+            )
         if key == "recipient":
             raise FeedError(
                 f"{where} still has a \"recipient\". Feeds now send to a Signal "
@@ -489,33 +488,32 @@ def strip_html(text: str) -> str:
     return " ".join(plain.split())
 
 
-def filter_recent(
-    items: list[FeedItem],
-    max_age: timedelta | None,
-    *,
-    now: datetime | None = None,
-) -> list[FeedItem]:
-    """Return items published within ``max_age`` of ``now``.
+def filter_since(items: list[FeedItem], since: datetime | None) -> list[FeedItem]:
+    """Return the items published strictly after ``since``, oldest first.
 
-    With ``max_age`` unset, all items pass through unchanged. When it is set,
-    items without a publication date are dropped (their freshness can't be
-    confirmed). ``now`` defaults to the current UTC time and is injectable for
-    tests.
+    The comparison is strict so an item that *is* the watermark isn't sent
+    again — the watermark is the publication date of the last item that went
+    out, not the moment it went out.
+
+    Items without a publication date are dropped: there is no way to tell
+    whether they are new, and guessing wrong means either resending forever or
+    never sending at all. With ``since`` unset every dated item passes through.
     """
-    if max_age is None:
-        return list(items)
+    dated = [item for item in items if item.published is not None]
+    if since is not None:
+        dated = [item for item in dated if item.published > since]
+    return sorted(dated, key=lambda item: item.published)
 
-    if now is None:
-        now = datetime.now(timezone.utc)
-    cutoff = now - max_age
 
-    recent: list[FeedItem] = []
-    for item in items:
-        if item.published is None:
-            continue
-        if item.published >= cutoff:
-            recent.append(item)
-    return recent
+def newest(items: list[FeedItem]) -> FeedItem | None:
+    """Return the most recently published item, or ``None`` if there is none.
+
+    This is what a feed sends on its very first run, before there is a watermark
+    to compare against: one item, so a new group doesn't open with the feed's
+    entire back catalogue.
+    """
+    dated = filter_since(items, None)
+    return dated[-1] if dated else None
 
 
 def item_fields(item: FeedItem) -> dict[str, str]:

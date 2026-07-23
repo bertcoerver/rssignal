@@ -1,6 +1,6 @@
 """Tests for rssignal.cli."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -348,18 +348,50 @@ def test_create_group_error_returns_1(monkeypatch, capsys):
     assert "error:" in capsys.readouterr().err
 
 
-def test_run_to_is_threaded_through(monkeypatch):
+def _capture_run_feeds(monkeypatch):
     captured = {}
 
-    def fake_run_feeds(config, *, dry_run=False, to=None):
-        captured.update(config=config, dry_run=dry_run, to=to)
+    def fake_run_feeds(config, *, dry_run=False, to=None, since=None):
+        captured.update(config=config, dry_run=dry_run, to=to, since=since)
         return 0
 
     monkeypatch.setattr(cli, "run_feeds", fake_run_feeds)
+    return captured
+
+
+def test_run_to_is_threaded_through(monkeypatch):
+    captured = _capture_run_feeds(monkeypatch)
 
     assert cli.main(["run", "--to", "+31611111111"]) == 0
     assert captured == {
         "config": "feeds.json",
         "dry_run": False,
         "to": "+31611111111",
+        "since": None,
     }
+
+
+def test_run_since_is_parsed_and_threaded_through(monkeypatch):
+    captured = _capture_run_feeds(monkeypatch)
+
+    assert cli.main(["run", "--since", "2026-07-01T09:00+02:00"]) == 0
+    assert captured["since"] == datetime(
+        2026, 7, 1, 9, 0, tzinfo=timezone(timedelta(hours=2))
+    )
+
+
+def test_run_since_without_a_zone_is_read_as_utc(monkeypatch):
+    # Feed publication dates are compared in UTC; a naive one would blow up on
+    # the comparison instead of here.
+    captured = _capture_run_feeds(monkeypatch)
+
+    assert cli.main(["run", "--since", "2026-07-01"]) == 0
+    assert captured["since"] == datetime(2026, 7, 1, tzinfo=timezone.utc)
+
+
+def test_run_since_that_is_not_a_timestamp_is_refused(monkeypatch):
+    _capture_run_feeds(monkeypatch)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["run", "--since", "last tuesday"])
+    assert "ISO timestamp" in str(excinfo.value)

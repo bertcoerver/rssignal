@@ -1,5 +1,6 @@
 """Tests for rssignal.signal_cli (all subprocess calls are mocked)."""
 
+import json
 import os
 import subprocess
 from types import SimpleNamespace
@@ -221,18 +222,43 @@ def test_send_msg_timeout_raises(have_binary, monkeypatch):
 
 # --- groups ----------------------------------------------------------------
 
-# Made-up output in signal-cli's real shape: the INFO line it writes on a cold
-# start, and names with spaces, an ampersand, and an emoji. The ids are fake but
-# use the same base64 alphabet (including / and +) as real ones.
-GROUPS_OUTPUT = """INFO  AccountHelper - The Signal protocol expects that incoming messages are regularly received.
-Id: AAAA1111bbbb+cccc/dddd2222eeee3333ffff4444g= Name: Book club & friends  Active: true Blocked: false
-Id: BBBB2222cccc/dddd+eeee3333ffff4444gggg5555h= Name: 🎉 party 3.0  Active: true Blocked: false
-Id: CCCC3333dddd+eeee/ffff4444gggg5555hhhh6666i= Name: Old crew  Active: false Blocked: false
-Id: DDDD4444eeee/ffff+gggg5555hhhh6666iiii7777j= Name: Spam group  Active: true Blocked: true
-"""
+# Made-up output in signal-cli's real JSON shape: names with spaces, an
+# ampersand, and an emoji, a group left (isMember false) and one blocked. The
+# ids are fake but use the same base64 alphabet (including / and +) as real ones.
+GROUPS_JSON = json.dumps(
+    [
+        {
+            "id": "AAAA1111bbbb+cccc/dddd2222eeee3333ffff4444g=",
+            "name": "Book club & friends",
+            "description": "Six people, one book, no discipline.",
+            "isMember": True,
+            "isBlocked": False,
+        },
+        {
+            "id": "BBBB2222cccc/dddd+eeee3333ffff4444gggg5555h=",
+            "name": "\U0001f389 party 3.0",
+            "description": "",
+            "isMember": True,
+            "isBlocked": False,
+        },
+        {
+            "id": "CCCC3333dddd+eeee/ffff4444gggg5555hhhh6666i=",
+            "name": "Old crew",
+            "description": None,
+            "isMember": False,
+            "isBlocked": False,
+        },
+        {
+            "id": "DDDD4444eeee/ffff+gggg5555hhhh6666iiii7777j=",
+            "name": "Spam group",
+            "isMember": True,
+            "isBlocked": True,
+        },
+    ]
+)
 
 
-def _patch_groups_output(monkeypatch, output=GROUPS_OUTPUT, returncode=0):
+def _patch_groups_output(monkeypatch, output=GROUPS_JSON, returncode=0):
     calls = {}
 
     def fake_run(argv, **kwargs):
@@ -249,18 +275,42 @@ def test_list_groups_parses_output(have_binary, monkeypatch):
 
     groups = list_groups(account="+31600000000")
 
-    assert calls["argv"] == [FAKE_BIN, "-a", "+31600000000", "listGroups"]
+    # JSON, not the plain listing: the plain one omits the description entirely,
+    # and a watermarked description is multi-line.
+    assert calls["argv"] == [
+        FAKE_BIN, "-o", "json", "-a", "+31600000000", "listGroups"
+    ]
     assert groups[0] == SignalGroup(
         id="AAAA1111bbbb+cccc/dddd2222eeee3333ffff4444g=",
         name="Book club & friends",
         active=True,
         blocked=False,
+        description="Six people, one book, no discipline.",
     )
-    # Log lines are ignored, not mistaken for groups.
     assert len(groups) == 4
-    assert groups[1].name == "🎉 party 3.0"
+    assert groups[1].name == "\U0001f389 party 3.0"
     assert groups[2].active is False
     assert groups[3].blocked is True
+
+
+def test_list_groups_tolerates_a_missing_description(have_binary, monkeypatch):
+    # signal-cli sends null for a group with no blurb, and older versions omit
+    # the key. Neither should become the string "None".
+    _patch_groups_output(monkeypatch)
+    groups = list_groups(account="+31600000000")
+    assert groups[2].description == ""  # explicit null
+    assert groups[3].description == ""  # key absent
+
+
+def test_list_groups_of_no_groups_is_empty(have_binary, monkeypatch):
+    _patch_groups_output(monkeypatch, output="[]")
+    assert list_groups(account="+31600000000") == []
+
+
+def test_list_groups_unreadable_output_raises(have_binary, monkeypatch):
+    _patch_groups_output(monkeypatch, output="not json at all")
+    with pytest.raises(SignalError):
+        list_groups(account="+31600000000")
 
 
 def test_list_groups_recipient_is_prefixed(have_binary, monkeypatch):
@@ -279,7 +329,7 @@ def test_list_groups_uses_configured_account(have_binary, monkeypatch):
 
     list_groups()
 
-    assert calls["argv"][2] == "+31600000000"
+    assert "+31600000000" in calls["argv"]
 
 
 def test_list_groups_failure_raises(have_binary, monkeypatch):
@@ -932,8 +982,8 @@ def test_update_group_clips_a_long_description(have_binary, monkeypatch):
 
 
 def test_clip_leaves_a_short_description_alone():
-    assert signal_cli._clip("Iedere werkdag om 13.30 uur.") == (
-        "Iedere werkdag om 13.30 uur."
+    assert signal_cli._clip("A short blurb about nothing much.") == (
+        "A short blurb about nothing much."
     )
 
 
@@ -946,3 +996,13 @@ def test_clip_cuts_on_a_word_boundary():
 def test_clip_falls_back_to_a_hard_cut_for_one_long_word():
     clipped = signal_cli._clip("x" * 40, limit=10)
     assert len(clipped) == 10 and clipped.endswith("…")
+
+
+def test_clip_never_cuts_off_a_trailing_watermark():
+    # The marker is what the next run reads to know how far a feed got; losing
+    # it to a long blurb would silently resend everything.
+    marker = "[rssignal 2026-07-23T10:03:00+00:00]"
+    clipped = signal_cli._clip(f"{'word ' * 300}\n\n{marker}", limit=200)
+
+    assert clipped.endswith(marker)
+    assert len(clipped) <= 200

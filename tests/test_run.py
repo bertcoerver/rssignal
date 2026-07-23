@@ -1,7 +1,8 @@
 """Tests for rssignal.run (feeds, sending, and downloads are monkeypatched)."""
 
+import dataclasses
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -9,8 +10,29 @@ from rssignal import run
 from rssignal.feeds import FeedConfig, FeedError, FeedFilter, FeedItem, ParsedFeed
 from rssignal.run import run_feeds
 from rssignal.signal_cli import LinkPreview, SignalError, SignalGroup
+from rssignal.watermark import format_watermark, read_watermark
 
 NOW = datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc)
+
+# A watermark old enough that every item in a fixture counts as new. Tests about
+# first-run behaviour pass their own groups (or none) instead.
+LONG_AGO = format_watermark(NOW - timedelta(days=365))
+
+
+def _stamp(items):
+    """Give undated fixture items increasing publication dates, in feed order.
+
+    Undated items are never sent — there is no way to tell whether they are new
+    — so a test that isn't about dates would otherwise send nothing. Increasing
+    in list order means the chronological send order matches how the test wrote
+    them.
+    """
+    return [
+        item
+        if item.published is not None
+        else dataclasses.replace(item, published=NOW + timedelta(seconds=i))
+        for i, item in enumerate(items)
+    ]
 
 
 def _patch_feeds(
@@ -26,11 +48,14 @@ def _patch_feeds(
         run,
         "parse_feed",
         lambda cfg: ParsedFeed(
-            items=items_by_url[cfg.url], image_url=image, description=blurb
+            items=_stamp(items_by_url[cfg.url]), image_url=image, description=blurb
         ),
     )
     if groups is None:
-        groups = [SignalGroup(id=f"{c.name}=", name=c.name) for c in configs]
+        groups = [
+            SignalGroup(id=f"{c.name}=", name=c.name, description=LONG_AGO)
+            for c in configs
+        ]
     return _patch_groups(monkeypatch, groups)
 
 
@@ -40,7 +65,7 @@ def _patch_groups(monkeypatch, existing=(), *, created_id="new="):
     Nothing here reaches signal-cli: no group is ever listed, created, or
     messaged for real.
     """
-    calls = {"list": 0, "receive": 0, "created": []}
+    calls = {"list": 0, "receive": 0, "created": [], "updated": []}
     groups = list(existing)
 
     def fake_list_groups():
@@ -61,13 +86,17 @@ def _patch_groups(monkeypatch, existing=(), *, created_id="new="):
                 "announcement_only": announcement_only,
             }
         )
-        group = SignalGroup(id=created_id, name=name)
+        group = SignalGroup(id=created_id, name=name, description=description or "")
         groups.append(group)
         return group
+
+    def fake_update_group(group_id, *, description=None, avatar=None):
+        calls["updated"].append({"id": group_id, "description": description})
 
     monkeypatch.setattr(run, "list_groups", fake_list_groups)
     monkeypatch.setattr(run, "receive", fake_receive)
     monkeypatch.setattr(run, "create_group", fake_create_group)
+    monkeypatch.setattr(run, "update_group", fake_update_group)
     return calls
 
 
@@ -100,7 +129,7 @@ def test_run_regular_sends_text_per_item(monkeypatch):
     _patch_feeds(monkeypatch, [cfg], {"https://a": items})
     sends = _capture_sends(monkeypatch)
 
-    count = run_feeds("feeds.json", now=NOW)
+    count = run_feeds("feeds.json")
 
     assert count == 2
     assert sends[0]["text"] == "One\n\nd1\n\nhttps://a/1"
@@ -122,7 +151,7 @@ def test_run_podcast_downloads_and_sends_voice_note(monkeypatch):
 
     monkeypatch.setattr(run, "download_temp", fake_download)
 
-    count = run_feeds("feeds.json", now=NOW)
+    count = run_feeds("feeds.json")
 
     assert count == 1
     assert sends[0]["voice_note"] is True
@@ -137,7 +166,7 @@ def test_run_podcast_without_enclosure_falls_back_to_text(monkeypatch):
     _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
     sends = _capture_sends(monkeypatch)
 
-    count = run_feeds("feeds.json", now=NOW)
+    count = run_feeds("feeds.json")
 
     assert count == 1
     assert sends[0]["voice_note"] is False
@@ -155,7 +184,7 @@ def test_run_uses_message_template(monkeypatch):
     _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
     sends = _capture_sends(monkeypatch)
 
-    run_feeds("feeds.json", now=NOW)
+    run_feeds("feeds.json")
 
     assert sends[0]["text"] == "📰 One [Blog]\n\nhttps://a/1"
 
@@ -174,7 +203,7 @@ def test_run_applies_field_filters(monkeypatch):
     _patch_feeds(monkeypatch, [cfg], {"https://a": items})
     sends = _capture_sends(monkeypatch)
 
-    count = run_feeds("feeds.json", now=NOW)
+    count = run_feeds("feeds.json")
 
     assert count == 1
     assert sends[0]["text"].startswith("Real post")
@@ -214,7 +243,7 @@ def test_run_podcast_splits_card_and_voice_note(monkeypatch):
     sends = _capture_sends(monkeypatch)
     downloaded = _fake_downloads(monkeypatch)
 
-    count = run_feeds("feeds.json", now=NOW)
+    count = run_feeds("feeds.json")
 
     assert downloaded == ["https://a/ep.mp3", "https://a/ep.jpg"]
     assert count == 1  # one item, even though it took two messages
@@ -245,7 +274,7 @@ def test_run_podcast_without_a_card_stays_one_message(monkeypatch):
     sends = _capture_sends(monkeypatch)
     _fake_downloads(monkeypatch)
 
-    run_feeds("feeds.json", now=NOW)
+    run_feeds("feeds.json")
 
     assert len(sends) == 1
     assert sends[0]["voice_note"] is True
@@ -258,7 +287,7 @@ def test_run_sends_without_artwork_when_its_download_fails(monkeypatch, capsys):
     sends = _capture_sends(monkeypatch)
     _fake_downloads(monkeypatch, fail_on="https://a/ep.jpg")
 
-    count = run_feeds("feeds.json", now=NOW)
+    count = run_feeds("feeds.json")
 
     # The episode still goes out; only the card's image is lost.
     assert count == 1
@@ -274,7 +303,7 @@ def test_run_regular_feed_sends_no_preview(monkeypatch):
     _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
     sends = _capture_sends(monkeypatch)
 
-    run_feeds("feeds.json", now=NOW)
+    run_feeds("feeds.json")
 
     assert sends[0]["preview"] is None
 
@@ -289,7 +318,7 @@ def test_run_dry_run_describes_preview_without_downloading(monkeypatch, capsys):
 
     monkeypatch.setattr(run, "download_temp", fail)
 
-    run_feeds("feeds.json", dry_run=True, now=NOW)
+    run_feeds("feeds.json", dry_run=True)
 
     out = capsys.readouterr().out
     assert "preview: Ep <https://a/ep.mp3>" in out
@@ -302,7 +331,7 @@ def test_run_dry_run_sends_nothing(monkeypatch, capsys):
     _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
     sends = _capture_sends(monkeypatch)
 
-    count = run_feeds("feeds.json", dry_run=True, now=NOW)
+    count = run_feeds("feeds.json", dry_run=True)
 
     assert count == 1
     assert sends == []
@@ -325,7 +354,7 @@ def test_run_sends_to_the_group_named_after_the_feed(monkeypatch):
     )
     sends = _capture_sends(monkeypatch)
 
-    run_feeds("feeds.json", now=NOW)
+    run_feeds("feeds.json")
 
     assert sends[0]["recipient"] == "group:book="
     assert calls["created"] == []
@@ -340,7 +369,7 @@ def test_run_matches_a_group_name_case_insensitively(monkeypatch):
     )
     sends = _capture_sends(monkeypatch)
 
-    run_feeds("feeds.json", now=NOW)
+    run_feeds("feeds.json")
 
     assert sends[0]["recipient"] == "group:book="
     assert calls["created"] == []
@@ -352,7 +381,7 @@ def test_run_creates_the_group_when_it_is_missing(monkeypatch, capsys):
     )
     sends = _capture_sends(monkeypatch)
 
-    run_feeds("feeds.json", now=NOW)
+    run_feeds("feeds.json")
 
     assert calls["created"] == [
         {"name": "Blog", "description": None, "avatar": None, "announcement_only": True}
@@ -373,7 +402,7 @@ def test_run_uses_the_feed_artwork_as_the_group_image(monkeypatch):
     _capture_sends(monkeypatch)
     downloaded = _fake_downloads(monkeypatch)
 
-    run_feeds("feeds.json", now=NOW)
+    run_feeds("feeds.json")
 
     assert downloaded == ["https://a/show.jpg"]
     assert calls["created"][0]["avatar"] == "/tmp/fake-show.jpg"
@@ -392,7 +421,7 @@ def test_run_creates_the_group_without_an_image_when_the_download_fails(
     _capture_sends(monkeypatch)
     _fake_downloads(monkeypatch, fail_on="https://a/show.jpg")
 
-    run_feeds("feeds.json", now=NOW)
+    run_feeds("feeds.json")
 
     # Artwork is decoration; losing it must not cost you the group.
     assert calls["created"][0]["avatar"] is None
@@ -408,7 +437,7 @@ def test_run_drains_the_queue_before_reading_the_group_list(monkeypatch):
     )
     _capture_sends(monkeypatch)
 
-    run_feeds("feeds.json", now=NOW)
+    run_feeds("feeds.json")
 
     assert calls["receive"] == 1
 
@@ -423,7 +452,7 @@ def test_run_refreshes_even_when_a_stale_group_matches(monkeypatch):
     )
     _capture_sends(monkeypatch)
 
-    run_feeds("feeds.json", now=NOW)
+    run_feeds("feeds.json")
 
     assert calls["receive"] == 1
 
@@ -438,7 +467,7 @@ def test_run_lists_groups_once_for_several_feeds(monkeypatch):
     )
     _capture_sends(monkeypatch)
 
-    run_feeds("feeds.json", now=NOW)
+    run_feeds("feeds.json")
 
     # Every signal-cli call pays a JVM start; N feeds must not cost N listings,
     # and one refresh covers the whole run.
@@ -451,7 +480,7 @@ def test_run_creates_no_group_for_a_feed_with_nothing_to_send(monkeypatch):
     calls = _patch_feeds(monkeypatch, [cfg], {"https://a": [_POST]}, groups=[])
     sends = _capture_sends(monkeypatch)
 
-    count = run_feeds("feeds.json", now=NOW)
+    count = run_feeds("feeds.json")
 
     assert count == 0
     assert sends == []
@@ -465,7 +494,7 @@ def test_run_dry_run_creates_nothing_and_says_so(monkeypatch, capsys):
     )
     sends = _capture_sends(monkeypatch)
 
-    run_feeds("feeds.json", dry_run=True, now=NOW)
+    run_feeds("feeds.json", dry_run=True)
 
     assert calls["created"] == []
     assert sends == []
@@ -481,7 +510,7 @@ def test_run_dry_run_names_an_existing_group(monkeypatch, capsys):
     )
     _capture_sends(monkeypatch)
 
-    run_feeds("feeds.json", dry_run=True, now=NOW)
+    run_feeds("feeds.json", dry_run=True)
 
     out = capsys.readouterr().out
     assert "group:book=" in out
@@ -494,11 +523,11 @@ def test_run_to_overrides_every_group(monkeypatch):
     )
     sends = _capture_sends(monkeypatch)
 
-    run_feeds("feeds.json", to="+31611111111", now=NOW)
+    run_feeds("feeds.json", to="+31611111111")
 
     assert sends[0]["recipient"] == "+31611111111"
     # A test send must not touch groups at all — not even to look.
-    assert calls == {"list": 0, "receive": 0, "created": []}
+    assert calls == {"list": 0, "receive": 0, "created": [], "updated": []}
 
 
 def test_run_refuses_to_guess_between_two_groups_with_one_name(monkeypatch):
@@ -511,7 +540,7 @@ def test_run_refuses_to_guess_between_two_groups_with_one_name(monkeypatch):
     sends = _capture_sends(monkeypatch)
 
     with pytest.raises(SignalError, match="2 groups are called"):
-        run_feeds("feeds.json", now=NOW)
+        run_feeds("feeds.json")
     assert sends == []
 
 
@@ -527,7 +556,7 @@ def test_run_ignores_groups_you_have_left_or_blocked(monkeypatch):
     )
     _capture_sends(monkeypatch)
 
-    run_feeds("feeds.json", now=NOW)
+    run_feeds("feeds.json")
 
     # Neither is a place to send, so a fresh group is the right answer.
     assert calls["created"] == [
@@ -545,7 +574,7 @@ def test_run_uses_the_feed_blurb_as_the_group_description(monkeypatch):
     )
     _capture_sends(monkeypatch)
 
-    run_feeds("feeds.json", now=NOW)
+    run_feeds("feeds.json")
 
     assert calls["created"][0]["description"] == "Everything worth reading, daily."
 
@@ -556,6 +585,284 @@ def test_run_creates_the_group_without_a_description_when_the_feed_has_none(
     calls = _patch_feeds(monkeypatch, [_blog()], {"https://a": [_POST]}, groups=[])
     _capture_sends(monkeypatch)
 
-    run_feeds("feeds.json", now=NOW)
+    run_feeds("feeds.json")
 
     assert calls["created"][0]["description"] is None
+
+
+# --- watermarks -------------------------------------------------------------
+#
+# How far a feed got is remembered in its group's description, because Signal
+# offers nowhere else to put it. Group names, ids and descriptions here are all
+# invented, and nothing in these tests reaches signal-cli.
+
+
+def _dated(title, when):
+    return FeedItem(title=title, description="d", link=f"https://a/{title}", published=when)
+
+
+OLDEST = _dated("Oldest", NOW - timedelta(days=2))
+MIDDLE = _dated("Middle", NOW - timedelta(days=1))
+LATEST = _dated("Latest", NOW)
+
+
+def _group_at(when, *, name="Blog", blurb="A show."):
+    """A group whose description says the feed got as far as ``when``."""
+    description = blurb if when is None else f"{blurb}\n\n{format_watermark(when)}"
+    return SignalGroup(id="blog=", name=name, description=description)
+
+
+def test_run_sends_only_what_is_newer_than_the_watermark(monkeypatch):
+    group = _group_at(MIDDLE.published)
+    _patch_feeds(
+        monkeypatch,
+        [_blog()],
+        {"https://a": [LATEST, MIDDLE, OLDEST]},
+        groups=[group],
+    )
+    sends = _capture_sends(monkeypatch)
+
+    count = run_feeds("feeds.json")
+
+    # MIDDLE is the watermark itself, so it must not go again.
+    assert count == 1
+    assert [s["text"].splitlines()[0] for s in sends] == ["Latest"]
+
+
+def test_run_sends_nothing_when_the_feed_has_not_moved(monkeypatch):
+    calls = _patch_feeds(
+        monkeypatch,
+        [_blog()],
+        {"https://a": [LATEST, MIDDLE]},
+        groups=[_group_at(LATEST.published)],
+    )
+    sends = _capture_sends(monkeypatch)
+
+    assert run_feeds("feeds.json") == 0
+    assert sends == []
+    # Nothing sent means nothing recorded, so the chat stays silent: no
+    # "changed the group description" line for a run with no news.
+    assert calls["updated"] == []
+
+
+def test_run_without_a_watermark_sends_only_the_newest_item(monkeypatch):
+    # A group that has never been used by rssignal must not disgorge the whole
+    # back catalogue on its first run.
+    _patch_feeds(
+        monkeypatch,
+        [_blog()],
+        {"https://a": [LATEST, MIDDLE, OLDEST]},
+        groups=[_group_at(None)],
+    )
+    sends = _capture_sends(monkeypatch)
+
+    assert run_feeds("feeds.json") == 1
+    assert sends[0]["text"].splitlines()[0] == "Latest"
+
+
+def test_run_on_a_brand_new_group_sends_only_the_newest_item(monkeypatch):
+    calls = _patch_feeds(
+        monkeypatch, [_blog()], {"https://a": [LATEST, MIDDLE, OLDEST]}, groups=[]
+    )
+    sends = _capture_sends(monkeypatch)
+
+    assert run_feeds("feeds.json") == 1
+    assert len(calls["created"]) == 1
+    assert sends[0]["text"].splitlines()[0] == "Latest"
+
+
+def test_run_ignores_a_corrupt_watermark(monkeypatch):
+    # Editing the description by hand should cost one duplicate, not a crash.
+    group = SignalGroup(id="blog=", name="Blog", description="A show.\n\n[rssignal soon]")
+    _patch_feeds(
+        monkeypatch, [_blog()], {"https://a": [LATEST, MIDDLE]}, groups=[group]
+    )
+    sends = _capture_sends(monkeypatch)
+
+    assert run_feeds("feeds.json") == 1
+    assert sends[0]["text"].splitlines()[0] == "Latest"
+
+
+def test_run_records_the_newest_item_it_sent(monkeypatch):
+    calls = _patch_feeds(
+        monkeypatch,
+        [_blog()],
+        {"https://a": [LATEST, MIDDLE, OLDEST]},
+        groups=[_group_at(OLDEST.published)],
+    )
+    _capture_sends(monkeypatch)
+
+    run_feeds("feeds.json")
+
+    assert len(calls["updated"]) == 1
+    written = calls["updated"][0]
+    assert written["id"] == "blog="
+    # The stamp is the item's publication date, not the time of the run.
+    assert read_watermark(written["description"]) == LATEST.published
+
+
+def test_run_sends_oldest_first(monkeypatch):
+    _patch_feeds(
+        monkeypatch,
+        [_blog()],
+        {"https://a": [LATEST, MIDDLE, OLDEST]},
+        groups=[_group_at(NOW - timedelta(days=10))],
+    )
+    sends = _capture_sends(monkeypatch)
+
+    run_feeds("feeds.json")
+
+    # Feeds list newest-first; sending in that order would strand the older
+    # items behind the watermark if a send failed part-way.
+    assert [s["text"].splitlines()[0] for s in sends] == ["Oldest", "Middle", "Latest"]
+
+
+def test_run_records_progress_when_a_send_fails_part_way(monkeypatch):
+    calls = _patch_feeds(
+        monkeypatch,
+        [_blog()],
+        {"https://a": [LATEST, MIDDLE, OLDEST]},
+        groups=[_group_at(NOW - timedelta(days=10))],
+    )
+
+    sent = []
+
+    def flaky_send(text, recipient=None, **kwargs):
+        if text.startswith("Middle"):
+            raise SignalError("no route to host")
+        sent.append(text)
+
+    monkeypatch.setattr(run, "send_msg", flaky_send)
+
+    with pytest.raises(SignalError):
+        run_feeds("feeds.json")
+
+    # Oldest got through, so the watermark moves to it and Middle and Latest
+    # are retried next run. Losing them would be the worse failure.
+    assert [t.splitlines()[0] for t in sent] == ["Oldest"]
+    assert read_watermark(calls["updated"][0]["description"]) == OLDEST.published
+
+
+def test_run_records_nothing_when_the_very_first_send_fails(monkeypatch):
+    calls = _patch_feeds(
+        monkeypatch,
+        [_blog()],
+        {"https://a": [LATEST]},
+        groups=[_group_at(NOW - timedelta(days=10))],
+    )
+
+    def failing_send(text, recipient=None, **kwargs):
+        raise SignalError("no route to host")
+
+    monkeypatch.setattr(run, "send_msg", failing_send)
+
+    with pytest.raises(SignalError):
+        run_feeds("feeds.json")
+
+    assert calls["updated"] == []
+
+
+def test_run_keeps_a_hand_edited_blurb_when_it_records(monkeypatch):
+    mine = "My own words about this feed."
+    group = SignalGroup(
+        id="blog=", name="Blog", description=f"{mine}\n\n{format_watermark(OLDEST.published)}"
+    )
+    calls = _patch_feeds(
+        monkeypatch,
+        [_blog()],
+        {"https://a": [LATEST]},
+        blurb="The feed's own boilerplate.",
+        groups=[group],
+    )
+    _capture_sends(monkeypatch)
+
+    run_feeds("feeds.json")
+
+    written = calls["updated"][0]["description"]
+    assert written.startswith(mine)
+    assert "boilerplate" not in written
+
+
+def test_run_falls_back_to_the_feed_blurb_when_the_group_has_none(monkeypatch):
+    calls = _patch_feeds(
+        monkeypatch,
+        [_blog()],
+        {"https://a": [LATEST]},
+        blurb="What the feed says about itself.",
+        groups=[SignalGroup(id="blog=", name="Blog", description="")],
+    )
+    _capture_sends(monkeypatch)
+
+    run_feeds("feeds.json")
+
+    assert calls["updated"][0]["description"].startswith("What the feed says")
+
+
+def test_run_since_overrides_the_stored_watermark(monkeypatch):
+    _patch_feeds(
+        monkeypatch,
+        [_blog()],
+        {"https://a": [LATEST, MIDDLE, OLDEST]},
+        groups=[_group_at(LATEST.published)],
+    )
+    sends = _capture_sends(monkeypatch)
+
+    count = run_feeds("feeds.json", since=NOW - timedelta(days=10))
+
+    # The group says it is up to date; --since says replay anyway.
+    assert count == 3
+    assert [s["text"].splitlines()[0] for s in sends] == ["Oldest", "Middle", "Latest"]
+
+
+def test_run_to_reads_and_writes_no_watermark(monkeypatch):
+    calls = _patch_feeds(
+        monkeypatch,
+        [_blog()],
+        {"https://a": [LATEST, MIDDLE, OLDEST]},
+        groups=[_group_at(NOW - timedelta(days=10))],
+    )
+    sends = _capture_sends(monkeypatch)
+
+    run_feeds("feeds.json", to="+31611111111")
+
+    # A test send has no effect on rssignal's idea of where the feed got to,
+    # in either direction: it sends the newest item and records nothing.
+    assert [s["text"].splitlines()[0] for s in sends] == ["Latest"]
+    assert calls["updated"] == []
+    assert calls["list"] == 0
+
+
+def test_run_dry_run_records_nothing(monkeypatch, capsys):
+    calls = _patch_feeds(
+        monkeypatch,
+        [_blog()],
+        {"https://a": [LATEST, MIDDLE]},
+        groups=[_group_at(MIDDLE.published)],
+    )
+    sends = _capture_sends(monkeypatch)
+
+    count = run_feeds("feeds.json", dry_run=True)
+
+    assert count == 1
+    assert sends == []
+    assert calls["updated"] == []
+    assert "Latest" in capsys.readouterr().out
+
+
+def test_run_recording_failure_does_not_fail_the_run(monkeypatch, capsys):
+    # The items really were sent. Raising here would only mean sending again.
+    _patch_feeds(
+        monkeypatch,
+        [_blog()],
+        {"https://a": [LATEST]},
+        groups=[_group_at(OLDEST.published)],
+    )
+    _capture_sends(monkeypatch)
+
+    def failing_update(group_id, *, description=None, avatar=None):
+        raise SignalError("group update rejected")
+
+    monkeypatch.setattr(run, "update_group", failing_update)
+
+    assert run_feeds("feeds.json") == 1
+    assert "recording how far the feed got failed" in capsys.readouterr().err

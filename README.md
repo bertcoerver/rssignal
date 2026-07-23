@@ -8,8 +8,8 @@ command-line tool, so messages come from your own linked Signal account.
 
 > **Status:** early. Signal setup, message sending, one auto-created group per
 > feed, feed parsing/sending, message templates, per-field filters, extracted
-> fields, and link previews work.
-> De-duplication and the cloud service (POST-triggered) come next.
+> fields, link previews, and send-once-only work.
+> The cloud service (POST-triggered) comes next.
 
 ## Requirements
 
@@ -138,8 +138,6 @@ Each feed entry supports:
 | `url`               | yes      | The RSS/Atom feed URL.                                                  |
 | `type`              | yes      | `regular` (title + description + link) or `podcast` (audio voice note). |
 | `name`              | yes      | The Signal group this feed sends to. Also `{feed_name}` in templates.  |
-| `max_age_hours`     | no       | Only send items published within this many hours.                      |
-| `max_age_days`      | no       | Added to `max_age_hours`. Omit both to send every item in the feed.    |
 | `message_template`  | no       | Message text with `{field}` placeholders. Omit for the built-in layout. |
 | `extract`           | no       | Define new fields by regex against existing ones. See below.           |
 | `link_preview`      | no       | Send a link preview card. Defaults to on for `podcast`, off for `regular`. |
@@ -150,8 +148,9 @@ Each feed entry supports:
 | `<field>_excludes`  | no       | Drop items whose field contains any of these terms.                    |
 | `<field>_matches`   | no       | Keep items whose field matches any of these regexes.                   |
 
-Unknown keys are rejected, so a typo like `max_age_hour` is an error rather than a
-silently ignored setting.
+Unknown keys are rejected, so a typo like `title_contain` is an error rather than a
+silently ignored setting. There is no recency setting: see
+[what rssignal remembers](#what-rssignal-remembers).
 
 ### One group per feed
 
@@ -316,7 +315,8 @@ name from `rssignal fields`:
 
 Each takes a string or a list. `contains` and `matches` keep an item when **any**
 value hits; `excludes` keeps it when **none** do. Matching is case-insensitive, and
-multiple filters must **all** pass. Recency (`max_age_*`) is applied first.
+multiple filters must **all** pass. Filters are applied before the watermark, so
+an item you filter out never counts as sent.
 
 Check what would be sent, then send for real:
 
@@ -373,8 +373,54 @@ All three `preview_*` keys take the same `{field}` placeholders as
 `message_template`. An item whose preview URL or title renders empty is sent
 without a card rather than failing.
 
-> **Note:** there is no de-duplication yet — running again while items are still
-> inside their `max_age` window resends them. Seen-tracking is the next milestone.
+## What rssignal remembers
+
+rssignal sends each item once. To do that it has to remember how far each feed
+got — and it keeps that **in the feed's own Signal group description**, not in a
+state file:
+
+```
+Two people argue about films they have not seen. New episode every Thursday.
+
+[rssignal 2026-07-23T10:03:00+00:00]
+```
+
+The stamp is the publication date of the newest item that went out. On the next
+run, anything published after it is sent, oldest first, and the marker moves.
+
+There is nowhere better. `signal-cli` cannot read back messages it has sent — the
+server hands each message over once, and a linked secondary device never receives
+its own sends — and of everything `listGroups` reports, the description is the
+only free-text field that is writable, readable back, and stored server-side. The
+upside is that the record lives with the group: reinstall signal-cli, or link a
+new machine, and nothing is resent.
+
+**The cost:** Signal shows a group-detail change in the chat, so every run that
+sends something also leaves one *"You changed the group description"* line in that
+group. Runs with nothing new write nothing and stay completely silent.
+
+Worth knowing:
+
+- **A feed with no marker yet sends exactly one item** — the newest. A new group
+  doesn't open with the whole back catalogue.
+- **Items with no publication date are never sent.** There is no way to tell
+  whether they are new.
+- **Your own edits survive.** Rewrite a group's description in Signal and rssignal
+  moves the marker around your text instead of pasting the feed's blurb back over
+  it. Delete the marker and the feed's newest item is sent once more.
+- **`--to` touches no group**, so it neither reads nor moves any marker. It sends
+  the newest item, every time.
+- **`--since` replays**, ignoring what the groups remember:
+
+  ```bash
+  rssignal run --since 2026-07-01                # everything published since then
+  rssignal run --since 2026-07-01T09:00+02:00    # or to the minute
+  ```
+
+  The marker still ends up on the newest item actually sent, so a replay leaves it
+  correct rather than rewound.
+- **A send that fails part-way is safe.** Items go out oldest first and the marker
+  lands on the last one that made it; the rest are retried on the next run.
 
 ## Development
 

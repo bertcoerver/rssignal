@@ -1,18 +1,21 @@
-"""Orchestration: read feeds, filter by recency, and send one message per item.
+"""Orchestration: read feeds, work out what's new, and send one message per item.
 
 This ties the pieces together: :func:`rssignal.feeds.load_feeds` /
-:func:`~rssignal.feeds.parse_feed` produce items, :func:`~rssignal.feeds.filter_recent`
-and :func:`~rssignal.feeds.apply_filters` narrow them, :func:`~rssignal.feeds.render_message`
-turns each survivor into text, and it is sent with :func:`rssignal.signal_cli.send_msg`.
-Podcast items download their audio enclosure and send it as a voice note, plus a
-link preview card whose artwork is downloaded alongside it. Those go out as two
-messages: Signal drops a preview card from any message carrying an attachment.
+:func:`~rssignal.feeds.parse_feed` produce items, :func:`~rssignal.feeds.apply_filters`
+and :func:`~rssignal.feeds.filter_since` narrow them,
+:func:`~rssignal.feeds.render_message` turns each survivor into text, and it is
+sent with :func:`rssignal.signal_cli.send_msg`. Podcast items download their audio
+enclosure and send it as a voice note, plus a link preview card whose artwork is
+downloaded alongside it. Those go out as two messages: Signal drops a preview card
+from any message carrying an attachment.
 
 Each feed sends to a Signal group named after it, created on the first send if it
 doesn't exist yet — see :class:`_GroupResolver`.
 
-There is no de-duplication yet: running twice within a feed's ``max_age`` window
-resends the same items. Seen-tracking is the next milestone.
+How far a feed got is remembered in that group's own description, so a feed is
+never sent twice and running more often costs nothing. See
+:mod:`rssignal.watermark` for why the description, of all places, and
+:func:`_send_feed` for the order things happen in.
 """
 
 from __future__ import annotations
@@ -28,21 +31,26 @@ from .feeds import (
     FeedItem,
     ParsedFeed,
     apply_filters,
-    filter_recent,
+    filter_since,
     load_feeds,
+    newest,
     parse_feed,
     preview_fields,
     render_message,
 )
 from .signal_cli import (
+    GROUP_DESCRIPTION_MAX_CHARS,
     LinkPreview,
+    SignalError,
     SignalGroup,
     create_group,
     list_groups,
     match_group,
     receive,
     send_msg,
+    update_group,
 )
+from .watermark import compose_description, read_watermark, strip_watermark
 
 
 class _GroupResolver:
@@ -105,55 +113,118 @@ def run_feeds(
     *,
     dry_run: bool = False,
     to: str | None = None,
-    now: datetime | None = None,
+    since: datetime | None = None,
 ) -> int:
-    """Process every feed in ``config_path`` and send its recent items.
+    """Process every feed in ``config_path`` and send whatever is new.
 
     Each feed goes to the Signal group named after it, which is created on the
     first send if it doesn't exist. ``to`` overrides that for every feed at once
     and touches no group — the safe way to try a real send against your own
-    number.
+    number. ``since`` overrides every stored watermark, for replaying a stretch
+    of a feed by hand.
 
     Returns the number of items sent (or, in ``dry_run`` mode, that would be
-    sent). With ``dry_run`` set nothing is sent, downloaded, or created — each
-    candidate is printed instead.
+    sent). With ``dry_run`` set nothing is sent, downloaded, created, or
+    recorded — each candidate is printed instead.
     """
     feeds = load_feeds(config_path)
     resolver = _GroupResolver()
-    sent = 0
-    for cfg in feeds:
-        parsed: ParsedFeed = parse_feed(cfg)
-        items = filter_recent(parsed.items, cfg.max_age, now=now)
-        items = apply_filters(items, cfg.filters)
-        if not items:
-            # No group is resolved, let alone created, for a feed with nothing to
-            # say: an unused feed shouldn't leave an empty group behind.
-            continue
+    return sum(
+        _send_feed(cfg, resolver, dry_run=dry_run, to=to, since=since)
+        for cfg in feeds
+    )
 
-        recipient = _recipient_for(cfg, parsed, resolver, to=to, dry_run=dry_run)
-        for item in items:
-            _handle_item(cfg, item, recipient, dry_run=dry_run)
+
+def _send_feed(
+    cfg: FeedConfig,
+    resolver: _GroupResolver,
+    *,
+    dry_run: bool,
+    to: str | None,
+    since: datetime | None,
+) -> int:
+    """Send one feed's new items, and record how far it got. Returns the count.
+
+    The order here is deliberate. The group is looked up *before* deciding what
+    to send, because the watermark lives on it — but it is only ever *created*
+    once there is something to send, so a typo in a feed's name can't leave a
+    stray group behind. The watermark is written last, from the items that
+    actually went out.
+    """
+    parsed: ParsedFeed = parse_feed(cfg)
+    items = apply_filters(parsed.items, cfg.filters)
+    if not items:
+        return 0
+
+    # With --to, no group is touched at all: nothing to read a watermark from,
+    # and nothing to write one to. That leaves --to what it has always been —
+    # a send that has no effect on rssignal's idea of where a feed got to.
+    group = None if to else resolver.find(cfg.name)
+    mark = since or (read_watermark(group.description) if group else None)
+
+    if mark is None:
+        # Nothing remembered yet. One item, not the whole back catalogue.
+        latest = newest(items)
+        due = [latest] if latest else []
+    else:
+        due = filter_since(items, mark)
+    if not due:
+        return 0
+
+    if dry_run:
+        where = to or (group.recipient if group else f"(group {cfg.name!r} would be created)")
+        for item in due:
+            _handle_item(cfg, item, where, dry_run=True)
+        return len(due)
+
+    if to:
+        recipient = to
+    else:
+        # The one place a group is created, and only now that there is something
+        # to put in it: a typo in a feed's name can't leave a stray group behind.
+        group = group or resolver.resolve(cfg.name, parsed)
+        recipient = group.recipient
+
+    # due is oldest-first, so a send that fails part-way leaves the watermark on
+    # the last item that made it and the rest are retried next run. The finally
+    # is what makes that true even when send_msg raises.
+    done: FeedItem | None = None
+    sent = 0
+    try:
+        for item in due:
+            _handle_item(cfg, item, recipient, dry_run=False)
+            done = item
             sent += 1
+    finally:
+        if done is not None and not to:
+            _record_progress(group, parsed, done)
+
     return sent
 
 
-def _recipient_for(
-    cfg: FeedConfig,
-    parsed: ParsedFeed,
-    resolver: _GroupResolver,
-    *,
-    to: str | None,
-    dry_run: bool,
-) -> str:
-    """Work out where ``cfg``'s items go, without side effects in a dry run."""
-    if to:
-        return to
-    if dry_run:
-        # Looking is safe; creating a group is not. The queue is still drained,
-        # so what a dry run reports is what a real run would actually find.
-        group = resolver.find(cfg.name)
-        return group.recipient if group else f"(group {cfg.name!r} would be created)"
-    return resolver.resolve(cfg.name, parsed).recipient
+def _record_progress(group: SignalGroup, parsed: ParsedFeed, done: FeedItem) -> None:
+    """Move ``group``'s watermark to ``done``, keeping its blurb.
+
+    The blurb kept is the group's own, not the feed's: edit a group description
+    in Signal and rssignal moves the marker around your text instead of pasting
+    the feed's boilerplate back over it every run. The feed's blurb is only the
+    fallback, for a group that hasn't got one.
+
+    Failing to record is reported but not raised. The items really were sent;
+    turning that into a failed run would only mean sending them again.
+    """
+    blurb = strip_watermark(group.description) or parsed.description
+    description = compose_description(
+        blurb, done.published, limit=GROUP_DESCRIPTION_MAX_CHARS
+    )
+    try:
+        update_group(group.id, description=description)
+    except SignalError as exc:
+        print(
+            f"[{group.name}] sent, but recording how far the feed got failed: "
+            f"{exc}\nThose items will be sent again on the next run.",
+            file=sys.stderr,
+        )
 
 
 def _handle_item(
