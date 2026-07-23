@@ -177,13 +177,24 @@ picture, and the channel's description as its group description. Both are
 channel-level — an episode's own image and notes stay on the message, where they
 belong. Invite people from Signal on your phone; rssignal never adds anyone.
 
+It also starts with **disappearing messages set to one week**
+(`GROUP_EXPIRATION_SECONDS`). A feed group is a stream, not an archive: left
+alone it grows without limit, and the phone holding it keeps every episode's
+audio forever. This costs rssignal nothing — how far a feed got is kept in the
+group *description*, which is metadata rather than a message and never expires,
+so a group can empty itself completely and the next run still knows exactly
+where it was. The "changed the group description" lines each sending run leaves
+behind expire along with everything else. Note that the episodes go too, audio
+included, so if a feed group doubles as your listening queue, turn it off.
+
 Those settings are applied **only when rssignal creates the group.** A group you
 already had is used exactly as it is — rssignal will not restyle a group you made
-yourself. To set them yourself:
+yourself, or change its expiry. To set them yourself:
 
 ```python
 from rssignal import update_group
 update_group("<group id>", description="A daily podcast.", avatar="./artwork.jpg")
+update_group("<group id>", expiration=604800)   # one week; 0 turns it off
 ```
 
 Group pictures have two traps, both of which fail **silently** — the command
@@ -192,7 +203,8 @@ exits 0 and the group simply has no image:
 - `updateGroup` ignores `--avatar` on the call that *creates* a group (though it
   does honour `--name` and `--set-permission-send-messages` there). rssignal
   therefore sets the picture in a second call against the new group id, and puts
-  the description there too rather than trust it to the creating call.
+  the description and the expiry there too rather than trust them to the
+  creating call.
 - Signal drops an avatar that is too large. A 1400×1400 podcast cover vanishes;
   512×512 arrives. rssignal scales anything bigger down to 512px on its longest
   side before sending, keeping the aspect ratio.

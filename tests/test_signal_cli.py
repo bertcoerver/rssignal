@@ -731,7 +731,7 @@ def test_create_group_builds_correct_argv(have_binary, monkeypatch):
 
     group = create_group("Feed group", account="+31600000000")
 
-    assert calls["argv"] == [
+    assert calls["argvs"][0] == [
         FAKE_BIN,
         "-o",
         "json",
@@ -763,8 +763,9 @@ def test_create_group_omits_group_id_so_signal_cli_creates_one(have_binary, monk
     calls = _patch_create(monkeypatch, stdout='{"groupId": "ZZZ="}')
     create_group("New", account="+31600000000")
     # Passing -g would edit an existing group instead of creating one.
-    assert "-g" not in calls["argv"]
-    assert "--group-id" not in calls["argv"]
+    create_argv = calls["argvs"][0]
+    assert "-g" not in create_argv
+    assert "--group-id" not in create_argv
 
 
 def test_create_group_passes_description_avatar_and_announcement(
@@ -797,14 +798,19 @@ def test_create_group_passes_description_avatar_and_announcement(
     assert decorate_argv[decorate_argv.index("--avatar") + 1] == str(avatar)
 
 
-def test_create_group_with_nothing_to_decorate_makes_one_call(
-    have_binary, monkeypatch
-):
+def test_create_group_always_sets_disappearing_messages(have_binary, monkeypatch):
+    # Even with nothing to decorate, the second call still runs: a feed group is
+    # a stream, not an archive, and it must not grow without limit.
     calls = _patch_create(monkeypatch, stdout='{"groupId": "ZZZ="}')
 
     create_group("Pod", announcement_only=True, account="+31600000000")
 
-    assert len(calls["argvs"]) == 1
+    create_argv, decorate_argv = calls["argvs"]
+    assert "--expiration" not in create_argv
+    assert decorate_argv[decorate_argv.index("--expiration") + 1] == str(
+        signal_cli.GROUP_EXPIRATION_SECONDS
+    )
+    assert signal_cli.GROUP_EXPIRATION_SECONDS == 7 * 24 * 60 * 60
 
 
 def test_create_group_keeps_the_group_when_the_avatar_fails(
@@ -828,7 +834,7 @@ def test_create_group_keeps_the_group_when_the_avatar_fails(
     group = create_group("Pod", avatar=str(avatar), account="+31600000000")
 
     assert group == SignalGroup(id="ZZZ=", name="Pod")
-    assert "description and picture failed" in capsys.readouterr().err
+    assert "setting its details failed" in capsys.readouterr().err
 
 
 def test_set_group_avatar_builds_correct_argv(have_binary, monkeypatch, tmp_path):
@@ -1129,6 +1135,32 @@ def test_update_group_sets_description_and_avatar_in_one_call(
 def test_update_group_with_nothing_to_change_runs_nothing(have_binary, monkeypatch):
     calls = _patch_create(monkeypatch)
     update_group("ZZZ=", account="+31600000000")
+    assert calls.get("argvs") is None
+
+
+def test_update_group_sets_the_expiry(have_binary, monkeypatch):
+    calls = _patch_create(monkeypatch)
+
+    update_group("ZZZ=", expiration=604800, account="+31600000000")
+
+    assert calls["argv"][calls["argv"].index("--expiration") + 1] == "604800"
+
+
+def test_update_group_can_turn_the_expiry_off(have_binary, monkeypatch):
+    # 0 is off, and is not the same as None, which means "leave it alone".
+    calls = _patch_create(monkeypatch)
+
+    update_group("ZZZ=", expiration=0, account="+31600000000")
+
+    assert calls["argv"][calls["argv"].index("--expiration") + 1] == "0"
+
+
+def test_update_group_rejects_a_negative_expiry(have_binary, monkeypatch):
+    calls = _patch_create(monkeypatch)
+
+    with pytest.raises(ValueError):
+        update_group("ZZZ=", expiration=-1, account="+31600000000")
+
     assert calls.get("argvs") is None
 
 

@@ -39,6 +39,17 @@ GROUP_AVATAR_MAX_PX = 512
 # by rssignal — where it can be cut on a word — rather than by the server.
 GROUP_DESCRIPTION_MAX_CHARS = 480
 
+# Disappearing messages on every group rssignal creates. A feed group is a
+# stream, not an archive: without this it grows without limit and the phone
+# holding it keeps every episode's audio forever.
+#
+# It costs nothing rssignal depends on. How far a feed got is kept in the group
+# *description* (see :mod:`rssignal.watermark`), which is group metadata rather
+# than a message and does not expire — so a group can empty itself completely
+# and the next run still knows exactly where it was. The "changed the group
+# description" lines each sending run leaves behind expire along with the rest.
+GROUP_EXPIRATION_SECONDS = 7 * 24 * 60 * 60
+
 # Signal caps a message body at 2000 **bytes** of UTF-8, not 2000 characters —
 # measured against a real feed, a body of 1997 bytes kept its link preview and
 # one of 2105 lost it, both at 1997 characters. The difference is entirely
@@ -351,14 +362,19 @@ def create_group(
     ``announcement_only`` restricts sending to admins, which is usually what you
     want for a group that exists to receive a feed.
 
-    The description and avatar are applied by a **second** ``updateGroup`` call
-    once the group has an id. signal-cli accepts ``--avatar`` on the creating
-    call, exits 0, and leaves the group with no picture; the same flag against an
-    existing ``--group-id`` works. That was measured; whether ``--description``
-    fares any better there was not, so it takes the path known to work.
-    ``--name`` and ``--set-permission-send-messages`` do take effect on creation
-    and stay put. A group that can't be decorated is still returned, with a
-    warning: losing the blurb or the picture is not a reason to lose the group.
+    The description, avatar and message expiry are applied by a **second**
+    ``updateGroup`` call once the group has an id. signal-cli accepts
+    ``--avatar`` on the creating call, exits 0, and leaves the group with no
+    picture; the same flag against an existing ``--group-id`` works. That was
+    measured; whether ``--description`` and ``--expiration`` fare any better
+    there was not, so they take the path known to work. ``--name`` and
+    ``--set-permission-send-messages`` do take effect on creation and stay put.
+    A group that can't be decorated is still returned, with a warning: losing
+    the blurb, the picture or the timer is not a reason to lose the group.
+
+    Every group starts with disappearing messages set to
+    :data:`GROUP_EXPIRATION_SECONDS` — see there for why that costs rssignal
+    nothing. Existing groups are never touched.
 
     The returned :class:`SignalGroup` carries the new base64 id; its
     :attr:`~SignalGroup.recipient` is ready to send to.
@@ -413,22 +429,21 @@ def create_group(
         group_id = created[0].id
 
     applied = ""
-    if description or avatar:
-        try:
-            update_group(
-                group_id,
-                description=description or None,
-                avatar=avatar or None,
-                account=account,
-                timeout=timeout,
-            )
-            applied = _clip(description) if description else ""
-        except SignalError as exc:
-            print(
-                f"Group {name!r} was created, but setting its description and "
-                f"picture failed: {exc}",
-                file=sys.stderr,
-            )
+    try:
+        update_group(
+            group_id,
+            description=description or None,
+            avatar=avatar or None,
+            expiration=GROUP_EXPIRATION_SECONDS,
+            account=account,
+            timeout=timeout,
+        )
+        applied = _clip(description) if description else ""
+    except SignalError as exc:
+        print(
+            f"Group {name!r} was created, but setting its details failed: {exc}",
+            file=sys.stderr,
+        )
 
     # The description comes back on the group so the caller doesn't have to
     # re-list to find out what actually landed there — empty if it didn't.
@@ -545,15 +560,17 @@ def update_group(
     *,
     description: str | None = None,
     avatar: str | None = None,
+    expiration: int | None = None,
     account: str | None = None,
     timeout: float = 120,
 ) -> None:
-    """Set an existing group's description and/or picture, in one call.
+    """Set an existing group's description, picture and/or message expiry.
 
     ``avatar`` is a **local image file path**, not a URL; images larger than
     :data:`GROUP_AVATAR_MAX_PX` are scaled down first, because Signal drops an
     oversized avatar without reporting anything. ``description`` is trimmed to
-    :data:`GROUP_DESCRIPTION_MAX_CHARS`.
+    :data:`GROUP_DESCRIPTION_MAX_CHARS`. ``expiration`` is the disappearing-message
+    timer in **seconds**, or ``0`` to turn it off.
 
     Separate from :func:`create_group` because signal-cli does not honour
     ``--avatar`` on the call that creates a group. Anything left as ``None`` is
@@ -568,7 +585,12 @@ def update_group(
             f"Group avatar {avatar!r} is not a file. An avatar is a local image "
             "path, not a URL — download the image first."
         )
-    if description is None and avatar is None:
+    if expiration is not None and expiration < 0:
+        raise ValueError(
+            f"Message expiry must be a number of seconds, not {expiration!r}. "
+            "Use 0 to turn disappearing messages off."
+        )
+    if description is None and avatar is None and expiration is None:
         return
 
     binary = find_signal_cli()
@@ -581,6 +603,8 @@ def update_group(
             argv.extend(["--description", _clip(description)])
         if avatar is not None:
             argv.extend(["--avatar", stack.enter_context(_avatar_within_limits(avatar))])
+        if expiration is not None:
+            argv.extend(["--expiration", str(expiration)])
 
         try:
             result = subprocess.run(
