@@ -264,8 +264,9 @@ def test_run_podcast_splits_card_and_voice_note(monkeypatch):
     assert audio["attachments"] == ["/tmp/fake-ep.mp3"]
     assert audio["voice_note"] is True
     assert audio["preview"] is None
-    # The text already went out with the card; repeating it would be noise.
-    assert audio["text"] == ""
+    # The title, though — a message with no body at all shows up in the chat
+    # list as a bare "Voice Message", and this is the group's last message.
+    assert audio["text"] == "Ep"
 
 
 def test_run_podcast_without_a_card_stays_one_message(monkeypatch):

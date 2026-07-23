@@ -516,6 +516,167 @@ def test_link_preview_requires_a_url_and_title():
         LinkPreview(url="https://a/1", title="")
 
 
+# --- preview images ---------------------------------------------------------
+#
+# Unlike a group avatar, a link preview's image is *not* size-limited: 1920x1920
+# artwork was measured arriving intact on a card, so it goes out untouched
+# rather than needlessly downscaled.
+
+
+def test_send_msg_sends_a_preview_image_at_its_original_size(
+    have_binary, monkeypatch, tmp_path
+):
+    big = str(tmp_path / "art.jpg")
+    Image.new("RGB", (1920, 1920), "red").save(big, "JPEG")
+    calls = _capture_argv(monkeypatch)
+
+    send_msg(
+        "Episode\n\nhttps://a/1",
+        recipient="+31611111111",
+        account="+31600000000",
+        preview=LinkPreview(url="https://a/1", title="Episode", image=big),
+    )
+
+    sent = calls["argv"][calls["argv"].index("--preview-image") + 1]
+    assert sent == big
+    with Image.open(sent) as img:
+        assert img.size == (1920, 1920)
+
+
+def test_send_msg_keeps_the_preview_image_ahead_of_the_message(
+    have_binary, monkeypatch, tmp_path
+):
+    # The flag has to sit past --attachment's greedy arg list and ahead of -m.
+    big = str(tmp_path / "art.jpg")
+    Image.new("RGB", (1920, 1920), "red").save(big, "JPEG")
+    calls = _capture_argv(monkeypatch)
+
+    send_msg(
+        "Episode\n\nhttps://a/1",
+        recipient="group:ZZZ=",
+        account="+31600000000",
+        attachments=["/tmp/ep.mp3"],
+        voice_note=True,
+        preview=LinkPreview(url="https://a/1", title="Episode", image=big),
+    )
+
+    argv = calls["argv"]
+    assert argv.index("--attachment") < argv.index("--preview-image") < argv.index("-m")
+
+
+# --- over-long message bodies ----------------------------------------------
+
+
+def test_send_msg_leaves_a_body_within_the_limit_alone(have_binary, monkeypatch):
+    calls = _capture_argv(monkeypatch)
+    text = "Episode 402\n\nhttps://a/402"
+
+    send_msg(text, recipient="+31611111111", account="+31600000000")
+
+    assert calls["argv"][calls["argv"].index("-m") + 1] == text
+
+
+def test_send_msg_shortens_an_over_long_body(have_binary, monkeypatch):
+    calls = _capture_argv(monkeypatch)
+
+    send_msg("word " * 600, recipient="+31611111111", account="+31600000000")
+
+    body = calls["argv"][calls["argv"].index("-m") + 1]
+    assert len(body.encode()) <= signal_cli.MESSAGE_MAX_BYTES
+    assert body.endswith("…")
+
+
+def test_send_msg_keeps_the_preview_url_in_an_over_long_body(have_binary, monkeypatch):
+    # Signal has nothing to draw the card from once the url is gone, so a long
+    # set of show notes loses its tail rather than its link.
+    calls = _capture_argv(monkeypatch)
+    url = "https://a/sons/a-very-long-episode"
+
+    send_msg(
+        f"{'word ' * 600}\n\n{url}",
+        recipient="+31611111111",
+        account="+31600000000",
+        preview=LinkPreview(url=url, title="A very long episode"),
+    )
+
+    body = calls["argv"][calls["argv"].index("-m") + 1]
+    assert body.endswith(url)
+    assert len(body.encode()) <= signal_cli.MESSAGE_MAX_BYTES
+
+
+def test_send_msg_counts_bytes_not_characters(have_binary, monkeypatch):
+    # The bug this replaced: French show notes clipped to 1997 *characters* went
+    # out at 2105 bytes and lost their card. Curly quotes cost three bytes each.
+    calls = _capture_argv(monkeypatch)
+    url = "https://a/1"
+
+    send_msg(
+        f"{'“mot” ' * 500}\n\n{url}",
+        recipient="+31611111111",
+        account="+31600000000",
+        preview=LinkPreview(url=url, title="Un épisode"),
+    )
+
+    body = calls["argv"][calls["argv"].index("-m") + 1]
+    assert len(body.encode()) <= signal_cli.MESSAGE_MAX_BYTES
+    assert len(body) < signal_cli.MESSAGE_MAX_BYTES  # far fewer characters fit
+    assert body.endswith(url)
+
+
+def test_clip_body_counts_the_url_against_the_budget(monkeypatch):
+    # The url is reserved out of the limit rather than added on top of it.
+    monkeypatch.setattr(signal_cli, "MESSAGE_MAX_BYTES", 60)
+    url = "https://a/some-episode"
+
+    body = signal_cli.clip_body(
+        f"{'word ' * 40}\n\n{url}", url
+    )
+
+    assert body.endswith(url)
+    assert len(body.encode()) <= 60
+
+
+def test_clip_body_counts_a_non_ascii_url_in_bytes(monkeypatch):
+    # An internationalised url costs more than its character count, and the
+    # budget has to notice or the body lands back over the limit.
+    monkeypatch.setattr(signal_cli, "MESSAGE_MAX_BYTES", 60)
+    url = "https://a/épisode-très-écouté"
+
+    body = signal_cli.clip_body(
+        f"{'word ' * 40}\n\n{url}", url
+    )
+
+    assert body.endswith(url)
+    assert len(body.encode()) <= 60
+
+
+def test_clip_body_shortens_on_a_word_boundary(monkeypatch):
+    monkeypatch.setattr(signal_cli, "MESSAGE_MAX_BYTES", 14)
+    assert signal_cli.clip_body("alpha beta gamma delta", None) == "alpha beta…"
+
+
+def test_clip_body_hard_cuts_when_the_url_leaves_no_room(monkeypatch):
+    # Nothing sensible survives, but the url still has to: a card with no body
+    # beats no card at all.
+    monkeypatch.setattr(signal_cli, "MESSAGE_MAX_BYTES", 20)
+    url = "https://a/an-episode-with-a-long-path"
+
+    body = signal_cli.clip_body(f"notes\n\n{url}", url)
+
+    assert body == url
+
+
+def test_clip_body_falls_back_when_the_url_is_missing_from_the_body(monkeypatch):
+    # signal-cli rejects this preview anyway; there is nothing to preserve.
+    monkeypatch.setattr(signal_cli, "MESSAGE_MAX_BYTES", 14)
+
+    body = signal_cli.clip_body(
+        "alpha beta gamma delta", "https://a/1"
+    )
+
+    assert body == "alpha beta…"
+
+
 def test_link_device_prints_uri_when_no_qrencode(have_binary, monkeypatch, capsys):
     uri = "sgnl://linkdevice?uuid=abc&pub_key=xyz"
 

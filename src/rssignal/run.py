@@ -7,7 +7,8 @@ and :func:`~rssignal.feeds.filter_since` narrow them,
 sent with :func:`rssignal.signal_cli.send_msg`. Podcast items download their audio
 enclosure and send it as a voice note, plus a link preview card whose artwork is
 downloaded alongside it. Those go out as two messages: Signal drops a preview card
-from any message carrying an attachment.
+from any message carrying an attachment. The voice note repeats the episode title
+as its body, so the chat list names the episode instead of saying "Voice Message".
 
 Each feed sends to a Signal group named after it, created on the first send if it
 doesn't exist yet — see :class:`_GroupResolver`.
@@ -43,6 +44,7 @@ from .signal_cli import (
     LinkPreview,
     SignalError,
     SignalGroup,
+    clip_body,
     create_group,
     list_groups,
     match_group,
@@ -275,10 +277,12 @@ def _handle_item(
     cfg: FeedConfig, item: FeedItem, recipient: str, *, dry_run: bool
 ) -> None:
     """Send (or, in dry-run, describe) a single item from feed ``cfg``."""
-    text = render_message(item, cfg)
     is_podcast = cfg.type == "podcast" and bool(item.enclosure_url)
     card = preview_fields(item, cfg)
     label = cfg.name or cfg.url
+    # Clipped here rather than left to send_msg, so a dry run reports the text
+    # that would actually go out — long show notes are cut, not printed whole.
+    text = clip_body(render_message(item, cfg), card["url"] if card else None)
 
     if dry_run:
         first_line = text.splitlines()[0] if text else "(no text)"
@@ -288,7 +292,7 @@ def _handle_item(
             if card["image_url"]:
                 print(f"    preview image: {card['image_url']}")
         if is_podcast:
-            suffix = " (second message)" if card else ""
+            suffix = f" (second message, captioned {item.title!r})" if card else ""
             print(f"    voice note{suffix}: {item.enclosure_url}")
         return
 
@@ -312,7 +316,13 @@ def _handle_item(
             # and card first, then the voice note on its own.
             send_msg(text, recipient=recipient, preview=preview)
             send_msg(
-                "",
+                # The title, not an empty body. A chat-list row shows the
+                # message's own text, falling back to a bare "Voice Message"
+                # when there is none — and the voice note is the last message
+                # in the group, so that fallback is what the list would show
+                # for the whole feed. The title is repeated from the card
+                # above it, which is a small price for a legible chat list.
+                item.title,
                 recipient=recipient,
                 attachments=attachments,
                 voice_note=True,

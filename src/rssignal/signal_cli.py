@@ -29,12 +29,31 @@ from .watermark import compose_description, read_watermark, shorten
 # Signal silently drops a group avatar that is too large: the upload is accepted,
 # signal-cli exits 0, and the group simply keeps no picture. 1400x1400 is dropped,
 # 512x512 goes through, so anything bigger is scaled down before it is sent.
+# Link preview images are *not* subject to this: 1920x1920 artwork was measured
+# arriving intact on a card, so previews are sent at their original size rather
+# than needlessly degraded.
 GROUP_AVATAR_MAX_PX = 512
 
 # Signal caps group descriptions, but signal-cli documents no figure and rejects
 # nothing locally. This is a conservative cap so a long feed blurb is shortened
 # by rssignal — where it can be cut on a word — rather than by the server.
 GROUP_DESCRIPTION_MAX_CHARS = 480
+
+# Signal caps a message body at 2000 **bytes** of UTF-8, not 2000 characters —
+# measured against a real feed, a body of 1997 bytes kept its link preview and
+# one of 2105 lost it, both at 1997 characters. The difference is entirely
+# punctuation: a curly quote costs three bytes, an em dash three, an accented
+# letter two. A feed in English rarely notices; one in French blows past the
+# limit while still looking short enough.
+#
+# signal-cli hands the string over whole (Signal's own clients would move the
+# overflow into a `long-message.txt` attachment instead), and the receiving app
+# responds by dropping the link preview — silently, card and title and all. So
+# rssignal cuts the body itself, on a word, counting bytes.
+MESSAGE_MAX_BYTES = 2000
+
+# What a shortened body ends in. Three bytes itself, which is the whole point.
+ELLIPSIS = "…"
 
 # Default name shown in Signal's "Linked Devices" list.
 DEFAULT_DEVICE_NAME = "rssignal"
@@ -430,14 +449,76 @@ def _clip(text: str, limit: int = GROUP_DESCRIPTION_MAX_CHARS) -> str:
     return shorten(text, limit)
 
 
+def _shorten_bytes(text: str, limit: int) -> str:
+    """Cut ``text`` to ``limit`` UTF-8 bytes, on a word where one is close by.
+
+    The byte-counting twin of :func:`rssignal.watermark.shorten`. Group
+    descriptions are measured in characters and messages in bytes, and the two
+    only agree while the text stays ASCII — which is exactly the case that hides
+    the bug. See :data:`MESSAGE_MAX_BYTES`.
+    """
+    text = text.strip()
+    if len(text.encode()) <= limit:
+        return text
+    if limit <= len(ELLIPSIS.encode()):
+        return ""
+
+    # Characters are 1-4 bytes each, so a character index is only a starting
+    # guess; walk it back until the text and its ellipsis both fit.
+    cut = text[:limit]
+    while cut and len(cut.encode()) + len(ELLIPSIS.encode()) > limit:
+        cut = cut[:-1]
+
+    space = cut.rfind(" ")
+    if space > len(cut) // 2:
+        cut = cut[:space]
+    return f"{cut.rstrip(' ,;:.—-')}{ELLIPSIS}" if cut else ""
+
+
+def clip_body(text: str, url: str | None = None) -> str:
+    """Shorten ``text`` to :data:`MESSAGE_MAX_BYTES`, cutting on a word if it can.
+
+    ``url`` is a link preview's url, if the message carries one. It is never
+    what gets cut, however long the text in front of it: signal-cli rejects a
+    preview whose url is missing from the body, and Signal has nothing to draw
+    the card from. The text is shortened instead — the same bargain
+    :func:`_clip` strikes for a group description's watermark.
+
+    A url that isn't in the body to begin with is left to signal-cli to complain
+    about; there is nothing here worth preserving.
+
+    Public so ``--dry-run`` can show what would actually be sent rather than the
+    text before it was cut.
+    """
+    if len(text.encode()) <= MESSAGE_MAX_BYTES:
+        return text
+    if url is None:
+        return _shorten_bytes(text, MESSAGE_MAX_BYTES)
+
+    head, found, tail = text.rpartition(url)
+    if not found:
+        return _shorten_bytes(text, MESSAGE_MAX_BYTES)
+
+    # Everything kept is measured in bytes, the url included: it is usually
+    # ASCII, but an internationalised domain or an unescaped accent in the path
+    # costs more than its character count and would put the body back over.
+    # The 2 is the two newlines put back between the text and the url.
+    room = MESSAGE_MAX_BYTES - len(url.encode()) - len(tail.encode()) - 2
+    return f"{_shorten_bytes(head, room)}\n\n{url}{tail}".strip()
+
+
 @contextmanager
 def _avatar_within_limits(path: str):
     """Yield a path to ``path`` scaled down to what Signal will accept.
 
+    Signal takes an oversized avatar, reports nothing, and then quietly doesn't
+    use it — the group simply keeps no picture. So anything bigger than
+    :data:`GROUP_AVATAR_MAX_PX` on its long edge is written to a temporary JPEG,
+    removed on the way out.
+
     The original is yielded untouched when it already fits, and also when it
     can't be read as an image — a picture rssignal doesn't understand is better
-    handed to signal-cli than rejected outright. Anything larger is written to a
-    temporary JPEG that is removed on the way out.
+    handed to signal-cli than rejected outright.
     """
     try:
         with Image.open(path) as img:
@@ -612,6 +693,12 @@ def send_msg(
     default ``timeout`` is generous because attachment uploads take longer than
     plain text.
 
+    A body over :data:`MESSAGE_MAX_BYTES` is shortened before it goes out, on a
+    word where possible and never at the cost of the preview url — see
+    :func:`clip_body`. A preview image is sent at whatever size it arrives:
+    Signal renders a large one as a full-width card rather than a thumbnail, so
+    downscaling it would cost the better-looking layout for nothing.
+
     Raises :class:`SignalSendError` on a non-zero exit or timeout,
     :class:`SignalCliNotFound` if the binary is missing, and ``ValueError`` if no
     recipient can be resolved.
@@ -648,7 +735,7 @@ def send_msg(
             argv.extend(["--preview-description", preview.description])
         if preview.image:
             argv.extend(["--preview-image", preview.image])
-    argv.extend(["-m", msg])
+    argv.extend(["-m", clip_body(msg, preview.url if preview else None)])
     # Groups are addressed with -g rather than as a positional recipient.
     if recipient.startswith(GROUP_PREFIX):
         argv.extend(["-g", recipient[len(GROUP_PREFIX):]])

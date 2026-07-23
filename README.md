@@ -346,6 +346,14 @@ first, then the voice note on its own. Signal silently drops a preview card from
 any message that also has an attachment, so they cannot be combined. A podcast
 feed with `"link_preview": false` goes back to a single message.
 
+The voice note carries the episode title as its body, repeating the card just
+above it. That repetition is deliberate: a chat-list row shows a message's own
+text and falls back to a bare `🎤 Voice Message` when there is none — and the
+voice note is the group's *last* message, so that fallback is what the whole feed
+would be labelled with. The title costs one duplicated line in the chat and buys a
+readable list. (The `🎤` is drawn by Signal from the attachment itself and cannot
+be changed.)
+
 The card and the body split the item between them rather than repeating it. The
 card gets the title, so the built-in layout leaves it out of the body and sends
 the description plus the URL. The card carries no description unless you ask for
@@ -357,6 +365,11 @@ The card's artwork comes from `image_url`: the episode's own `<itunes:image>` or
 the same logo on every episode tells you nothing — so an episode without its own
 image gets a card without one. Artwork is downloaded per item; if that download
 fails the episode is still sent, just without the image.
+
+Artwork is sent at its original size. Unlike a group avatar, a preview image has
+no size limit worth working around — and Signal lays out a large one as a
+full-width card rather than a small thumbnail beside the text, which looks
+considerably better for podcast covers. Downscaling would only throw that away.
 
 Signal requires the previewed URL to appear in the message body, so rssignal
 appends it if your template doesn't already include it. Many podcast feeds set
@@ -372,6 +385,28 @@ point the card at the real episode page:
 All three `preview_*` keys take the same `{field}` placeholders as
 `message_template`. An item whose preview URL or title renders empty is sent
 without a card rather than failing.
+
+### Long messages
+
+Signal caps a message body at 2000 **bytes of UTF-8 — not 2000 characters**. The
+difference is punctuation: a curly quote or an em dash costs three bytes, an
+accented letter two. An English feed rarely notices. A French or German one can
+sail past the limit while still looking comfortably short.
+
+Go over it and Signal silently drops the message's link preview — the whole card,
+title and image and all, leaving bare text. Nothing is reported; signal-cli exits
+0. (Signal's own apps avoid this by moving the overflow into a `long-message.txt`
+attachment instead; signal-cli hands the string over whole.)
+
+So rssignal shortens an over-long body itself, on a word where it can, ending it
+with `…`, and counting bytes. **The preview URL is never what gets cut** — Signal
+has nothing to draw the card from without it, so the show notes lose their tail
+instead. The URL is reserved out of the budget rather than added on top of it,
+and it too is measured in bytes, in case of an internationalised domain.
+
+Use a `message_template` if you would rather choose what gets sent than have the
+end of it trimmed — `{description}` is the field that tends to be long.
+`--dry-run` prints the body as it would actually be sent, already shortened.
 
 ## What rssignal remembers
 
