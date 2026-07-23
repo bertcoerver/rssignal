@@ -121,7 +121,7 @@ def _capture_sends(monkeypatch):
 
 
 def test_run_regular_sends_text_per_item(monkeypatch):
-    cfg = FeedConfig(url="https://a", type="regular", name="Blog")
+    cfg = FeedConfig(url="https://a", name="Blog")
     items = [
         FeedItem(title="One", description="d1", link="https://a/1"),
         FeedItem(title="Two", description="d2", link="https://a/2"),
@@ -137,7 +137,7 @@ def test_run_regular_sends_text_per_item(monkeypatch):
 
 
 def test_run_podcast_downloads_and_sends_voice_note(monkeypatch):
-    cfg = FeedConfig(url="https://a", type="podcast", name="Pod")
+    cfg = FeedConfig(url="https://a", name="Pod")
     item = FeedItem(
         title="Ep", description="notes", enclosure_url="https://a/ep.mp3"
     )
@@ -161,7 +161,7 @@ def test_run_podcast_downloads_and_sends_voice_note(monkeypatch):
 
 
 def test_run_podcast_without_enclosure_falls_back_to_text(monkeypatch):
-    cfg = FeedConfig(url="https://a", type="podcast", name="Pod")
+    cfg = FeedConfig(url="https://a", name="Pod")
     item = FeedItem(title="Ep", description="notes", enclosure_url=None)
     _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
     sends = _capture_sends(monkeypatch)
@@ -176,7 +176,6 @@ def test_run_podcast_without_enclosure_falls_back_to_text(monkeypatch):
 def test_run_uses_message_template(monkeypatch):
     cfg = FeedConfig(
         url="https://a",
-        type="regular",
         name="Blog",
         message_template="📰 {title} [{feed_name}]\n\n{link}",
     )
@@ -192,7 +191,6 @@ def test_run_uses_message_template(monkeypatch):
 def test_run_applies_field_filters(monkeypatch):
     cfg = FeedConfig(
         url="https://a",
-        type="regular",
         name="Blog",
         filters=(FeedFilter("title", "excludes", ("sponsored",)),),
     )
@@ -238,7 +236,7 @@ def _fake_downloads(monkeypatch, fail_on=None):
 def test_run_podcast_splits_card_and_voice_note(monkeypatch):
     # Signal drops a preview card from a message that has an attachment, so the
     # card and the audio have to be two messages.
-    cfg = FeedConfig(url="https://a", type="podcast", name="Pod")
+    cfg = FeedConfig(url="https://a", name="Pod")
     _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
     sends = _capture_sends(monkeypatch)
     downloaded = _fake_downloads(monkeypatch)
@@ -269,8 +267,31 @@ def test_run_podcast_splits_card_and_voice_note(monkeypatch):
     assert audio["text"] == "Ep"
 
 
+def test_run_decides_per_item_within_one_feed(monkeypatch):
+    # A show that posts the occasional written note. There is no feed-level
+    # setting to get this wrong: the note keeps its link and sends no audio.
+    note = FeedItem(title="A note", description="words", link="https://a/note")
+    cfg = FeedConfig(url="https://a", name="Pod")
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE, note]})
+    sends = _capture_sends(monkeypatch)
+    _fake_downloads(monkeypatch)
+
+    count = run_feeds("feeds.json")
+
+    assert count == 2
+    # Two messages for the episode, then one for the note.
+    assert len(sends) == 3
+    assert sends[-1] == {
+        "text": "A note\n\nwords\n\nhttps://a/note",
+        "recipient": sends[0]["recipient"],
+        "attachments": None,
+        "voice_note": False,
+        "preview": None,
+    }
+
+
 def test_run_podcast_without_a_card_stays_one_message(monkeypatch):
-    cfg = FeedConfig(url="https://a", type="podcast", name="Pod", link_preview=False)
+    cfg = FeedConfig(url="https://a", name="Pod", link_preview=False)
     _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
     sends = _capture_sends(monkeypatch)
     _fake_downloads(monkeypatch)
@@ -283,7 +304,7 @@ def test_run_podcast_without_a_card_stays_one_message(monkeypatch):
 
 
 def test_run_sends_without_artwork_when_its_download_fails(monkeypatch, capsys):
-    cfg = FeedConfig(url="https://a", type="podcast", name="Pod")
+    cfg = FeedConfig(url="https://a", name="Pod")
     _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
     sends = _capture_sends(monkeypatch)
     _fake_downloads(monkeypatch, fail_on="https://a/ep.jpg")
@@ -299,7 +320,7 @@ def test_run_sends_without_artwork_when_its_download_fails(monkeypatch, capsys):
 
 
 def test_run_regular_feed_sends_no_preview(monkeypatch):
-    cfg = FeedConfig(url="https://a", type="regular", name="Blog")
+    cfg = FeedConfig(url="https://a", name="Blog")
     item = FeedItem(title="One", description="d1", link="https://a/1")
     _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
     sends = _capture_sends(monkeypatch)
@@ -310,7 +331,7 @@ def test_run_regular_feed_sends_no_preview(monkeypatch):
 
 
 def test_run_dry_run_describes_preview_without_downloading(monkeypatch, capsys):
-    cfg = FeedConfig(url="https://a", type="podcast", name="Pod")
+    cfg = FeedConfig(url="https://a", name="Pod")
     _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
     _capture_sends(monkeypatch)
 
@@ -327,7 +348,7 @@ def test_run_dry_run_describes_preview_without_downloading(monkeypatch, capsys):
 
 
 def test_run_dry_run_sends_nothing(monkeypatch, capsys):
-    cfg = FeedConfig(url="https://a", type="regular", name="Blog")
+    cfg = FeedConfig(url="https://a", name="Blog")
     item = FeedItem(title="One", description="d1", link="https://a/1")
     _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
     sends = _capture_sends(monkeypatch)
@@ -345,7 +366,7 @@ _POST = FeedItem(title="One", description="d1", link="https://a/1")
 
 
 def _blog(name="Blog", **kwargs):
-    return FeedConfig(url="https://a", type="regular", name=name, **kwargs)
+    return FeedConfig(url="https://a", name=name, **kwargs)
 
 
 def test_run_sends_to_the_group_named_after_the_feed(monkeypatch):
@@ -459,7 +480,7 @@ def test_run_refreshes_even_when_a_stale_group_matches(monkeypatch):
 
 
 def test_run_lists_groups_once_for_several_feeds(monkeypatch):
-    feeds = [_blog("Blog"), FeedConfig(url="https://b", type="regular", name="Other")]
+    feeds = [_blog("Blog"), FeedConfig(url="https://b", name="Other")]
     calls = _patch_feeds(
         monkeypatch,
         feeds,

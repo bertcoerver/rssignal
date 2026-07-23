@@ -4,11 +4,13 @@ This ties the pieces together: :func:`rssignal.feeds.load_feeds` /
 :func:`~rssignal.feeds.parse_feed` produce items, :func:`~rssignal.feeds.apply_filters`
 and :func:`~rssignal.feeds.filter_since` narrow them,
 :func:`~rssignal.feeds.render_message` turns each survivor into text, and it is
-sent with :func:`rssignal.signal_cli.send_msg`. Podcast items download their audio
-enclosure and send it as a voice note, plus a link preview card whose artwork is
-downloaded alongside it. Those go out as two messages: Signal drops a preview card
-from any message carrying an attachment. The voice note repeats the episode title
-as its body, so the chat list names the episode instead of saying "Voice Message".
+sent with :func:`rssignal.signal_cli.send_msg`. An item carrying audio — decided
+per item by :func:`~rssignal.feeds.is_audio_item`, with nothing to configure —
+downloads its enclosure and sends it as a voice note, plus a link preview card
+whose artwork is downloaded alongside it. Those go out as two messages: Signal
+drops a preview card from any message carrying an attachment. The voice note
+repeats the episode title as its body, so the chat list names the episode instead
+of saying "Voice Message".
 
 Each feed sends to a Signal group named after it, created on the first send if it
 doesn't exist yet — see :class:`_GroupResolver`.
@@ -33,6 +35,7 @@ from .feeds import (
     ParsedFeed,
     apply_filters,
     filter_since,
+    is_audio_item,
     load_feeds,
     newest,
     parse_feed,
@@ -277,7 +280,7 @@ def _handle_item(
     cfg: FeedConfig, item: FeedItem, recipient: str, *, dry_run: bool
 ) -> None:
     """Send (or, in dry-run, describe) a single item from feed ``cfg``."""
-    is_podcast = cfg.type == "podcast" and bool(item.enclosure_url)
+    is_podcast = is_audio_item(item)
     card = preview_fields(item, cfg)
     label = cfg.name or cfg.url
     # Clipped here rather than left to send_msg, so a dry run reports the text

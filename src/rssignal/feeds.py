@@ -17,11 +17,22 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from html import unescape
 from html.parser import HTMLParser
+from urllib.parse import urlsplit
 
 import feedparser
 
-# The two feed kinds rssignal knows how to turn into messages.
-FEED_TYPES = ("regular", "podcast")
+# Extensions that mark an enclosure as audio when its declared type doesn't.
+AUDIO_SUFFIXES = (
+    ".mp3",
+    ".m4a",
+    ".m4b",
+    ".aac",
+    ".ogg",
+    ".oga",
+    ".opus",
+    ".wav",
+    ".flac",
+)
 
 # Suffixes that turn a feed config key into a filter, e.g. "title_contains".
 FILTER_OPS = ("contains", "excludes", "matches")
@@ -29,7 +40,6 @@ FILTER_OPS = ("contains", "excludes", "matches")
 # Config keys that are settings rather than filters.
 KNOWN_KEYS = (
     "url",
-    "type",
     "name",
     "message_template",
     "extract",
@@ -118,7 +128,6 @@ class FeedConfig:
     """
 
     url: str
-    type: str
     name: str = ""
     message_template: str | None = None
     filters: tuple[FeedFilter, ...] = ()
@@ -127,18 +136,6 @@ class FeedConfig:
     preview_url: str | None = None
     preview_title: str | None = None
     preview_description: str | None = None
-
-    @property
-    def previews_enabled(self) -> bool:
-        """Whether items from this feed carry a Signal link preview.
-
-        Podcasts get one by default — the card is what makes an episode
-        recognizable next to its voice note. Regular feeds already show their
-        link in the body, so they opt in explicitly.
-        """
-        if self.link_preview is None:
-            return self.type == "podcast"
-        return self.link_preview
 
 
 @dataclass(frozen=True)
@@ -180,15 +177,47 @@ class ParsedFeed:
     description: str = ""
 
 
+def is_audio_item(item: FeedItem) -> bool:
+    """Whether ``item`` carries audio to send — rssignal's idea of an episode.
+
+    This is asked per item rather than per feed, and it is what a podcast *is*
+    as far as rssignal is concerned: there is no ``type`` setting to declare.
+    An item that says yes goes out as a voice note with a preview card; one that
+    says no goes out as text with its link. A show that posts the occasional
+    written note therefore gets that note as a readable message rather than a
+    linkless stub.
+
+    An enclosure alone is not enough — plenty of ordinary feeds attach an image
+    or a PDF. The declared type decides when there is one, and the URL only gets
+    a say when the feed didn't declare anything useful, which is common enough:
+    ``application/octet-stream`` on an mp3 is a real thing feeds do.
+    """
+    if not item.enclosure_url:
+        return False
+
+    mime = (item.enclosure_type or "").strip().lower()
+    if mime.startswith("audio/"):
+        return True
+    if mime and not mime.startswith("application/"):
+        # image/, video/, text/ — declared, and declared as something else.
+        # Video included: it isn't a voice note, so the item keeps its link.
+        return False
+
+    # Split the URL first: podcast CDNs bolt tracking parameters onto every
+    # enclosure, and "…/ep.mp3?source=rss" doesn't end in ".mp3".
+    return urlsplit(item.enclosure_url).path.lower().endswith(AUDIO_SUFFIXES)
+
+
 def load_feeds(path: str = "feeds.json") -> list[FeedConfig]:
     """Read ``path`` and return the list of :class:`FeedConfig` it describes.
 
-    Expects ``{"feeds": [ {...}, ... ]}``. Each feed needs a ``url``, a ``type``
-    (one of :data:`FEED_TYPES`), and a ``name`` — the name is the Signal group
-    the feed sends to. There is no recency setting: how far a feed got is
+    Expects ``{"feeds": [ {...}, ... ]}``. Each feed needs a ``url`` and a
+    ``name`` — the name is the Signal group the feed sends to. There is no
+    setting for what kind of feed it is: :func:`is_audio_item` works that out
+    per item. There is no recency setting either: how far a feed got is
     remembered in its group's description (see :mod:`rssignal.watermark`).
-    Raises :class:`FeedError` on a missing file, invalid JSON, or a malformed /
-    unknown-type entry.
+    Raises :class:`FeedError` on a missing file, invalid JSON, or a malformed
+    entry.
     """
     try:
         with open(path, encoding="utf-8") as fh:
@@ -222,12 +251,6 @@ def _build_feed_config(raw: object, index: int) -> FeedConfig:
     if not isinstance(url, str) or not url:
         raise FeedError(f"{where} is missing a non-empty \"url\".")
 
-    feed_type = raw.get("type")
-    if feed_type not in FEED_TYPES:
-        raise FeedError(
-            f"{where} has type {feed_type!r}; expected one of {FEED_TYPES}."
-        )
-
     name = raw.get("name")
     if not isinstance(name, str) or not name.strip():
         raise FeedError(
@@ -252,7 +275,6 @@ def _build_feed_config(raw: object, index: int) -> FeedConfig:
 
     return FeedConfig(
         url=url,
-        type=feed_type,
         name=name.strip(),
         message_template=template,
         filters=_build_filters(raw, where),
@@ -319,6 +341,13 @@ def _build_filters(raw: dict, where: str) -> tuple[FeedFilter, ...]:
                 "Signal group description, and sends what is newer. Drop the "
                 "key. To replay from a particular moment, use "
                 "`rssignal run --since`."
+            )
+        if key == "type":
+            raise FeedError(
+                f"{where} still has a \"type\". rssignal now works this out from "
+                "the feed itself: an item with an audio enclosure is sent as a "
+                "voice note, anything else as text plus its link. Drop the key. "
+                "To turn a preview card on or off by hand, use \"link_preview\"."
             )
         if key == "recipient":
             raise FeedError(
@@ -631,11 +660,17 @@ def preview_fields(item: FeedItem, cfg: FeedConfig) -> dict[str, str] | None:
     the body of the message is right underneath it, so repeating the item's text
     on the card only crowds it.
 
-    Returns ``None`` when previews are off for this feed, or when the url or
+    Returns ``None`` when previews are off for this item, or when the url or
     title render empty: signal-cli requires both, and a card with no title is
     not worth sending.
+
+    Whether they are on is decided per item, not per feed: an episode gets a
+    card by default, because that is what makes it recognizable next to its
+    voice note, while an item that already shows its link in the body does not.
+    ``link_preview`` overrides both ways.
     """
-    if not cfg.previews_enabled:
+    enabled = cfg.link_preview if cfg.link_preview is not None else is_audio_item(item)
+    if not enabled:
         return None
 
     url = _render_template(
@@ -679,7 +714,7 @@ def render_message(item: FeedItem, cfg: FeedConfig) -> str:
     preview = preview_fields(item, cfg)
 
     if cfg.message_template is None:
-        text = format_message(item, cfg.type, include_title=preview is None)
+        text = format_message(item, include_title=preview is None)
     else:
         text = _render_template(
             cfg.message_template, item, cfg, "message_template"
@@ -692,15 +727,16 @@ def render_message(item: FeedItem, cfg: FeedConfig) -> str:
     return text
 
 
-def format_message(item: FeedItem, feed_type: str, *, include_title: bool = True) -> str:
+def format_message(item: FeedItem, *, include_title: bool = True) -> str:
     """Build the default Signal message text for ``item``.
 
-    For ``regular`` feeds the link is appended; for ``podcast`` feeds it is
-    omitted, since the audio enclosure is sent as an attachment instead. Clear
-    ``include_title`` when something else in the message already shows it — a
-    link preview card, for instance.
+    The link is appended unless the item carries audio (see
+    :func:`is_audio_item`), in which case the enclosure is sent as an attachment
+    and the link would only duplicate what the preview card already links to.
+    Clear ``include_title`` when something else in the message already shows it
+    — a link preview card, for instance.
     """
     parts = [item.title if include_title else "", item.description]
-    if feed_type == "regular":
+    if not is_audio_item(item):
         parts.append(item.link or "")
     return "\n\n".join(part for part in parts if part)

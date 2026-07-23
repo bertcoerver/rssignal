@@ -3,14 +3,12 @@
     {
       "name": "Some Blog",
       "url": "https://example.com/rss",
-      "type": "regular",
       "message_template": "📰 {title}\n\n{description}\n\n{link}",
       "title_excludes": ["sponsored", "newsletter roundup"]
     },
     {
       "name": "Some Podcast",
       "url": "https://example.com/podcast.rss",
-      "type": "podcast",
       "extract": {
         "episode_id": { "from": "link", "pattern": "/file/[^/]+/(\\d+)/" }
       },

@@ -119,8 +119,8 @@ _ITEM = FeedItem(
 )
 
 _CONFIGS = [
-    FeedConfig(url="https://a/rss", type="podcast", name="Pod"),
-    FeedConfig(url="https://b/rss", type="regular", name="Blog"),
+    FeedConfig(url="https://a/rss", name="Pod"),
+    FeedConfig(url="https://b/rss", name="Blog"),
 ]
 
 

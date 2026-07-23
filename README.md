@@ -136,11 +136,10 @@ Each feed entry supports:
 | Key                 | Required | Description                                                            |
 | ------------------- | -------- | ---------------------------------------------------------------------- |
 | `url`               | yes      | The RSS/Atom feed URL.                                                  |
-| `type`              | yes      | `regular` (title + description + link) or `podcast` (audio voice note). |
 | `name`              | yes      | The Signal group this feed sends to. Also `{feed_name}` in templates.  |
 | `message_template`  | no       | Message text with `{field}` placeholders. Omit for the built-in layout. |
 | `extract`           | no       | Define new fields by regex against existing ones. See below.           |
-| `link_preview`      | no       | Send a link preview card. Defaults to on for `podcast`, off for `regular`. |
+| `link_preview`      | no       | Send a link preview card. Defaults to on for items with audio, off for the rest. |
 | `preview_url`       | no       | Template for the card's link. Defaults to `{link}`.                    |
 | `preview_title`     | no       | Template for the card's title. Defaults to `{title}`.                  |
 | `preview_description` | no     | Template for the card's text. Omit for a card with no description.     |
@@ -151,6 +150,13 @@ Each feed entry supports:
 Unknown keys are rejected, so a typo like `title_contain` is an error rather than a
 silently ignored setting. There is no recency setting: see
 [what rssignal remembers](#what-rssignal-remembers).
+
+There is no setting for what kind of feed it is, either. rssignal decides that per
+*item*: one whose enclosure is audio goes out as a voice note with a preview card,
+anything else as text plus its link. This is checked per item rather than per feed
+on purpose — a podcast that occasionally posts a written note gets that note as a
+readable message with a working link, instead of a linkless stub. If you disagree
+about the card, `link_preview` overrides it either way.
 
 ### One group per feed
 
@@ -234,9 +240,9 @@ filters use:
 ```
 
 A placeholder the item doesn't have renders as empty text rather than failing the
-run, and the resulting blank gap is collapsed. Without a `message_template`, a
-`regular` feed sends title + description + link and a `podcast` feed sends title +
-description.
+run, and the resulting blank gap is collapsed. Without a `message_template`, an item
+sends title + description + link — or title + description for one carrying audio,
+where the link is left out because the enclosure itself is attached.
 
 ### Discovering fields
 
@@ -331,20 +337,20 @@ rssignal run --config other.json
 would have to be created — worth reading before the first real run. It refreshes
 the group list like a real run does, so its answer is the one a real run gets.
 
-For `podcast` feeds the episode's audio enclosure is downloaded and sent with
+An item whose enclosure is audio has it downloaded and sent with
 `signal-cli --voice-note`. Depending on the file's codec, Signal may show it as
 a regular audio attachment rather than an in-app voice note.
 
 ### Link previews
 
-Podcast items also carry a link preview card — the episode title and its artwork —
+Those items also carry a link preview card — the episode title and its artwork —
 so an episode is recognizable next to its voice note. Set `"link_preview": false`
-to turn it off, or `true` on a `regular` feed to turn it on.
+to turn it off, or `true` on a feed without audio to turn it on.
 
 **A podcast episode with a card arrives as two messages:** the text and the card
 first, then the voice note on its own. Signal silently drops a preview card from
-any message that also has an attachment, so they cannot be combined. A podcast
-feed with `"link_preview": false` goes back to a single message.
+any message that also has an attachment, so they cannot be combined. Setting
+`"link_preview": false` goes back to a single message.
 
 The voice note carries the episode title as its body, repeating the card just
 above it. That repetition is deliberate: a chat-list row shows a message's own

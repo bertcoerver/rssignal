@@ -129,7 +129,7 @@ def _resolve_feed(args: argparse.Namespace) -> FeedConfig:
     and with neither the first configured feed is used.
     """
     if args.url:
-        return FeedConfig(url=args.url, type="regular", name=args.url)
+        return FeedConfig(url=args.url, name=args.url)
 
     feeds = load_feeds(args.config)
     if not feeds:
@@ -174,8 +174,7 @@ def _cmd_fields(args: argparse.Namespace) -> int:
     if args.template:
         preview = render_message(
             item,
-            FeedConfig(url=cfg.url, type=cfg.type, name=cfg.name,
-                       message_template=args.template),
+            FeedConfig(url=cfg.url, name=cfg.name, message_template=args.template),
         )
         print("\n--- rendered message ---")
         print(preview)

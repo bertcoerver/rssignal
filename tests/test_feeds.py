@@ -14,6 +14,7 @@ from rssignal.feeds import (
     FieldExtract,
     filter_since,
     format_message,
+    is_audio_item,
     item_fields,
     load_feeds,
     newest,
@@ -35,24 +36,23 @@ def test_load_feeds_valid(tmp_path):
         tmp_path,
         {
             "feeds": [
-                {"name": "Blog", "url": "https://a/rss", "type": "regular"},
-                {"name": "Pod", "url": "https://b/rss", "type": "podcast"},
+                {"name": "Blog", "url": "https://a/rss"},
+                {"name": "Pod", "url": "https://b/rss"},
             ]
         },
     )
 
     configs = load_feeds(path)
 
-    assert configs[0] == FeedConfig(url="https://a/rss", type="regular", name="Blog")
-    assert configs[1].type == "podcast"
-    assert configs[1].name == "Pod"
+    assert configs[0] == FeedConfig(url="https://a/rss", name="Blog")
+    assert configs[1] == FeedConfig(url="https://b/rss", name="Pod")
 
 
 @pytest.mark.parametrize("key", ["max_age_hours", "max_age_days"])
 def test_load_feeds_max_age_is_rejected_with_a_migration_hint(tmp_path, key):
     # The window is gone: how far a feed got now lives in its group description.
     path = _write_config(
-        tmp_path, {"feeds": [{"name": "F", "url": "https://a", "type": "regular", key: 12}]}
+        tmp_path, {"feeds": [{"name": "F", "url": "https://a", key: 12}]}
     )
     with pytest.raises(FeedError) as excinfo:
         load_feeds(path)
@@ -65,20 +65,26 @@ def test_load_feeds_missing_file_raises():
         load_feeds("/nonexistent/feeds.json")
 
 
-def test_load_feeds_bad_type_raises(tmp_path):
-    path = _write_config(tmp_path, {"feeds": [{"name": "F", "url": "https://a", "type": "newsletter"}]})
-    with pytest.raises(FeedError):
+@pytest.mark.parametrize("value", ["podcast", "regular", "newsletter"])
+def test_load_feeds_type_is_rejected_with_a_migration_hint(tmp_path, value):
+    # The kind of feed is no longer declared: it is read off each item's enclosure.
+    path = _write_config(
+        tmp_path, {"feeds": [{"name": "F", "url": "https://a", "type": value}]}
+    )
+    with pytest.raises(FeedError) as excinfo:
         load_feeds(path)
+    assert '"type"' in str(excinfo.value)
+    assert "link_preview" in str(excinfo.value)
 
 
 def test_load_feeds_missing_url_raises(tmp_path):
-    path = _write_config(tmp_path, {"feeds": [{"name": "F", "type": "regular"}]})
+    path = _write_config(tmp_path, {"feeds": [{"name": "F"}]})
     with pytest.raises(FeedError):
         load_feeds(path)
 
 
 def test_load_feeds_not_an_object_raises(tmp_path):
-    path = _write_config(tmp_path, [{"name": "F", "url": "https://a", "type": "regular"}])
+    path = _write_config(tmp_path, [{"name": "F", "url": "https://a"}])
     with pytest.raises(FeedError):
         load_feeds(path)
 
@@ -101,7 +107,7 @@ def test_parse_feed_regular(monkeypatch):
     ]
     monkeypatch.setattr(feeds.feedparser, "parse", lambda url: fake)
 
-    items = parse_feed(FeedConfig(url="https://a", type="regular")).items
+    items = parse_feed(FeedConfig(url="https://a")).items
 
     assert items == [
         FeedItem(
@@ -126,7 +132,7 @@ def test_parse_feed_podcast_enclosure(monkeypatch):
     ]
     monkeypatch.setattr(feeds.feedparser, "parse", lambda url: fake)
 
-    item = parse_feed(FeedConfig(url="https://a", type="podcast")).items[0]
+    item = parse_feed(FeedConfig(url="https://a")).items[0]
 
     assert item.enclosure_url == "https://a/ep1.mp3"
     assert item.enclosure_type == "audio/mpeg"
@@ -140,7 +146,7 @@ def test_parse_feed_bozo_no_entries_raises(monkeypatch):
     monkeypatch.setattr(feeds.feedparser, "parse", lambda url: fake)
 
     with pytest.raises(FeedError):
-        parse_feed(FeedConfig(url="https://a", type="regular"))
+        parse_feed(FeedConfig(url="https://a"))
 
 
 def _item(published):
@@ -192,22 +198,64 @@ def test_newest_of_nothing_datable_is_none():
     assert newest([_item(None)]) is None
 
 
-def test_format_message_regular():
+def _audio(**kwargs):
+    """An item carrying audio, for the branches keyed off is_audio_item."""
+    fields = {
+        "title": "Ep",
+        "description": "Notes",
+        "link": "https://a/1",
+        "enclosure_url": "https://a/ep.mp3",
+        "enclosure_type": "audio/mpeg",
+    }
+    return FeedItem(**{**fields, **kwargs})
+
+
+def test_format_message_appends_the_link():
     item = FeedItem(title="Title", description="Body", link="https://a/1")
-    assert format_message(item, "regular") == "Title\n\nBody\n\nhttps://a/1"
+    assert format_message(item) == "Title\n\nBody\n\nhttps://a/1"
 
 
-def test_format_message_podcast_omits_link():
-    item = FeedItem(title="Ep", description="Notes", link="https://a/1")
-    assert format_message(item, "podcast") == "Ep\n\nNotes"
+def test_format_message_omits_the_link_when_the_item_carries_audio():
+    # The enclosure is attached, and the card links to it anyway.
+    assert format_message(_audio()) == "Ep\n\nNotes"
 
 
 def test_format_message_can_drop_the_title():
+    assert format_message(_audio(), include_title=False) == "Notes"
     item = FeedItem(title="Ep", description="Notes", link="https://a/1")
-    assert format_message(item, "podcast", include_title=False) == "Notes"
-    assert (
-        format_message(item, "regular", include_title=False) == "Notes\n\nhttps://a/1"
+    assert format_message(item, include_title=False) == "Notes\n\nhttps://a/1"
+
+
+# --- detecting audio -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("url", "mime", "expected"),
+    [
+        ("https://a/ep.mp3", "audio/mpeg", True),
+        ("https://a/ep.m4a", "AUDIO/MP4", True),
+        # Feeds really do serve mp3s as octet-stream, so the URL gets a say.
+        ("https://a/ep.mp3", "application/octet-stream", True),
+        ("https://a/ep.mp3", None, True),
+        # …and CDNs really do bolt tracking parameters onto every enclosure.
+        ("https://a/ep.mp3?source=rss&x=1", None, True),
+        ("https://a/ep.opus", "", True),
+        # Declared as something else: an ordinary feed with an attachment.
+        ("https://a/cover.jpg", "image/jpeg", False),
+        ("https://a/talk.mp4", "video/mp4", False),
+        ("https://a/paper.pdf", "application/pdf", False),
+        ("https://a/post", None, False),
+    ],
+)
+def test_is_audio_item(url, mime, expected):
+    item = FeedItem(
+        title="t", description="d", enclosure_url=url, enclosure_type=mime
     )
+    assert is_audio_item(item) is expected
+
+
+def test_is_audio_item_without_an_enclosure():
+    assert is_audio_item(FeedItem(title="t", description="d")) is False
 
 
 # --- item fields -----------------------------------------------------------
@@ -231,7 +279,7 @@ def test_parse_feed_lifts_author_categories_and_extras(monkeypatch):
     ]
     monkeypatch.setattr(feeds.feedparser, "parse", lambda url: fake)
 
-    item = parse_feed(FeedConfig(url="https://a", type="podcast", name="Pod")).items[0]
+    item = parse_feed(FeedConfig(url="https://a", name="Pod")).items[0]
 
     assert item.author == "Example Media"
     assert item.categories == ("news", "politics")
@@ -278,8 +326,8 @@ def test_item_fields_extra_cannot_shadow_a_core_field():
 
 def test_render_message_without_template_uses_default():
     item = FeedItem(title="Title", description="Body", link="https://a/1")
-    cfg = FeedConfig(url="https://a", type="regular")
-    assert render_message(item, cfg) == format_message(item, "regular")
+    cfg = FeedConfig(url="https://a")
+    assert render_message(item, cfg) == format_message(item)
 
 
 def test_render_message_with_template():
@@ -291,7 +339,6 @@ def test_render_message_with_template():
     )
     cfg = FeedConfig(
         url="https://a",
-        type="podcast",
         message_template="🎧 {title} ({published_date}) [{itunes_duration}]\n\n{description}",
     )
     assert render_message(item, cfg) == (
@@ -303,7 +350,6 @@ def test_render_message_unknown_field_renders_empty_without_gap():
     item = FeedItem(title="Ep", description="Notes")
     cfg = FeedConfig(
         url="https://a",
-        type="regular",
         message_template="{title}\n\n{nope}\n\n{description}",
     )
     # The missing field collapses instead of leaving a blank paragraph.
@@ -312,7 +358,7 @@ def test_render_message_unknown_field_renders_empty_without_gap():
 
 def test_render_message_malformed_template_raises():
     cfg = FeedConfig(
-        url="https://a", type="regular", name="Blog", message_template="{title"
+        url="https://a", name="Blog", message_template="{title"
     )
     with pytest.raises(FeedError) as excinfo:
         render_message(FeedItem(title="T", description="D"), cfg)
@@ -330,7 +376,6 @@ def test_load_feeds_parses_message_template(tmp_path):
                 {
                     "name": "F",
                     "url": "https://a",
-                    "type": "regular",
                     "message_template": "{title} — {link}",
                 }
             ]
@@ -347,7 +392,6 @@ def test_load_feeds_parses_filters(tmp_path):
                 {
                     "name": "F",
                     "url": "https://a",
-                    "type": "regular",
                     "title_contains": ["one", "two"],
                     "description_excludes": "rerun",
                     "title_matches": r"^Ep \d+",
@@ -365,14 +409,14 @@ def test_load_feeds_parses_filters(tmp_path):
 
 
 def test_load_feeds_no_filters_is_empty_tuple(tmp_path):
-    path = _write_config(tmp_path, {"feeds": [{"name": "F", "url": "https://a", "type": "regular"}]})
+    path = _write_config(tmp_path, {"feeds": [{"name": "F", "url": "https://a"}]})
     assert load_feeds(path)[0].filters == ()
 
 
 def test_load_feeds_unknown_key_raises(tmp_path):
     # A typo like title_contain must not be silently ignored.
     path = _write_config(
-        tmp_path, {"feeds": [{"name": "F", "url": "https://a", "type": "regular", "title_contain": "x"}]}
+        tmp_path, {"feeds": [{"name": "F", "url": "https://a", "title_contain": "x"}]}
     )
     with pytest.raises(FeedError) as excinfo:
         load_feeds(path)
@@ -382,7 +426,7 @@ def test_load_feeds_unknown_key_raises(tmp_path):
 def test_load_feeds_bad_regex_raises(tmp_path):
     path = _write_config(
         tmp_path,
-        {"feeds": [{"name": "F", "url": "https://a", "type": "regular", "title_matches": "([unclosed"}]},
+        {"feeds": [{"name": "F", "url": "https://a", "title_matches": "([unclosed"}]},
     )
     with pytest.raises(FeedError):
         load_feeds(path)
@@ -391,7 +435,7 @@ def test_load_feeds_bad_regex_raises(tmp_path):
 def test_load_feeds_filter_value_must_be_string_or_list(tmp_path):
     path = _write_config(
         tmp_path,
-        {"feeds": [{"name": "F", "url": "https://a", "type": "regular", "title_contains": 42}]},
+        {"feeds": [{"name": "F", "url": "https://a", "title_contains": 42}]},
     )
     with pytest.raises(FeedError):
         load_feeds(path)
@@ -409,11 +453,11 @@ def _parsed(entries, feed=None):
     return fake
 
 
-def _parse_one(monkeypatch, entry, feed=None, feed_type="podcast"):
+def _parse_one(monkeypatch, entry, feed=None):
     monkeypatch.setattr(
         feeds.feedparser, "parse", lambda url: _parsed([entry], feed)
     )
-    return parse_feed(FeedConfig(url="https://a", type=feed_type)).items[0]
+    return parse_feed(FeedConfig(url="https://a")).items[0]
 
 
 def test_parse_feed_takes_episode_itunes_image(monkeypatch):
@@ -467,13 +511,24 @@ _EPISODE = FeedItem(
     title="Episode 402",
     description="A long look at something interesting.",
     link="https://a/402.mp3",
+    enclosure_url="https://a/402.mp3",
+    enclosure_type="audio/mpeg",
     image_url="https://a/402.jpg",
     feed_name="Pod",
 )
 
+# The same item without the audio: whether a card is sent is decided per item,
+# so the two fixtures are what the default branches on.
+_POST = FeedItem(
+    title="A post",
+    description="Words about something.",
+    link="https://a/post",
+    feed_name="Blog",
+)
 
-def test_preview_fields_defaults_for_a_podcast():
-    cfg = FeedConfig(url="https://a", type="podcast", name="Pod")
+
+def test_preview_fields_defaults_on_for_an_item_with_audio():
+    cfg = FeedConfig(url="https://a", name="Pod")
 
     # No description by default: the message body sits right under the card.
     assert preview_fields(_EPISODE, cfg) == {
@@ -484,23 +539,29 @@ def test_preview_fields_defaults_for_a_podcast():
     }
 
 
-def test_preview_fields_is_none_for_a_regular_feed():
-    cfg = FeedConfig(url="https://a", type="regular")
-    assert preview_fields(_EPISODE, cfg) is None
+def test_preview_fields_defaults_off_for_an_item_without_audio():
+    cfg = FeedConfig(url="https://a")
+    assert preview_fields(_POST, cfg) is None
+
+
+def test_preview_fields_decides_per_item_not_per_feed():
+    # One config, two items: the written note in a podcast feed gets no card.
+    cfg = FeedConfig(url="https://a", name="Pod")
+    assert preview_fields(_EPISODE, cfg) is not None
+    assert preview_fields(_POST, cfg) is None
 
 
 def test_preview_fields_honours_link_preview_toggle():
-    off = FeedConfig(url="https://a", type="podcast", link_preview=False)
-    on = FeedConfig(url="https://a", type="regular", link_preview=True)
+    off = FeedConfig(url="https://a", link_preview=False)
+    on = FeedConfig(url="https://a", link_preview=True)
 
     assert preview_fields(_EPISODE, off) is None
-    assert preview_fields(_EPISODE, on) is not None
+    assert preview_fields(_POST, on) is not None
 
 
 def test_preview_fields_uses_templates():
     cfg = FeedConfig(
         url="https://a",
-        type="podcast",
         preview_url="https://pod.example/{feed_name}",
         preview_title="🎧 {title}",
         preview_description="from {feed_name}",
@@ -516,18 +577,18 @@ def test_preview_fields_uses_templates():
 def test_preview_fields_is_none_without_a_url():
     # An item with no link can't anchor a preview card.
     item = FeedItem(title="Ep", description="d")
-    cfg = FeedConfig(url="https://a", type="podcast")
+    cfg = FeedConfig(url="https://a")
     assert preview_fields(item, cfg) is None
 
 
 def test_preview_fields_is_none_without_a_title():
-    cfg = FeedConfig(url="https://a", type="podcast", preview_title="{nonexistent}")
+    cfg = FeedConfig(url="https://a", preview_title="{nonexistent}")
     assert preview_fields(_EPISODE, cfg) is None
 
 
 def test_preview_description_is_opt_in():
-    item = FeedItem(title="Ep", description="word " * 100, link="https://a/1")
-    cfg = FeedConfig(url="https://a", type="podcast")
+    item = _audio(description="word " * 100)
+    cfg = FeedConfig(url="https://a")
 
     assert preview_fields(item, cfg)["description"] == ""
 
@@ -535,7 +596,7 @@ def test_preview_description_is_opt_in():
 def test_render_message_appends_the_preview_url():
     # The built-in podcast layout has no link, but signal-cli needs the preview
     # url to appear in the body.
-    cfg = FeedConfig(url="https://a", type="podcast")
+    cfg = FeedConfig(url="https://a")
 
     text = render_message(_EPISODE, cfg)
 
@@ -545,7 +606,7 @@ def test_render_message_appends_the_preview_url():
 def test_render_message_drops_the_title_carried_by_the_card():
     # The card already shows "Episode 402"; repeating it directly underneath
     # would just be the same line twice.
-    cfg = FeedConfig(url="https://a", type="podcast")
+    cfg = FeedConfig(url="https://a")
 
     text = render_message(_EPISODE, cfg)
 
@@ -554,7 +615,7 @@ def test_render_message_drops_the_title_carried_by_the_card():
 
 def test_render_message_keeps_the_title_when_a_template_asks_for_it():
     cfg = FeedConfig(
-        url="https://a", type="podcast", message_template="🎧 {title}\n\n{description}"
+        url="https://a", message_template="🎧 {title}\n\n{description}"
     )
 
     assert render_message(_EPISODE, cfg).startswith("🎧 Episode 402")
@@ -562,7 +623,7 @@ def test_render_message_keeps_the_title_when_a_template_asks_for_it():
 
 def test_render_message_does_not_duplicate_an_existing_url():
     cfg = FeedConfig(
-        url="https://a", type="podcast", message_template="{title}\n{link}"
+        url="https://a", message_template="{title}\n{link}"
     )
 
     text = render_message(_EPISODE, cfg)
@@ -571,8 +632,8 @@ def test_render_message_does_not_duplicate_an_existing_url():
 
 
 def test_render_message_leaves_body_alone_without_a_preview():
-    cfg = FeedConfig(url="https://a", type="podcast", link_preview=False)
-    assert render_message(_EPISODE, cfg) == format_message(_EPISODE, "podcast")
+    cfg = FeedConfig(url="https://a", link_preview=False)
+    assert render_message(_EPISODE, cfg) == format_message(_EPISODE)
 
 
 # --- preview configuration -------------------------------------------------
@@ -586,7 +647,6 @@ def test_load_feeds_parses_preview_keys(tmp_path):
                 {
                     "name": "F",
                     "url": "https://a",
-                    "type": "podcast",
                     "link_preview": False,
                     "preview_url": "https://pod.example",
                     "preview_title": "🎧 {title}",
@@ -599,26 +659,27 @@ def test_load_feeds_parses_preview_keys(tmp_path):
     cfg = load_feeds(path)[0]
 
     assert cfg.link_preview is False
-    assert cfg.previews_enabled is False
+    assert preview_fields(_EPISODE, cfg) is None
     assert cfg.preview_url == "https://pod.example"
     assert cfg.preview_title == "🎧 {title}"
     assert cfg.preview_description == "{feed_name}"
 
 
 def test_load_feeds_preview_defaults_are_none(tmp_path):
-    path = _write_config(tmp_path, {"feeds": [{"name": "F", "url": "https://a", "type": "podcast"}]})
+    path = _write_config(tmp_path, {"feeds": [{"name": "F", "url": "https://a"}]})
 
     cfg = load_feeds(path)[0]
 
     assert cfg.link_preview is None
-    # Unset means "podcast yes, regular no".
-    assert cfg.previews_enabled is True
+    # Unset means "audio yes, everything else no", decided per item.
+    assert preview_fields(_EPISODE, cfg) is not None
+    assert preview_fields(_POST, cfg) is None
 
 
 def test_load_feeds_link_preview_must_be_boolean(tmp_path):
     path = _write_config(
         tmp_path,
-        {"feeds": [{"name": "F", "url": "https://a", "type": "podcast", "link_preview": "yes"}]},
+        {"feeds": [{"name": "F", "url": "https://a", "link_preview": "yes"}]},
     )
     with pytest.raises(FeedError):
         load_feeds(path)
@@ -627,7 +688,7 @@ def test_load_feeds_link_preview_must_be_boolean(tmp_path):
 def test_load_feeds_unknown_preview_key_raises(tmp_path):
     path = _write_config(
         tmp_path,
-        {"feeds": [{"name": "F", "url": "https://a", "type": "podcast", "preview_image": "x"}]},
+        {"feeds": [{"name": "F", "url": "https://a", "preview_image": "x"}]},
     )
     with pytest.raises(FeedError) as excinfo:
         load_feeds(path)
@@ -647,7 +708,6 @@ def _extracted(monkeypatch, pattern):
     )
     cfg = FeedConfig(
         url="https://a",
-        type="podcast",
         extract=(FieldExtract(name="episode_id", source="link", pattern=pattern),),
     )
     return parse_feed(cfg).items[0]
@@ -691,10 +751,9 @@ def test_extract_reads_the_item_not_other_extracts():
 
 
 def test_extracted_field_feeds_templates_and_previews():
-    item = FeedItem(title="Ep", description="Notes", link=_MP3)
+    item = _audio(link=_MP3)
     cfg = FeedConfig(
         url="https://a",
-        type="podcast",
         extract=(FieldExtract(name="episode_id", source="link", pattern=r"/(\d+)/"),),
         preview_url="https://pod.example/listen/{episode_id}",
         message_template="{description} — #{episode_id}",
@@ -725,7 +784,6 @@ def test_load_feeds_parses_extract(tmp_path):
                 {
                     "name": "F",
                     "url": "https://a",
-                    "type": "podcast",
                     "extract": {
                         "episode_id": {"from": "link", "pattern": r"/(\d+)/"}
                     },
@@ -742,7 +800,7 @@ def test_load_feeds_parses_extract(tmp_path):
 
 
 def test_load_feeds_extract_defaults_to_empty(tmp_path):
-    path = _write_config(tmp_path, {"feeds": [{"name": "F", "url": "https://a", "type": "podcast"}]})
+    path = _write_config(tmp_path, {"feeds": [{"name": "F", "url": "https://a"}]})
     assert load_feeds(path)[0].extract == ()
 
 
@@ -762,7 +820,7 @@ def test_load_feeds_rejects_a_malformed_extract(tmp_path, spec):
         tmp_path,
         {
             "feeds": [
-                {"name": "F", "url": "https://a", "type": "podcast", "extract": {"episode_id": spec}}
+                {"name": "F", "url": "https://a", "extract": {"episode_id": spec}}
             ]
         },
     )
@@ -774,7 +832,7 @@ def test_load_feeds_rejects_a_malformed_extract(tmp_path, spec):
 def test_load_feeds_extract_must_be_an_object(tmp_path):
     path = _write_config(
         tmp_path,
-        {"feeds": [{"name": "F", "url": "https://a", "type": "podcast", "extract": ["episode_id"]}]},
+        {"feeds": [{"name": "F", "url": "https://a", "extract": ["episode_id"]}]},
     )
     with pytest.raises(FeedError):
         load_feeds(path)
@@ -789,7 +847,7 @@ def test_parse_feed_takes_the_channel_description(monkeypatch):
         "parse",
         lambda url: _parsed([{"title": "Ep"}], {"summary": "<p>A daily &amp; show</p>"}),
     )
-    parsed = parse_feed(FeedConfig(url="https://a", type="podcast"))
+    parsed = parse_feed(FeedConfig(url="https://a"))
     # HTML is stripped: it becomes a Signal group description, not a web page.
     assert parsed.description == "A daily & show"
 
@@ -800,7 +858,7 @@ def test_parse_feed_falls_back_to_the_channel_subtitle(monkeypatch):
         "parse",
         lambda url: _parsed([{"title": "Ep"}], {"subtitle": "Short blurb"}),
     )
-    assert parse_feed(FeedConfig(url="https://a", type="podcast")).description == (
+    assert parse_feed(FeedConfig(url="https://a")).description == (
         "Short blurb"
     )
 
@@ -809,7 +867,7 @@ def test_parse_feed_without_a_channel_description(monkeypatch):
     monkeypatch.setattr(
         feeds.feedparser, "parse", lambda url: _parsed([{"title": "Ep"}])
     )
-    assert parse_feed(FeedConfig(url="https://a", type="podcast")).description == ""
+    assert parse_feed(FeedConfig(url="https://a")).description == ""
 
 
 def test_channel_description_does_not_leak_into_items(monkeypatch):
@@ -819,4 +877,4 @@ def test_channel_description_does_not_leak_into_items(monkeypatch):
         "parse",
         lambda url: _parsed([{"title": "Ep"}], {"summary": "Show blurb"}),
     )
-    assert parse_feed(FeedConfig(url="https://a", type="podcast")).items[0].description == ""
+    assert parse_feed(FeedConfig(url="https://a")).items[0].description == ""
