@@ -19,14 +19,19 @@ classifiers = [
 
 # rssignal shells out to the Java `signal-cli` binary for Signal (install
 # separately, e.g. `brew install signal-cli`); feedparser handles RSS/Atom.
-# Feeds whose items link to a video also need `ffmpeg` on PATH — only those, so
-# it stays optional and `rssignal doctor` reports it without failing.
+# Feeds whose items link to a video also need `ffmpeg` on PATH, and YouTube
+# feeds `yt-dlp` (the `video` extra below) — only those feeds, so both stay
+# optional and `rssignal doctor` reports them without failing.
 dependencies = ["feedparser>=6.0", "Pillow>=10.0"]
 
 [project.scripts]
 rssignal = "rssignal.cli:main"
 
 [project.optional-dependencies]
+# yt-dlp is a large, weekly-moving package and only YouTube feeds touch it, so
+# it is asked for explicitly: `pip install rssignal[video]`. rssignal runs it as
+# a command, and this is what puts that command on PATH.
+video = ["yt-dlp>=2024.8"]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",

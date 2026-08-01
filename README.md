@@ -27,6 +27,10 @@ command-line tool, so messages come from your own linked Signal account.
   ```bash
   brew install ffmpeg
   ```
+- Optional, only for YouTube feeds:
+  ```bash
+  pip install rssignal[video]   # yt-dlp
+  ```
 
 signal-cli stores its account state in `~/.local/share/signal-cli` by default.
 
@@ -140,7 +144,7 @@ Each feed entry supports:
 
 | Key                 | Required | Description                                                            |
 | ------------------- | -------- | ---------------------------------------------------------------------- |
-| `url`               | yes      | The RSS/Atom feed URL, or an ARTE collection page. See [video items](#video-items). |
+| `url`               | yes      | The RSS/Atom feed URL, or an ARTE collection page, or a YouTube channel. See [video items](#video-items). |
 | `name`              | yes      | The Signal group this feed sends to. Also `{feed_name}` in templates.  |
 | `message_template`  | no       | Message text with `{field}` placeholders. Omit for the built-in layout. |
 | `extract`           | no       | Define new fields by regex against existing ones. See below.           |
@@ -167,9 +171,15 @@ about the card, `link_preview` overrides it either way.
 ### Video items
 
 Some feeds are about video but carry none: the item links to a player page and the
-video lives behind a streaming manifest. rssignal recognises **ARTE** programme
-links — `https://www.arte.tv/<lang>/videos/<programme-id>/…` — and attaches the
-video to the message. Nothing to configure; the link in the item is enough.
+video lives somewhere else entirely. rssignal recognises two kinds of link and
+attaches the video to the message — **ARTE** programmes
+(`https://www.arte.tv/<lang>/videos/<programme-id>/…`) and **YouTube** videos
+(`watch?v=…`, `youtu.be/…`, `/shorts/…`). Nothing to configure; the link in the
+item is enough.
+
+Both can also be followed without finding a feed first.
+
+#### ARTE
 
 ARTE publishes no RSS, so you don't need one either: point `url` straight at a
 show's collection page and rssignal reads its episodes directly.
@@ -194,15 +204,43 @@ they are never sent. That is deliberate — a new group shouldn't open with a hu
 videos — and it costs a handful of small requests per run rather than one per
 episode.
 
-This needs **ffmpeg** on your PATH (`brew install ffmpeg`). Only video feeds do, so
-it stays optional — `rssignal doctor` reports whether it's there without failing.
+#### YouTube
 
-ARTE offers each programme at several qualities and Signal refuses an attachment
-over 100 MB, so rssignal picks the sharpest one it expects to fit, estimating from
-the quality's advertised bitrate and the programme's duration. A ten-minute episode
-typically arrives at 640x360, a longer one a rung lower. The stream is copied, not
-re-encoded, so this costs bandwidth and seconds rather than minutes of CPU. Check
-what an item would arrive at before sending anything:
+Point `url` at a channel — any of the forms YouTube hands out:
+
+```json
+{
+  "name": "Veritasium",
+  "url": "https://www.youtube.com/@veritasium"
+}
+```
+
+No API key is involved. YouTube publishes an Atom feed for every channel, at an
+address nobody would guess, and rssignal swaps the channel page for it — so a
+YouTube feed is a perfectly ordinary feed and filters, templates and extracts all
+work on it. A `/channel/UC…` url is rewritten on the spot; the `@handle`, `/c/` and
+`/user/` forms cost one small yt-dlp call to find the channel's id.
+
+That feed carries the **last 15 uploads**, which is plenty to follow a channel and
+no use for backfilling one.
+
+Downloads need **yt-dlp** (`pip install rssignal[video]`), which in turn uses
+ffmpeg. Uploads shorter than 90 seconds are treated as Shorts and dropped
+entirely — no message, and they aren't reconsidered on the next run.
+
+#### Quality, and what happens when it doesn't fit
+
+This needs **ffmpeg** on your PATH (`brew install ffmpeg`). Only video feeds do, so
+it stays optional — `rssignal doctor` reports whether it and yt-dlp are there
+without failing.
+
+Both sources offer the same video at several qualities and Signal refuses an
+attachment over 100 MB, so rssignal picks the sharpest one it expects to fit,
+from the reported file sizes where there are any and from bitrate times duration
+where there aren't. A ten-minute ARTE episode typically arrives at 640x360, a
+ten-minute YouTube video at 720p, and a long one a rung or two lower. Streams are
+copied, never re-encoded, so this costs bandwidth and seconds rather than minutes
+of CPU. Check what an item would arrive at before sending anything:
 
 ```bash
 rssignal run --dry-run
@@ -210,10 +248,10 @@ rssignal run --dry-run
 #     video: 640x360, ~63 MB
 ```
 
-If the video can't be had — expired rights, a programme too long for any quality to
-fit, ffmpeg missing — that's a warning on stderr, not a failure: the item still goes
-out as text and its link. A readable message beats no message, and the item isn't
-retried.
+If the video can't be had — expired rights, a video too long for any quality to fit,
+ffmpeg or yt-dlp missing — that's a warning on stderr, not a failure: the item still
+goes out as text and its link. A readable message beats no message, and the item
+isn't retried. Expect this for anything much over half an hour: 95 MB is 95 MB.
 
 Unlike a voice note, a video goes out as a single message: these items get no
 preview card by default, so there's nothing for the attachment to displace.

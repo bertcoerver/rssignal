@@ -385,18 +385,25 @@ def _build_filters(raw: dict, where: str) -> tuple[FeedFilter, ...]:
 def parse_feed(cfg: FeedConfig) -> ParsedFeed:
     """Fetch and parse ``cfg.url`` into a :class:`ParsedFeed`.
 
-    Usually that means RSS or Atom. A url that is not a feed at all but a place
-    rssignal knows how to read episodes from — an ARTE collection page — is read
-    that way instead, so following a show that publishes no feed of its own
-    needs nothing in the config but the page's address.
+    Usually that means RSS or Atom, and a video source's own page counts as
+    either a substitute for one or a signpost to one: an ARTE collection page is
+    read directly, since ARTE publishes no feed at all, and a YouTube channel
+    page is swapped for the feed YouTube publishes at an address nobody would
+    guess. Either way, following a show needs nothing in the config but the
+    address of its page.
     """
     # Imported here, not at the top: rssignal.video builds FeedItems and so
     # imports this module. Deferring it keeps that one-way and leaves feeds.py
     # free of any knowledge of what video sources exist.
-    from .video import arte_collection_id, parse_arte_collection
+    from .video import channel_feed_url, collection_feed
 
-    if arte_collection_id(cfg.url):
-        return parse_arte_collection(cfg)
+    collection = collection_feed(cfg)
+    if collection is not None:
+        return collection
+
+    feed_url = channel_feed_url(cfg.url)
+    if feed_url:
+        cfg = replace(cfg, url=feed_url)
 
     parsed = feedparser.parse(cfg.url)
     # feedparser doesn't raise on network/parse trouble; it records it instead.

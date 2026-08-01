@@ -1,0 +1,471 @@
+"""Read ARTE: a show as a feed, and a programme's video behind its link.
+
+ARTE items carry no enclosure at all — an item like
+``.../fr/videos/127395-052-A/le-dessous-des-images/`` links to a player page and
+the video itself lives behind a streaming manifest — so without this the whole
+point of such a feed never reaches Signal.
+
+How the video is found, and why not by scraping: the programme id is right there
+in the link, and ARTE publishes a player API keyed by it that returns the same
+manifest url the page's ``<video>`` element uses, plus the duration. That is two
+small json/text fetches against a documented-shaped endpoint instead of parsing
+a megabyte of rendered React that changes whenever the site is redesigned.
+
+Which quality, and why it is chosen here rather than left to ffmpeg: the
+manifest is a multi-variant HLS master offering the same programme from ~380x216
+up to 1080p, and Signal refuses an attachment over 100 MB. ffmpeg's HLS demuxer
+has no "biggest that fits" switch, so the master is parsed here, the size of each
+rung is estimated from its advertised average bandwidth times the duration, and
+the largest one expected to fit :data:`~rssignal.video.VIDEO_MAX_BYTES` is handed
+to ffmpeg by program index. Streams are copied, never re-encoded: the rungs
+already exist at sensible bitrates, and re-encoding would trade minutes of cpu
+for nothing.
+
+The dispatch that decides an item is ARTE's at all lives in
+:mod:`rssignal.video`; this module only answers about ARTE.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+from .download import fetch_text
+from .feeds import (
+    FeedConfig,
+    FeedError,
+    FeedItem,
+    ParsedFeed,
+    apply_extracts,
+    strip_html,
+)
+from .video import SIZE_ESTIMATE_MARGIN, VIDEO_MAX_BYTES
+
+# An ARTE programme page: language, then the programme id. Collection pages
+# (``RC-023176``) are deliberately not matched — they are a listing, not a
+# programme, and the player api has nothing to say about them.
+ARTE_LINK_RE = re.compile(
+    r"https?://(?:www\.)?arte\.tv/(?P<lang>[a-z]{2})/videos/"
+    r"(?P<program_id>\d{4,}-\d{3}-[A-Z])(?:[/?#]|$)",
+    re.IGNORECASE,
+)
+
+# An ARTE collection page — the show itself rather than one episode. This is
+# what you get from the site's "toutes les vidéos" link, and it is the url to
+# put in feeds.json for a show that publishes no usable RSS of its own.
+ARTE_COLLECTION_RE = re.compile(
+    r"https?://(?:www\.)?arte\.tv/(?P<lang>[a-z]{2})/videos/"
+    r"(?P<collection_id>RC-\d+)(?:[/?#]|$)",
+    re.IGNORECASE,
+)
+
+ARTE_PLAYER_API = "https://api.arte.tv/api/player/v2/config/{lang}/{program_id}"
+ARTE_PLAYLIST_API = "https://api.arte.tv/api/player/v2/playlist/{lang}/{collection_id}"
+
+# How many of a collection's newest episodes get a publication date looked up.
+#
+# The playlist lists a show's whole back catalogue — a hundred episodes for a
+# long-running one — but carries no dates, and a date costs one request per
+# episode. The list is newest-first, so dating the top slice is enough to tell
+# what is new: anything below it is old by construction. Undated items are
+# dropped by :func:`~rssignal.feeds.filter_since` anyway, which is exactly the
+# right answer for the back catalogue — a new group should not open with a
+# hundred videos.
+ARTE_DATED_ITEMS = 12
+
+# H.265 rungs duplicate resolutions that also exist in H.264, at no useful size
+# saving here, and play back unevenly across Signal's clients. Not worth the
+# gamble when an equivalent avc1 rung is always sitting next to it.
+_H265_CODECS = ("hev1", "hvc1")
+
+
+@dataclass(frozen=True)
+class Variant:
+    """One rung of an HLS master playlist.
+
+    ``index`` is its position among the ``EXT-X-STREAM-INF`` entries, which is
+    also the program index ffmpeg gives it — the two orders are the same, and
+    that correspondence is the only reason a rung can be requested by number.
+    """
+
+    index: int
+    bandwidth: int
+    width: int
+    height: int
+    codecs: str
+
+    @property
+    def resolution(self) -> str:
+        return f"{self.width}x{self.height}"
+
+    def estimated_bytes(self, duration: float) -> int:
+        """Roughly how big this rung is over ``duration`` seconds."""
+        return int(self.bandwidth / 8 * duration * SIZE_ESTIMATE_MARGIN)
+
+
+@dataclass(frozen=True)
+class HlsPlan:
+    """What would be downloaded for an ARTE item, worked out without downloading.
+
+    Resolving is two small fetches, so a dry run can report the real resolution
+    and size an item would arrive at rather than promising "a video". One
+    implementation of the :class:`~rssignal.video.VideoPlan` protocol.
+    """
+
+    master_url: str
+    variant: Variant
+    duration: float
+
+    @property
+    def estimated_bytes(self) -> int:
+        return self.variant.estimated_bytes(self.duration)
+
+    def describe(self) -> str:
+        mb = self.estimated_bytes / (1024 * 1024)
+        return f"{self.variant.resolution}, ~{mb:.0f} MB"
+
+    def fetch(self, into: str, *, timeout: float) -> str:
+        """Download the chosen rung into directory ``into``, returning its path."""
+        out_path = os.path.join(into, "video.mp4")
+        _run_ffmpeg(self.master_url, self.variant.index, out_path, timeout=timeout)
+        return out_path
+
+
+def arte_program_id(link: str | None) -> tuple[str, str] | None:
+    """Return ``(program_id, lang)`` for an ARTE programme link, else ``None``."""
+    if not link:
+        return None
+    match = ARTE_LINK_RE.search(link)
+    if not match:
+        return None
+    return match["program_id"].upper(), match["lang"].lower()
+
+
+def resolve(item: FeedItem, *, max_bytes: int = VIDEO_MAX_BYTES) -> HlsPlan:
+    """Work out which stream and quality ``item``'s video would be fetched at.
+
+    Raises :class:`FeedError` if the item is not an ARTE programme, the player
+    api has nothing usable, or every rung is too big to send.
+    """
+    found = arte_program_id(item.link)
+    if not found:
+        raise FeedError(f"Not an ARTE video link: {item.link!r}")
+    program_id, lang = found
+
+    master_url, duration = _player_config(program_id, lang)
+    variants = _variants(fetch_text(master_url))
+    variant = _pick_variant(variants, duration, max_bytes, program_id)
+    return HlsPlan(master_url=master_url, variant=variant, duration=duration)
+
+
+def _config_attributes(program_id: str, lang: str) -> dict:
+    """Fetch one programme's player config and return its ``attributes``."""
+    url = ARTE_PLAYER_API.format(lang=lang, program_id=program_id)
+    raw = fetch_text(url)
+    try:
+        return json.loads(raw)["data"]["attributes"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise FeedError(f"Unexpected player config for {program_id}: {exc}") from exc
+
+
+def _player_config(program_id: str, lang: str) -> tuple[str, float]:
+    """Return the ``(master_playlist_url, duration_seconds)`` ARTE reports.
+
+    Of the streams offered, the original-language one (``VOF``) is preferred;
+    the others are dubs of the same programme. Any HLS stream will do if that
+    isn't there.
+    """
+    attributes = _config_attributes(program_id, lang)
+    streams = attributes.get("streams")
+
+    if not streams:
+        # Rights windows expire; a programme past its end date has no stream.
+        raise FeedError(f"No stream available for {program_id} — expired rights?")
+
+    chosen = next(
+        (s for s in streams if _version_code(s).startswith("VOF")),
+        streams[0],
+    )
+    master_url = chosen.get("url")
+    if not master_url:
+        raise FeedError(f"Player config for {program_id} has no stream url")
+
+    duration = attributes.get("metadata", {}).get("duration", {}).get("seconds")
+    if not duration:
+        raise FeedError(f"Player config for {program_id} has no duration")
+    return master_url, float(duration)
+
+
+def arte_collection_id(url: str | None) -> tuple[str, str] | None:
+    """Return ``(collection_id, lang)`` for an ARTE collection url, else ``None``."""
+    if not url:
+        return None
+    match = ARTE_COLLECTION_RE.search(url)
+    if not match:
+        return None
+    return match["collection_id"].upper(), match["lang"].lower()
+
+
+def parse_arte_collection(cfg: FeedConfig) -> ParsedFeed:
+    """Read an ARTE collection as if it were a feed.
+
+    ARTE publishes no RSS, so following a show otherwise means a third-party
+    feed-generator scraping the page — which yields the site's furniture instead
+    of the synopsis, and stamps every item with the time it was scraped rather
+    than when the episode aired. The playlist endpoint the player itself uses
+    has the real thing: every episode, newest first, with its own subtitle,
+    synopsis, artwork and duration.
+
+    What it has not got is a date, which is what rssignal needs to tell new from
+    old. That lives in each programme's own config, as the start of its rights
+    window — the day it became available — so the newest
+    :data:`ARTE_DATED_ITEMS` are looked up individually and the rest are left
+    undated, and therefore unsent. See :data:`ARTE_DATED_ITEMS` for why that is
+    the behaviour you want rather than a limitation.
+    """
+    found = arte_collection_id(cfg.url)
+    if not found:
+        raise FeedError(f"Not an ARTE collection url: {cfg.url!r}")
+    collection_id, lang = found
+
+    raw = fetch_text(ARTE_PLAYLIST_API.format(lang=lang, collection_id=collection_id))
+    try:
+        attributes = json.loads(raw)["data"]["attributes"]
+        entries = attributes["items"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise FeedError(f"Unexpected playlist for {collection_id}: {exc}") from exc
+
+    if not entries:
+        raise FeedError(f"ARTE collection {collection_id} listed no episodes")
+
+    show = attributes.get("metadata") or {}
+    items = [
+        apply_extracts(
+            _collection_item(entry, cfg.name, lang, dated=index < ARTE_DATED_ITEMS),
+            cfg.extract,
+        )
+        for index, entry in enumerate(entries)
+    ]
+
+    return ParsedFeed(
+        items=items,
+        image_url=_first_image(show),
+        description=strip_html(show.get("description") or ""),
+    )
+
+
+def _collection_item(
+    entry: dict, feed_name: str, lang: str, *, dated: bool
+) -> FeedItem:
+    """Map one playlist entry to a :class:`~rssignal.feeds.FeedItem`."""
+    program_id = str(entry.get("providerId") or "")
+    # The show's name is on every entry as "title"; the episode's own name is
+    # the subtitle. Using the subtitle means a chat list shows which episode
+    # arrived rather than the same show name over and over.
+    show_title = str(entry.get("title") or "")
+    title = str(entry.get("subtitle") or "").strip() or show_title
+
+    published = _published(program_id, lang) if dated and program_id else None
+
+    duration = (entry.get("duration") or {}).get("seconds")
+    extra = {"program_id": program_id, "show_title": show_title}
+    if duration:
+        extra["duration_seconds"] = str(duration)
+
+    return FeedItem(
+        title=title,
+        description=strip_html(str(entry.get("description") or "")),
+        link=((entry.get("link") or {}).get("url")) or None,
+        published=published,
+        image_url=_first_image(entry),
+        feed_name=feed_name,
+        extra=extra,
+    )
+
+
+def _published(program_id: str, lang: str) -> datetime | None:
+    """When a programme became available, from its rights window.
+
+    A date rssignal can't read is worse than no date — it would either resend
+    forever or send nothing — so a programme that won't give one up is simply
+    left undated rather than guessed at, and a failed lookup doesn't take the
+    whole feed down with it.
+    """
+    try:
+        attributes = _config_attributes(program_id, lang)
+    except FeedError:
+        return None
+
+    begin = (attributes.get("rights") or {}).get("begin")
+    if not begin:
+        return None
+    try:
+        return datetime.fromisoformat(begin).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def _first_image(entry: dict) -> str | None:
+    images = entry.get("images") or []
+    if not images:
+        return None
+    return images[0].get("url") or None
+
+
+def _version_code(stream: dict) -> str:
+    versions = stream.get("versions") or []
+    if not versions:
+        return ""
+    return str(versions[0].get("code") or "")
+
+
+def _variants(master: str) -> list[Variant]:
+    """Parse the ``EXT-X-STREAM-INF`` rungs out of an HLS master playlist.
+
+    ``EXT-X-I-FRAME-STREAM-INF`` entries are skipped: they are trick-play
+    indexes, not playable renditions, and ffmpeg does not count them as
+    programs — including them would shift every index after the first one.
+    """
+    variants: list[Variant] = []
+    lines = [line.strip() for line in master.splitlines()]
+
+    for pos, line in enumerate(lines):
+        if not line.startswith("#EXT-X-STREAM-INF:"):
+            continue
+        # The rendition url is the next non-blank, non-comment line.
+        url = next(
+            (nxt for nxt in lines[pos + 1 :] if nxt and not nxt.startswith("#")),
+            None,
+        )
+        if url is None:
+            continue
+
+        attrs = line.split(":", 1)[1]
+        bandwidth = _attr_int(attrs, "AVERAGE-BANDWIDTH") or _attr_int(
+            attrs, "BANDWIDTH"
+        )
+        width, height = _attr_resolution(attrs)
+        if not bandwidth or not height:
+            continue
+
+        variants.append(
+            Variant(
+                index=len(variants),
+                bandwidth=bandwidth,
+                width=width,
+                height=height,
+                codecs=_attr_str(attrs, "CODECS"),
+            )
+        )
+
+    if not variants:
+        raise FeedError("HLS master playlist listed no playable variants")
+    return variants
+
+
+def _attr_str(attrs: str, name: str) -> str:
+    match = re.search(rf'\b{name}=("([^"]*)"|[^,]*)', attrs)
+    if not match:
+        return ""
+    return match[2] if match[2] is not None else match[1]
+
+
+def _attr_int(attrs: str, name: str) -> int:
+    value = _attr_str(attrs, name)
+    return int(value) if value.isdigit() else 0
+
+
+def _attr_resolution(attrs: str) -> tuple[int, int]:
+    match = re.search(r"\bRESOLUTION=(\d+)x(\d+)", attrs)
+    if not match:
+        return 0, 0
+    return int(match[1]), int(match[2])
+
+
+def _pick_variant(
+    variants: list[Variant], duration: float, max_bytes: int, program_id: str
+) -> Variant:
+    """Pick the sharpest rung expected to fit ``max_bytes``."""
+    usable = [v for v in variants if not v.codecs.startswith(_H265_CODECS)]
+    if not usable:
+        usable = variants
+
+    fitting = [v for v in usable if v.estimated_bytes(duration) <= max_bytes]
+    if not fitting:
+        smallest = min(usable, key=lambda v: v.bandwidth)
+        raise FeedError(
+            f"Video {program_id} is too big to send: even {smallest.resolution} "
+            f"is about {smallest.estimated_bytes(duration) / 1024 / 1024:.0f} MB, "
+            f"over the {max_bytes / 1024 / 1024:.0f} MB limit"
+        )
+    return max(fitting, key=lambda v: (v.width * v.height, v.bandwidth))
+
+
+def _run_ffmpeg(
+    master_url: str, index: int, out_path: str, *, timeout: float
+) -> None:
+    """Copy one rung of ``master_url`` into ``out_path`` as an mp4.
+
+    Both maps are explicit and both are needed. ``-map p:N`` on its own takes the
+    program's video *and* every audio rendition attached to it — ARTE ships four
+    (french, german, and two "confort audio" mixes), which would triple the file
+    for no benefit. ``:a:0`` keeps the first, which is the one the playlist marks
+    default.
+
+    ``aac_adtstoasc`` rewrites the AAC headers HLS uses into the form mp4 wants;
+    without it the copy produces a file that plays silently or not at all.
+    ``+faststart`` moves the index to the front so the video starts playing
+    before it has finished loading.
+    """
+    binary = shutil.which("ffmpeg")
+    if binary is None:
+        raise FeedError(
+            "ffmpeg is needed to fetch video items but was not found on PATH "
+            "(e.g. `brew install ffmpeg`)"
+        )
+
+    cmd = [
+        binary,
+        "-nostdin",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        master_url,
+        "-map",
+        f"p:{index}:v:0",
+        "-map",
+        f"p:{index}:a:0",
+        "-c",
+        "copy",
+        "-bsf:a",
+        "aac_adtstoasc",
+        "-movflags",
+        "+faststart",
+        out_path,
+    ]
+
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, check=False
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise FeedError(f"ffmpeg timed out after {timeout:.0f}s") from exc
+    except OSError as exc:
+        raise FeedError(f"Could not run ffmpeg: {exc}") from exc
+
+    if result.returncode != 0:
+        raise FeedError(f"ffmpeg failed: {_last_line(result.stderr)}")
+    if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        raise FeedError("ffmpeg produced no video")
+
+
+def _last_line(stderr: str) -> str:
+    """The final line of ffmpeg's complaint — the one that says what went wrong."""
+    lines = [line for line in (stderr or "").splitlines() if line.strip()]
+    return lines[-1] if lines else "no error output"

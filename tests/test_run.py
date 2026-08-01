@@ -10,7 +10,7 @@ from rssignal import run
 from rssignal.feeds import FeedConfig, FeedError, FeedFilter, FeedItem, ParsedFeed
 from rssignal.run import run_feeds
 from rssignal.signal_cli import LinkPreview, SignalError, SignalGroup
-from rssignal.video import Variant, VideoPlan
+from rssignal.video import VideoTooShort
 from rssignal.watermark import format_watermark, read_watermark
 
 NOW = datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc)
@@ -175,11 +175,27 @@ def test_run_podcast_without_enclosure_falls_back_to_text(monkeypatch):
 
 
 ARTE_LINK = "https://www.arte.tv/fr/videos/127395-052-A/le-dessous-des-images/"
+YOUTUBE_LINK = "https://www.youtube.com/watch?v=BFcjfKZ0BeI"
 
 
-def _patch_video(monkeypatch, *, fail=None, path="/tmp/fake.mp4"):
+class _FakePlan:
+    """What resolve_video would hand back, without asking anyone anything."""
+
+    def describe(self):
+        return "640x360, ~63 MB"
+
+    def fetch(self, into, *, timeout):  # pragma: no cover - video_temp is faked
+        raise AssertionError("video_temp is faked; fetch should never run")
+
+
+def _patch_video(monkeypatch, *, fail=None, resolve_fail=None, path="/tmp/fake.mp4"):
     """Stand in for the video fetch, recording the items it was asked about."""
     seen = []
+
+    def fake_resolve(item, **kwargs):
+        if resolve_fail is not None:
+            raise resolve_fail
+        return _FakePlan()
 
     @contextmanager
     def fake_video_temp(item, **kwargs):
@@ -188,6 +204,7 @@ def _patch_video(monkeypatch, *, fail=None, path="/tmp/fake.mp4"):
             raise fail
         yield path
 
+    monkeypatch.setattr(run, "resolve_video", fake_resolve)
     monkeypatch.setattr(run, "video_temp", fake_video_temp)
     return seen
 
@@ -218,7 +235,7 @@ def test_run_video_failure_still_sends_the_text(monkeypatch, capsys):
     item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
     calls = _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
     sends = _capture_sends(monkeypatch)
-    _patch_video(monkeypatch, fail=FeedError("expired rights"))
+    _patch_video(monkeypatch, resolve_fail=FeedError("expired rights"))
 
     count = run_feeds("feeds.json")
 
@@ -265,22 +282,62 @@ def test_run_audio_enclosure_wins_over_a_video_link(monkeypatch):
     assert seen == []
 
 
+def test_run_video_download_failure_still_sends_the_text(monkeypatch, capsys):
+    """Resolving worked and the download didn't; the text still goes out."""
+    cfg = FeedConfig(url="https://a", name="Arte")
+    item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    sends = _capture_sends(monkeypatch)
+    _patch_video(monkeypatch, fail=FeedError("ffmpeg failed: 403"))
+
+    assert run_feeds("feeds.json") == 1
+    assert sends[0]["attachments"] is None
+    assert "video skipped: ffmpeg failed: 403" in capsys.readouterr().err
+
+
+def test_run_too_short_video_sends_nothing_at_all(monkeypatch, capsys):
+    """A Short is not a message — and its watermark stands, so it stays gone."""
+    cfg = FeedConfig(url="https://a", name="Tube")
+    item = FeedItem(title="A Short", description="d", link=YOUTUBE_LINK)
+    calls = _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    sends = _capture_sends(monkeypatch)
+    seen = _patch_video(monkeypatch, resolve_fail=VideoTooShort("47s — a Short"))
+
+    count = run_feeds("feeds.json")
+
+    assert sends == []
+    # Not downloaded either: refused before anything was fetched.
+    assert seen == []
+    assert "skipped: 47s — a Short" in capsys.readouterr().err
+    assert calls["updated"]
+    # It counts as dealt with, which is what stops it being reconsidered.
+    assert count == 1
+
+
 def test_run_dry_run_reports_the_video_quality(monkeypatch, capsys):
     cfg = FeedConfig(url="https://a", name="Arte")
     item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
     _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
-    plan = VideoPlan(
-        master_url="https://cdn/master.m3u8",
-        variant=Variant(
-            index=3, bandwidth=754704, width=640, height=360, codecs="avc1"
-        ),
-        duration=641.0,
-    )
-    monkeypatch.setattr(run, "resolve_video", lambda item: plan)
+    monkeypatch.setattr(run, "resolve_video", lambda item: _FakePlan())
 
     run_feeds("feeds.json", dry_run=True)
 
     assert "video: 640x360, ~63 MB" in capsys.readouterr().out
+
+
+def test_run_dry_run_reports_a_video_it_would_not_send(monkeypatch, capsys):
+    cfg = FeedConfig(url="https://a", name="Tube")
+    item = FeedItem(title="A Short", description="d", link=YOUTUBE_LINK)
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+
+    def boom(item):
+        raise VideoTooShort("47s — a Short")
+
+    monkeypatch.setattr(run, "resolve_video", boom)
+
+    run_feeds("feeds.json", dry_run=True)
+
+    assert "nothing sent: 47s — a Short" in capsys.readouterr().out
 
 
 def test_run_dry_run_reports_an_unavailable_video(monkeypatch, capsys):

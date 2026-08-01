@@ -17,7 +17,10 @@ decided per item from the link in the same spirit — has its video fetched and
 attached to the message. That is one message, not two: these items get no
 preview card by default, so nothing is there for the attachment to displace. A
 video that can't be fetched is a warning, not a failure: the item still goes out
-as text and its link, because a readable message beats no message.
+as text and its link, because a readable message beats no message. The one video
+that produces no message at all is one too short to be worth a message — a
+YouTube Short — which is dropped where it stands, watermark and all, so it is
+not reconsidered every run.
 
 Each feed sends to a Signal group named after it, created on the first send if it
 doesn't exist yet — see :class:`_GroupResolver`.
@@ -62,7 +65,7 @@ from .signal_cli import (
     send_msg,
     update_group,
 )
-from .video import is_video_item, resolve_video, video_temp
+from .video import VideoTooShort, is_video_item, resolve_video, video_temp
 from .watermark import compose_description, read_watermark, strip_watermark
 
 
@@ -309,23 +312,37 @@ def _handle_item(
             suffix = f" (second message, captioned {item.title!r})" if card else ""
             print(f"    voice note{suffix}: {item.enclosure_url}")
         if is_video:
-            # Resolving is two small fetches and no download, so a dry run can
-            # report the resolution and size the video would really arrive at.
+            # Resolving is a couple of small requests and no download, so a dry
+            # run can report the resolution and size it would really arrive at.
             try:
                 print(f"    video: {resolve_video(item).describe()}")
+            except VideoTooShort as exc:
+                print(f"    nothing sent: {exc}")
             except FeedError as exc:
                 print(f"    video: unavailable ({exc})")
         return
+
+    if is_video:
+        # Resolved before anything is sent, because the answer can be "don't
+        # send this at all" — a Short is not a message.
+        try:
+            plan = resolve_video(item)
+        except VideoTooShort as exc:
+            print(f"[{label}] skipped: {exc}", file=sys.stderr)
+            return
+        except FeedError as exc:
+            print(f"[{label}] video skipped: {exc}", file=sys.stderr)
+            plan = None
 
     with ExitStack() as stack:
         attachments = None
         if is_podcast:
             attachments = [stack.enter_context(download_temp(item.enclosure_url))]
-        elif is_video:
+        elif is_video and plan is not None:
             # The video is the best part of the message but not the whole of
             # it: if it can't be had, the text and its link still can.
             try:
-                attachments = [stack.enter_context(video_temp(item))]
+                attachments = [stack.enter_context(video_temp(item, plan=plan))]
             except FeedError as exc:
                 print(f"[{label}] video skipped: {exc}", file=sys.stderr)
 

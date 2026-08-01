@@ -57,6 +57,9 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     ffmpeg = shutil.which("ffmpeg")
     print(f"ffmpeg: {ffmpeg or 'not found (only needed for video feeds)'}")
 
+    ytdlp = shutil.which("yt-dlp")
+    print(f"yt-dlp: {ytdlp or 'not found (only needed for YouTube feeds)'}")
+
     accounts = list_accounts()
     if accounts:
         print("linked accounts: " + ", ".join(accounts))
