@@ -12,6 +12,13 @@ drops a preview card from any message carrying an attachment. The voice note
 repeats the episode title as its body, so the chat list names the episode instead
 of saying "Voice Message".
 
+An item that only *links* to a video — :func:`~rssignal.video.is_video_item`,
+decided per item from the link in the same spirit — has its video fetched and
+attached to the message. That is one message, not two: these items get no
+preview card by default, so nothing is there for the attachment to displace. A
+video that can't be fetched is a warning, not a failure: the item still goes out
+as text and its link, because a readable message beats no message.
+
 Each feed sends to a Signal group named after it, created on the first send if it
 doesn't exist yet — see :class:`_GroupResolver`.
 
@@ -55,6 +62,7 @@ from .signal_cli import (
     send_msg,
     update_group,
 )
+from .video import is_video_item, resolve_video, video_temp
 from .watermark import compose_description, read_watermark, strip_watermark
 
 
@@ -281,6 +289,9 @@ def _handle_item(
 ) -> None:
     """Send (or, in dry-run, describe) a single item from feed ``cfg``."""
     is_podcast = is_audio_item(item)
+    # An item with an audio enclosure is already an episode; asking ARTE about
+    # it as well would be a pointless round trip.
+    is_video = not is_podcast and is_video_item(item)
     card = preview_fields(item, cfg)
     label = cfg.name or cfg.url
     # Clipped here rather than left to send_msg, so a dry run reports the text
@@ -297,12 +308,26 @@ def _handle_item(
         if is_podcast:
             suffix = f" (second message, captioned {item.title!r})" if card else ""
             print(f"    voice note{suffix}: {item.enclosure_url}")
+        if is_video:
+            # Resolving is two small fetches and no download, so a dry run can
+            # report the resolution and size the video would really arrive at.
+            try:
+                print(f"    video: {resolve_video(item).describe()}")
+            except FeedError as exc:
+                print(f"    video: unavailable ({exc})")
         return
 
     with ExitStack() as stack:
         attachments = None
         if is_podcast:
             attachments = [stack.enter_context(download_temp(item.enclosure_url))]
+        elif is_video:
+            # The video is the best part of the message but not the whole of
+            # it: if it can't be had, the text and its link still can.
+            try:
+                attachments = [stack.enter_context(video_temp(item))]
+            except FeedError as exc:
+                print(f"[{label}] video skipped: {exc}", file=sys.stderr)
 
         preview = None
         if card:

@@ -14,6 +14,7 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import shutil
 import sys
 from datetime import datetime, timezone
 
@@ -50,6 +51,11 @@ _REFRESH_HINT = (
 def _cmd_doctor(args: argparse.Namespace) -> int:
     binary = find_signal_cli()
     print(f"signal-cli: {binary}")
+
+    # Only video feeds need it, so its absence is worth reporting but is not a
+    # broken install.
+    ffmpeg = shutil.which("ffmpeg")
+    print(f"ffmpeg: {ffmpeg or 'not found (only needed for video feeds)'}")
 
     accounts = list_accounts()
     if accounts:

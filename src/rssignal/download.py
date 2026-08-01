@@ -1,4 +1,9 @@
-"""Download a remote file to a temporary path for sending as an attachment."""
+"""Fetch things over HTTP: attachments to a temporary path, small text inline.
+
+Every network read outside feedparser goes through this module's ``urlopen``, so
+there is one place to patch in tests and one place to change if this ever needs a
+session, a user agent, or a retry.
+"""
 
 from __future__ import annotations
 
@@ -20,6 +25,23 @@ def _suffix_for(url: str, default: str = ".mp3") -> str:
     if dot and ext and len(ext) <= 5 and "/" not in ext:
         return "." + ext
     return default
+
+
+def fetch_text(url: str, *, timeout: float = 30) -> str:
+    """Fetch ``url`` and return its body decoded as UTF-8.
+
+    For the small text resources that describe media rather than being it — an
+    API response, an HLS playlist. Anything big enough to be worth streaming to
+    disk wants :func:`download_temp` instead.
+
+    Raises :class:`FeedError` if the fetch fails, so callers can treat a dead
+    endpoint the same way they treat a dead feed.
+    """
+    try:
+        with urlopen(url, timeout=timeout) as response:
+            return response.read().decode("utf-8", errors="replace")
+    except (URLError, OSError, ValueError) as exc:
+        raise FeedError(f"Could not fetch {url!r}: {exc}") from exc
 
 
 @contextmanager

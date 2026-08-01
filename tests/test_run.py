@@ -10,6 +10,7 @@ from rssignal import run
 from rssignal.feeds import FeedConfig, FeedError, FeedFilter, FeedItem, ParsedFeed
 from rssignal.run import run_feeds
 from rssignal.signal_cli import LinkPreview, SignalError, SignalGroup
+from rssignal.video import Variant, VideoPlan
 from rssignal.watermark import format_watermark, read_watermark
 
 NOW = datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc)
@@ -171,6 +172,130 @@ def test_run_podcast_without_enclosure_falls_back_to_text(monkeypatch):
     assert count == 1
     assert sends[0]["voice_note"] is False
     assert sends[0]["attachments"] is None
+
+
+ARTE_LINK = "https://www.arte.tv/fr/videos/127395-052-A/le-dessous-des-images/"
+
+
+def _patch_video(monkeypatch, *, fail=None, path="/tmp/fake.mp4"):
+    """Stand in for the video fetch, recording the items it was asked about."""
+    seen = []
+
+    @contextmanager
+    def fake_video_temp(item, **kwargs):
+        seen.append(item.link)
+        if fail is not None:
+            raise fail
+        yield path
+
+    monkeypatch.setattr(run, "video_temp", fake_video_temp)
+    return seen
+
+
+def test_run_video_item_attaches_the_video(monkeypatch):
+    cfg = FeedConfig(url="https://a", name="Arte")
+    item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    sends = _capture_sends(monkeypatch)
+    seen = _patch_video(monkeypatch)
+
+    count = run_feeds("feeds.json")
+
+    assert count == 1
+    assert seen == [ARTE_LINK]
+    # One message, not two: no preview card means nothing for the attachment
+    # to displace.
+    assert len(sends) == 1
+    assert sends[0]["attachments"] == ["/tmp/fake.mp4"]
+    # A video is not a voice note.
+    assert sends[0]["voice_note"] is False
+    assert sends[0]["preview"] is None
+    assert sends[0]["text"] == f"Le drapeau\n\nd\n\n{ARTE_LINK}"
+
+
+def test_run_video_failure_still_sends_the_text(monkeypatch, capsys):
+    cfg = FeedConfig(url="https://a", name="Arte")
+    item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
+    calls = _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    sends = _capture_sends(monkeypatch)
+    _patch_video(monkeypatch, fail=FeedError("expired rights"))
+
+    count = run_feeds("feeds.json")
+
+    assert count == 1
+    assert sends[0]["attachments"] is None
+    assert sends[0]["text"].endswith(ARTE_LINK)
+    assert "video skipped: expired rights" in capsys.readouterr().err
+    # The item counted as sent, so its watermark stands rather than being
+    # rolled back for a retry that would fail the same way.
+    assert calls["updated"]
+
+
+def test_run_ordinary_link_is_not_treated_as_video(monkeypatch):
+    cfg = FeedConfig(url="https://a", name="Blog")
+    item = FeedItem(title="One", description="d", link="https://a/1")
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    sends = _capture_sends(monkeypatch)
+    seen = _patch_video(monkeypatch)
+
+    run_feeds("feeds.json")
+
+    assert seen == []
+    assert sends[0]["attachments"] is None
+
+
+def test_run_audio_enclosure_wins_over_a_video_link(monkeypatch):
+    """An episode is an episode: no point asking ARTE about it as well."""
+    cfg = FeedConfig(url="https://a", name="Pod")
+    item = FeedItem(
+        title="Ep", description="d", link=ARTE_LINK, enclosure_url="https://a/ep.mp3"
+    )
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    _capture_sends(monkeypatch)
+    seen = _patch_video(monkeypatch)
+
+    @contextmanager
+    def fake_download(url, **kwargs):
+        yield "/tmp/fake-ep.mp3"
+
+    monkeypatch.setattr(run, "download_temp", fake_download)
+
+    run_feeds("feeds.json")
+
+    assert seen == []
+
+
+def test_run_dry_run_reports_the_video_quality(monkeypatch, capsys):
+    cfg = FeedConfig(url="https://a", name="Arte")
+    item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    plan = VideoPlan(
+        master_url="https://cdn/master.m3u8",
+        variant=Variant(
+            index=3, bandwidth=754704, width=640, height=360, codecs="avc1"
+        ),
+        duration=641.0,
+    )
+    monkeypatch.setattr(run, "resolve_video", lambda item: plan)
+
+    run_feeds("feeds.json", dry_run=True)
+
+    assert "video: 640x360, ~63 MB" in capsys.readouterr().out
+
+
+def test_run_dry_run_reports_an_unavailable_video(monkeypatch, capsys):
+    cfg = FeedConfig(url="https://a", name="Arte")
+    item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+
+    def boom(item):
+        raise FeedError("expired rights")
+
+    monkeypatch.setattr(run, "resolve_video", boom)
+
+    run_feeds("feeds.json", dry_run=True)
+
+    assert "video: unavailable (expired rights)" in capsys.readouterr().out
 
 
 def test_run_uses_message_template(monkeypatch):

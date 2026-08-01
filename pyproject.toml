@@ -19,6 +19,8 @@ classifiers = [
 
 # rssignal shells out to the Java `signal-cli` binary for Signal (install
 # separately, e.g. `brew install signal-cli`); feedparser handles RSS/Atom.
+# Feeds whose items link to a video also need `ffmpeg` on PATH — only those, so
+# it stays optional and `rssignal doctor` reports it without failing.
 dependencies = ["feedparser>=6.0", "Pillow>=10.0"]
 
 [project.scripts]

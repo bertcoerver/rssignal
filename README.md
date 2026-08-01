@@ -22,6 +22,11 @@ command-line tool, so messages come from your own linked Signal account.
   ```bash
   brew install qrencode
   ```
+- Optional, only for feeds whose items link to a video (see
+  [video items](#video-items)):
+  ```bash
+  brew install ffmpeg
+  ```
 
 signal-cli stores its account state in `~/.local/share/signal-cli` by default.
 
@@ -135,7 +140,7 @@ Each feed entry supports:
 
 | Key                 | Required | Description                                                            |
 | ------------------- | -------- | ---------------------------------------------------------------------- |
-| `url`               | yes      | The RSS/Atom feed URL.                                                  |
+| `url`               | yes      | The RSS/Atom feed URL, or an ARTE collection page. See [video items](#video-items). |
 | `name`              | yes      | The Signal group this feed sends to. Also `{feed_name}` in templates.  |
 | `message_template`  | no       | Message text with `{field}` placeholders. Omit for the built-in layout. |
 | `extract`           | no       | Define new fields by regex against existing ones. See below.           |
@@ -153,10 +158,65 @@ silently ignored setting. There is no recency setting: see
 
 There is no setting for what kind of feed it is, either. rssignal decides that per
 *item*: one whose enclosure is audio goes out as a voice note with a preview card,
-anything else as text plus its link. This is checked per item rather than per feed
-on purpose — a podcast that occasionally posts a written note gets that note as a
+one that links to a video it can fetch goes out with the video attached, anything
+else as text plus its link. This is checked per item rather than per feed on
+purpose — a podcast that occasionally posts a written note gets that note as a
 readable message with a working link, instead of a linkless stub. If you disagree
 about the card, `link_preview` overrides it either way.
+
+### Video items
+
+Some feeds are about video but carry none: the item links to a player page and the
+video lives behind a streaming manifest. rssignal recognises **ARTE** programme
+links — `https://www.arte.tv/<lang>/videos/<programme-id>/…` — and attaches the
+video to the message. Nothing to configure; the link in the item is enough.
+
+ARTE publishes no RSS, so you don't need one either: point `url` straight at a
+show's collection page and rssignal reads its episodes directly.
+
+```json
+{
+  "name": "Le Dessous des Images",
+  "url": "https://www.arte.tv/fr/videos/RC-023176/le-dessous-des-images/"
+}
+```
+
+This is worth preferring over a third-party feed generator pointed at the same
+page. The generator scrapes what the page renders — the site's furniture instead of
+the synopsis — and stamps every item with the moment it scraped rather than when
+the episode aired, which is the one thing rssignal needs to tell new from old.
+Read directly, each episode arrives with its own title, its real synopsis, its
+artwork, and the date it became available.
+
+A collection lists the show's entire back catalogue, which has no dates attached;
+rssignal looks up the newest dozen individually and leaves the rest undated, so
+they are never sent. That is deliberate — a new group shouldn't open with a hundred
+videos — and it costs a handful of small requests per run rather than one per
+episode.
+
+This needs **ffmpeg** on your PATH (`brew install ffmpeg`). Only video feeds do, so
+it stays optional — `rssignal doctor` reports whether it's there without failing.
+
+ARTE offers each programme at several qualities and Signal refuses an attachment
+over 100 MB, so rssignal picks the sharpest one it expects to fit, estimating from
+the quality's advertised bitrate and the programme's duration. A ten-minute episode
+typically arrives at 640x360, a longer one a rung lower. The stream is copied, not
+re-encoded, so this costs bandwidth and seconds rather than minutes of CPU. Check
+what an item would arrive at before sending anything:
+
+```bash
+rssignal run --dry-run
+# [Le Dessous des Images] -> group:Le Dessous des Images=: La bataille du drapeau
+#     video: 640x360, ~63 MB
+```
+
+If the video can't be had — expired rights, a programme too long for any quality to
+fit, ffmpeg missing — that's a warning on stderr, not a failure: the item still goes
+out as text and its link. A readable message beats no message, and the item isn't
+retried.
+
+Unlike a voice note, a video goes out as a single message: these items get no
+preview card by default, so there's nothing for the attachment to displace.
 
 ### One group per feed
 

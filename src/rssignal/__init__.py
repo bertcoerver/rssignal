@@ -41,6 +41,15 @@ from .signal_cli import (
     set_group_avatar,
     update_group,
 )
+from .video import (
+    VIDEO_MAX_BYTES,
+    VideoPlan,
+    arte_collection_id,
+    is_video_item,
+    parse_arte_collection,
+    resolve_video,
+    video_temp,
+)
 from .watermark import compose_description, read_watermark, strip_watermark
 
 try:
@@ -82,6 +91,13 @@ __all__ = [
     "apply_filters",
     "filter_since",
     "is_audio_item",
+    "is_video_item",
+    "arte_collection_id",
+    "parse_arte_collection",
+    "resolve_video",
+    "video_temp",
+    "VideoPlan",
+    "VIDEO_MAX_BYTES",
     "newest",
     "apply_extracts",
     "item_fields",
