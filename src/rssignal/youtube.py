@@ -16,7 +16,9 @@ Downloading is yt-dlp's job. It is run as a command rather than imported, for
 the same reason ffmpeg is: ``subprocess.run`` gives the wall-clock timeout its
 python API has no knob for, ``-J`` is a stable documented interface where that
 api is not across yt-dlp's weekly releases, and a missing binary then reads the
-same way a missing ffmpeg does.
+same way a missing ffmpeg does. It is run signed out unless the environment says
+otherwise (see :data:`COOKIES_ENV`), which is enough until YouTube decides an
+address looks like a robot.
 
 Which quality: the same "sharpest that fits" rule as ARTE, over a different
 catalogue. YouTube serves video and audio separately above 360p, so a plan names
@@ -31,7 +33,9 @@ import os
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass
+import sys
+from collections.abc import Iterator
+from dataclasses import dataclass, replace
 
 from .feeds import FeedError, FeedItem
 from .video import SIZE_ESTIMATE_MARGIN, VIDEO_MAX_BYTES, VideoTooShort
@@ -59,6 +63,14 @@ YOUTUBE_CHANNEL_RE = re.compile(
 
 YOUTUBE_FEED = "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
 YOUTUBE_WATCH = "https://www.youtube.com/watch?v={video_id}"
+YOUTUBE_UPLOADS = "https://www.youtube.com/channel/{channel_id}/videos"
+
+# The channel id, read back out of the feed url rssignal rewrote a channel to.
+FEED_CHANNEL_RE = re.compile(r"[?&]channel_id=(?P<channel_id>UC[\w-]+)")
+
+# How many uploads the Atom feed carries, and so how far down the channel's own
+# listing the durations for them can be.
+FEED_VIDEO_COUNT = 15
 
 # Below this, an upload is a Short or a teaser rather than something worth its
 # own message. A compromise, and worth knowing it is one: Shorts now run to
@@ -68,6 +80,19 @@ MIN_VIDEO_SECONDS = 90
 # Reading a channel's id or a video's formats is one small request on yt-dlp's
 # side; it should not be able to hang a run.
 YTDLP_QUERY_TIMEOUT = 60
+
+# YouTube increasingly refuses anonymous requests from datacentre and repeat-
+# visitor addresses, asking them to "confirm you're not a bot". The only answer
+# it accepts is a signed-in session, so these hand yt-dlp one: a cookies.txt
+# export, or a browser profile to read the cookies out of. Neither is set by
+# default — most channels never ask — and every yt-dlp call gets them, because
+# the listing that fills in durations is challenged the same way a download is.
+COOKIES_ENV = "RSSIGNAL_YOUTUBE_COOKIES"
+COOKIES_FROM_BROWSER_ENV = "RSSIGNAL_YOUTUBE_COOKIES_FROM_BROWSER"
+
+# The distinctive part of that refusal, matched loosely because the wording
+# around it moves and the apostrophe is a typographic one.
+_BOT_CHECK = "not a bot"
 
 # Video codecs to leave alone. VP9 and AV1 rungs duplicate resolutions that also
 # exist in H.264 and play back unevenly across Signal's clients; Opus audio has
@@ -135,6 +160,50 @@ def youtube_feed_url(url: str | None) -> str | None:
     return YOUTUBE_FEED.format(channel_id=channel_id)
 
 
+def with_durations(feed_url: str, items: list[FeedItem]) -> list[FeedItem]:
+    """Return ``items`` with ``duration_seconds`` filled in, if they are YouTube's.
+
+    The Atom feed says how a video is titled, described and thumbnailed, and
+    nothing at all about how long it is — which is the one thing a channel that
+    posts both clips and full episodes has to be filtered on. yt-dlp's flat
+    listing of the channel does say, for every upload at once, so this costs one
+    small request per feed rather than one per video.
+
+    Items keep the id they already carry: the listing is matched to the feed by
+    video id, not by position, so the two disagreeing about order or about which
+    fifteen uploads are the latest costs a duration rather than mismatching one.
+
+    ``feed_url`` that isn't a YouTube channel feed leaves ``items`` alone. So
+    does a lookup that fails: a duration is worth a request, not worth losing
+    the feed over — though a filter that needs one will then drop the items,
+    which is what the warning is for.
+    """
+    match = FEED_CHANNEL_RE.search(feed_url or "")
+    if not match or not items:
+        return items
+
+    try:
+        durations = _channel_durations(match["channel_id"])
+    except FeedError as exc:
+        print(
+            f"Could not read how long the videos in {feed_url} are: {exc}\n"
+            "They have no duration_seconds this run.",
+            file=sys.stderr,
+        )
+        return items
+
+    annotated = []
+    for item in items:
+        seconds = durations.get(youtube_video_id(item.link) or "")
+        if seconds is None:
+            annotated.append(item)
+            continue
+        annotated.append(
+            replace(item, extra={**item.extra, "duration_seconds": str(int(seconds))})
+        )
+    return annotated
+
+
 def resolve(item: FeedItem, *, max_bytes: int = VIDEO_MAX_BYTES) -> YoutubePlan:
     """Work out which formats ``item``'s video would be fetched at.
 
@@ -172,6 +241,46 @@ def _channel_id(url: str) -> str:
     if not channel_id or not str(channel_id).startswith("UC"):
         raise FeedError(f"Could not work out the channel id for {url!r}")
     return str(channel_id)
+
+
+def _channel_durations(channel_id: str) -> dict[str, float]:
+    """Ask yt-dlp how long each of a channel's latest uploads is.
+
+    ``--flat-playlist`` is what makes this one request: yt-dlp lists the channel
+    without opening any of the videos, and still reports each one's duration.
+    """
+    info = _ytdlp_json(
+        [
+            "--flat-playlist",
+            "--playlist-items",
+            f"1:{FEED_VIDEO_COUNT}",
+            YOUTUBE_UPLOADS.format(channel_id=channel_id),
+        ],
+        timeout=YTDLP_QUERY_TIMEOUT,
+    )
+
+    durations: dict[str, float] = {}
+    for entry in _videos(info):
+        video_id = entry.get("id")
+        duration = entry.get("duration")
+        if video_id and duration:
+            durations[str(video_id)] = float(duration)
+    return durations
+
+
+def _videos(playlist: dict) -> Iterator[dict]:
+    """Walk a yt-dlp listing down to the videos in it.
+
+    A channel url can list its *tabs* rather than its uploads, one level of
+    playlist deeper, so the entries are followed until they stop nesting.
+    """
+    for entry in playlist.get("entries") or []:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("entries"):
+            yield from _videos(entry)
+        else:
+            yield entry
 
 
 def _video_info(url: str) -> dict:
@@ -352,7 +461,7 @@ def _run_ytdlp(args: list[str], *, timeout: float) -> subprocess.CompletedProces
 
     try:
         result = subprocess.run(
-            [binary, *args],
+            [binary, *_cookie_args(), *args],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -364,8 +473,48 @@ def _run_ytdlp(args: list[str], *, timeout: float) -> subprocess.CompletedProces
         raise FeedError(f"Could not run yt-dlp: {exc}") from exc
 
     if result.returncode != 0:
-        raise FeedError(f"yt-dlp failed: {_last_line(result.stderr)}")
+        raise FeedError(f"yt-dlp failed: {_complaint(result.stderr)}")
     return result
+
+
+def _cookie_args() -> list[str]:
+    """How yt-dlp should sign in, from the environment, or nothing if it shouldn't.
+
+    A cookies file wins over a browser profile when both are set: it is the
+    explicit one, and the one that works where there is no browser to read.
+    """
+    path = os.environ.get(COOKIES_ENV, "").strip()
+    if path:
+        expanded = os.path.expanduser(path)
+        if not os.path.isfile(expanded):
+            raise FeedError(
+                f"{COOKIES_ENV} is set to {path!r}, which is not a file. Point it "
+                "at a cookies.txt export, or unset it."
+            )
+        return ["--cookies", expanded]
+
+    browser = os.environ.get(COOKIES_FROM_BROWSER_ENV, "").strip()
+    if browser:
+        return ["--cookies-from-browser", browser]
+    return []
+
+
+def _complaint(stderr: str) -> str:
+    """What went wrong, and for the bot check, what to do about it.
+
+    That one is worth expanding because the fix is configuration rather than
+    anything about the video, and yt-dlp's own advice is for someone running
+    yt-dlp by hand.
+    """
+    last = _last_line(stderr)
+    if _BOT_CHECK not in last.lower():
+        return last
+    return (
+        f"{last}\nYouTube wants a signed-in session for this one. Set "
+        f"{COOKIES_FROM_BROWSER_ENV} to a browser you are logged into "
+        f"(e.g. firefox, chrome, safari, or 'firefox:<profile>'), or export a "
+        f"cookies.txt from that browser and set {COOKIES_ENV} to its path."
+    )
 
 
 def _last_line(stderr: str) -> str:

@@ -408,6 +408,39 @@ def test_load_feeds_parses_filters(tmp_path):
     assert FeedFilter("title", "matches", (r"^Ep \d+",)) in filters
 
 
+def test_load_feeds_parses_numeric_bounds(tmp_path):
+    path = _write_config(
+        tmp_path,
+        {
+            "feeds": [
+                {
+                    "name": "F",
+                    "url": "https://a",
+                    "duration_seconds_min": 420,
+                    "duration_seconds_max": "30:00",
+                }
+            ]
+        },
+    )
+
+    filters = load_feeds(path)[0].filters
+
+    # JSON may write a bound as a number or as a duration; both keep their text.
+    assert FeedFilter("duration_seconds", "min", ("420",)) in filters
+    assert FeedFilter("duration_seconds", "max", ("30:00",)) in filters
+
+
+@pytest.mark.parametrize("bound", ["half an hour", ["420", "1800"], True])
+def test_load_feeds_bad_numeric_bound_raises(tmp_path, bound):
+    path = _write_config(
+        tmp_path,
+        {"feeds": [{"name": "F", "url": "https://a", "duration_seconds_min": bound}]},
+    )
+    with pytest.raises(FeedError) as excinfo:
+        load_feeds(path)
+    assert "duration_seconds_min" in str(excinfo.value)
+
+
 def test_load_feeds_no_filters_is_empty_tuple(tmp_path):
     path = _write_config(tmp_path, {"feeds": [{"name": "F", "url": "https://a"}]})
     assert load_feeds(path)[0].filters == ()

@@ -224,9 +224,63 @@ work on it. A `/channel/UC…` url is rewritten on the spot; the `@handle`, `/c/
 That feed carries the **last 15 uploads**, which is plenty to follow a channel and
 no use for backfilling one.
 
+The one thing it doesn't say is how long a video is, which is exactly what a
+channel mixing clips with full episodes has to be filtered on — so rssignal asks
+yt-dlp for the channel's listing and puts a `duration_seconds` field on each item.
+That's one small request per feed, not one per video, and it makes a length filter
+ordinary:
+
+```json
+{
+  "name": "The Daily Show",
+  "url": "https://www.youtube.com/@TheDailyShow",
+  "duration_seconds_min": "7:00",
+  "duration_seconds_max": "30:00",
+  "published_weekday_contains": ["Tuesday", "Wednesday", "Thursday", "Friday"]
+}
+```
+
+An upload the listing doesn't cover — a Short, which lives on its own tab — gets no
+duration, and a length filter therefore drops it. Without yt-dlp, no item gets one:
+that's a warning on stderr, and a length filter then keeps nothing.
+
 Downloads need **yt-dlp** (`pip install rssignal[video]`), which in turn uses
 ffmpeg. Uploads shorter than 90 seconds are treated as Shorts and dropped
 entirely — no message, and they aren't reconsidered on the next run.
+
+#### When YouTube asks you to confirm you're not a bot
+
+```
+[The Daily Show] video skipped: yt-dlp failed: ERROR: [youtube] 14j9b34VCJI:
+Sign in to confirm you're not a bot.
+```
+
+YouTube blocks requests it can't attribute to a signed-in session, and gets
+stricter about it the more a machine asks — so this tends to show up on a server,
+on a VPN, or after a few runs in a row. The only thing it accepts is real cookies
+from an account. Two ways to hand them over, both off by default:
+
+```bash
+# Read them out of a browser you are logged into, by name:
+RSSIGNAL_YOUTUBE_COOKIES_FROM_BROWSER=firefox
+
+# …or point at a cookies.txt export:
+RSSIGNAL_YOUTUBE_COOKIES=~/.config/rssignal/youtube-cookies.txt
+```
+
+Either goes in your environment or `.env`, and applies to every yt-dlp call —
+the downloads and the listing that fills in durations, which YouTube challenges
+the same way. If both are set the file wins.
+
+A profile can be named where there are several: `firefox:default-release`. Firefox
+is the path of least resistance on macOS; Chrome and Safari encrypt their cookie
+stores and will prompt for keychain access, which is no use from a cron job. On a
+headless server there is no browser to read at all — export a cookies.txt from
+your desktop (a Netscape-format cookie extension does this) and copy it over.
+
+Use a throwaway Google account rather than your own: the cookies are a live
+session, so the file is a credential — keep it out of the repo, and expect to
+refresh it every few months when the session expires.
 
 #### Quality, and what happens when it doesn't fit
 
@@ -369,20 +423,21 @@ rssignal fields --item 3                         # sample the 3rd item
 ```
 Fields for Some Podcast (item 1 of 25):
 
-  title           Episode 402: the interview
-  description     In this episode we talk to …
-  link            https://example.com/402
-  published       2026-07-22T06:00:00+00:00
-  published_date  2026-07-22
-  enclosure_url   https://example.com/402.mp3
-  enclosure_type  audio/mpeg
-  image_url       https://example.com/artwork.jpg
-  author          Example Media
-  categories      news, politics
-  feed_name       Some Podcast
-  itunes_duration 00:42:11                        (extra)
-  id              urn:uuid:8f2c…                  (extra)
-  episode_id      54321                           (extra)
+  title              Episode 402: the interview
+  description        In this episode we talk to …
+  link               https://example.com/402
+  published          2026-07-22T06:00:00+00:00
+  published_date     2026-07-22
+  published_weekday  Wednesday
+  enclosure_url      https://example.com/402.mp3
+  enclosure_type     audio/mpeg
+  image_url          https://example.com/artwork.jpg
+  author             Example Media
+  categories         news, politics
+  feed_name          Some Podcast
+  itunes_duration    00:42:11                     (extra)
+  id                 urn:uuid:8f2c…               (extra)
+  episode_id         54321                        (extra)
 ```
 
 Anything you define with `extract` shows up here too, which is the quickest way to check
@@ -433,6 +488,43 @@ Each takes a string or a list. `contains` and `matches` keep an item when **any*
 value hits; `excludes` keeps it when **none** do. Matching is case-insensitive, and
 multiple filters must **all** pass. Filters are applied before the watermark, so
 an item you filter out never counts as sent.
+
+A rule reads better against the field the feed writes to a formula. Titles are
+written for people and vary; descriptions are often boilerplate, and boilerplate is
+what a filter can hold on to. `"description_excludes": ["sits down with"]` drops a
+show's guest interviews more reliably than any pattern over their titles, because
+the phrase is the house style rather than an accident of the episode.
+
+`matches` can also express an exclusion that `excludes` can't, since a negative
+lookahead over the whole field keeps everything the pattern doesn't describe:
+
+```json
+"title_matches": "^(?!Live: )"
+```
+
+`min` and `max` compare instead of matching, for the fields holding a number —
+`duration_seconds` on a video, `itunes_duration` on a podcast. Both bounds are
+inclusive, and either side may be written as seconds or with colons, so a length
+reads like one:
+
+```json
+"duration_seconds_min": "7:00",
+"duration_seconds_max": "30:00"
+```
+
+Each takes a single bound rather than a list; write both to get a window. A field
+that isn't a number — missing, or prose — fails them, so an item whose length
+couldn't be established is dropped rather than sent on the assumption it fits.
+
+`published_weekday` is the day an item was published, spelled out (`Monday` …
+`Sunday`), which is how a show with a broadcast week gets filtered down to it:
+
+```json
+"published_weekday_contains": ["Tuesday", "Wednesday", "Thursday", "Friday"]
+```
+
+Like every date rssignal reads, it is **UTC** — an evening upload in the Americas
+belongs to the next day here.
 
 Check what would be sent, then send for real:
 

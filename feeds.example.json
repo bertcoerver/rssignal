@@ -15,6 +15,13 @@
       "preview_url": "https://example.com/listen/{episode_id}",
       "preview_title": "🎧 {title}",
       "title_contains": ["interview", "special"]
+    },
+    {
+      "name": "Some YouTube Channel",
+      "url": "https://www.youtube.com/@example",
+      "duration_seconds_min": "7:00",
+      "duration_seconds_max": "30:00",
+      "published_weekday_contains": ["Tuesday", "Wednesday", "Thursday", "Friday"]
     }
   ]
 }

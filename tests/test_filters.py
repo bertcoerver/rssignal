@@ -1,5 +1,9 @@
 """Tests for per-field filtering (rssignal.feeds.apply_filters)."""
 
+from datetime import datetime, timezone
+
+import pytest
+
 from rssignal.feeds import FeedFilter, FeedItem, apply_filters
 
 INTERVIEW = FeedItem(title="Episode 12: The Interview", description="A long talk")
@@ -57,6 +61,75 @@ def test_missing_field_counts_as_empty():
     # No item has an "itunes_duration", so contains drops all and excludes keeps all.
     assert apply_filters(ALL, _filter("itunes_duration", "contains", "42")) == []
     assert apply_filters(ALL, _filter("itunes_duration", "excludes", "42")) == ALL
+
+
+def test_min_and_max_compare_a_field_as_a_number():
+    short = FeedItem(title="Clip", description="", extra={"duration_seconds": "120"})
+    episode = FeedItem(title="Ep", description="", extra={"duration_seconds": "1200"})
+    long = FeedItem(title="Live", description="", extra={"duration_seconds": "7200"})
+    items = [short, episode, long]
+
+    window = (
+        FeedFilter(field="duration_seconds", op="min", values=("420",)),
+        FeedFilter(field="duration_seconds", op="max", values=("1800",)),
+    )
+    assert apply_filters(items, window) == [episode]
+
+
+def test_min_and_max_are_inclusive():
+    item = FeedItem(title="Ep", description="", extra={"duration_seconds": "420"})
+    assert apply_filters([item], _filter("duration_seconds", "min", "420")) == [item]
+    assert apply_filters([item], _filter("duration_seconds", "max", "420")) == [item]
+
+
+@pytest.mark.parametrize(
+    "bound, kept",
+    [("2400", True), ("40:00", True), ("00:40:00", True), ("39:59", False)],
+)
+def test_a_bound_can_be_written_as_a_clock_duration(bound, kept):
+    item = FeedItem(title="Ep", description="", extra={"duration_seconds": "2400"})
+    assert apply_filters([item], _filter("duration_seconds", "max", bound)) == (
+        [item] if kept else []
+    )
+
+
+def test_a_field_can_be_written_as_a_clock_duration_too():
+    # itunes:duration is usually h:mm:ss, and comparing it shouldn't need an
+    # extract to turn it into seconds first.
+    item = FeedItem(title="Ep", description="", extra={"itunes_duration": "01:20:00"})
+    assert apply_filters([item], _filter("itunes_duration", "min", "3600")) == [item]
+    assert apply_filters([item], _filter("itunes_duration", "max", "3600")) == []
+
+
+def test_min_and_max_drop_what_is_not_a_number():
+    missing = FeedItem(title="No duration", description="")
+    prose = FeedItem(title="Ep", description="", extra={"duration_seconds": "a while"})
+
+    assert apply_filters([missing, prose], _filter("duration_seconds", "min", "1")) == []
+    assert apply_filters([missing, prose], _filter("duration_seconds", "max", "1")) == []
+
+
+def test_published_weekday_names_the_day():
+    days = [
+        FeedItem(
+            title=f"Day {day}",
+            description="",
+            published=datetime(2026, 7, 20 + day, tzinfo=timezone.utc),
+        )
+        for day in range(7)  # 2026-07-20 is a Monday.
+    ]
+
+    kept = apply_filters(
+        days,
+        _filter("published_weekday", "contains", "Tuesday", "Wednesday", "Friday"),
+    )
+    assert [item.title for item in kept] == ["Day 1", "Day 2", "Day 4"]
+
+
+def test_published_weekday_is_empty_without_a_date():
+    undated = FeedItem(title="Undated", description="")
+    monday = _filter("published_weekday", "contains", "Monday")
+    assert apply_filters([undated], monday) == []
 
 
 def test_filters_can_read_extra_fields():

@@ -35,7 +35,24 @@ AUDIO_SUFFIXES = (
 )
 
 # Suffixes that turn a feed config key into a filter, e.g. "title_contains".
-FILTER_OPS = ("contains", "excludes", "matches")
+FILTER_OPS = ("contains", "excludes", "matches", "min", "max")
+
+# The ops that read their field as a number rather than as text, so they take
+# one bound rather than a list of alternatives.
+NUMERIC_OPS = ("min", "max")
+
+# Day names for the published_weekday field. Written out rather than taken from
+# strftime("%A"), which answers in whatever language the machine happens to be
+# set to — a filter in feeds.json must mean the same thing everywhere it runs.
+WEEKDAYS = (
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+)
 
 # Config keys that are settings rather than filters.
 KNOWN_KEYS = (
@@ -56,6 +73,7 @@ CORE_FIELDS = (
     "link",
     "published",
     "published_date",
+    "published_weekday",
     "enclosure_url",
     "enclosure_type",
     "image_url",
@@ -96,6 +114,8 @@ class FeedFilter:
 
     ``values`` holds the alternatives for the test: ``contains`` and ``matches``
     keep an item when *any* value hits, ``excludes`` keeps it when *none* do.
+    The numeric ops (:data:`NUMERIC_OPS`) compare rather than match, so they take
+    a single bound — alternatives mean nothing to them.
     """
 
     field: str
@@ -364,6 +384,10 @@ def _build_filters(raw: dict, where: str) -> tuple[FeedFilter, ...]:
                 f"or a filter named <field>_<op> with op in {FILTER_OPS}."
             )
 
+        if op in NUMERIC_OPS:
+            filters.append(_numeric_filter(field_name, op, value, where, key))
+            continue
+
         values = [value] if isinstance(value, str) else value
         if not isinstance(values, list) or not all(
             isinstance(v, str) for v in values
@@ -382,6 +406,30 @@ def _build_filters(raw: dict, where: str) -> tuple[FeedFilter, ...]:
     return tuple(filters)
 
 
+def _numeric_filter(
+    field_name: str, op: str, value: object, where: str, key: str
+) -> FeedFilter:
+    """Validate one ``<field>_min`` / ``<field>_max`` bound into a filter.
+
+    The bound is a number of seconds, or a duration written with colons, and
+    JSON may give either as a number or a string. It is checked here rather than
+    per item so ``"duration_seconds_max": "half an hour"`` fails the run up front
+    instead of quietly dropping every item.
+    """
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        raise FeedError(
+            f"{where} {key!r} must be a single bound, not a list — a number of "
+            "seconds, or a duration like \"30:00\"."
+        )
+
+    text = str(value)
+    if _as_number(text) is None:
+        raise FeedError(
+            f"{where} {key!r} is not a number or a duration: {value!r}."
+        )
+    return FeedFilter(field=field_name, op=op, values=(text,))
+
+
 def parse_feed(cfg: FeedConfig) -> ParsedFeed:
     """Fetch and parse ``cfg.url`` into a :class:`ParsedFeed`.
 
@@ -391,11 +439,15 @@ def parse_feed(cfg: FeedConfig) -> ParsedFeed:
     page is swapped for the feed YouTube publishes at an address nobody would
     guess. Either way, following a show needs nothing in the config but the
     address of its page.
+
+    A video item also gets the one thing its feed tends to leave out — how long
+    the video is — so that ``duration_seconds`` is an ordinary field like any
+    other. See :func:`~rssignal.video.annotate_durations`.
     """
     # Imported here, not at the top: rssignal.video builds FeedItems and so
     # imports this module. Deferring it keeps that one-way and leaves feeds.py
     # free of any knowledge of what video sources exist.
-    from .video import channel_feed_url, collection_feed
+    from .video import annotate_durations, channel_feed_url, collection_feed
 
     collection = collection_feed(cfg)
     if collection is not None:
@@ -418,11 +470,13 @@ def parse_feed(cfg: FeedConfig) -> ParsedFeed:
     # <itunes:subtitle>, which some feeds fill in instead.
     description = strip_html(cget("summary") or cget("subtitle") or "")
 
+    # Durations come before extracts so a rule can read one, and after the items
+    # exist because they are looked up per feed, not per entry.
+    items = [_build_feed_item(entry, cfg.name) for entry in parsed.entries]
+    items = annotate_durations(cfg.url, items)
+
     return ParsedFeed(
-        items=[
-            apply_extracts(_build_feed_item(entry, cfg.name), cfg.extract)
-            for entry in parsed.entries
-        ],
+        items=[apply_extracts(item, cfg.extract) for item in items],
         image_url=_href(cget("image")),
         description=description,
     )
@@ -573,6 +627,12 @@ def item_fields(item: FeedItem) -> dict[str, str]:
     the ``rssignal fields`` command, so what that command prints is exactly what
     the other two can use. Named fields come first; the feed's own extras fill
     in behind them without overwriting a named field.
+
+    The three ``published*`` fields are the one date in three shapes: the full
+    timestamp, the day it fell on, and the name of that day — which is there so
+    a show with a broadcast week can be filtered down to it. All three are UTC,
+    like every date rssignal reads, so a late-evening upload can belong to the
+    next day.
     """
     fields: dict[str, str] = {
         "title": item.title,
@@ -580,6 +640,7 @@ def item_fields(item: FeedItem) -> dict[str, str]:
         "link": item.link or "",
         "published": item.published.isoformat() if item.published else "",
         "published_date": item.published.strftime("%Y-%m-%d") if item.published else "",
+        "published_weekday": WEEKDAYS[item.published.weekday()] if item.published else "",
         "enclosure_url": item.enclosure_url or "",
         "enclosure_type": item.enclosure_type or "",
         "image_url": item.image_url or "",
@@ -624,7 +685,8 @@ def apply_filters(
     """Return the items passing every filter (filters are ANDed).
 
     Matching is case-insensitive throughout. A field an item doesn't have counts
-    as empty, so ``contains`` drops it while ``excludes`` keeps it.
+    as empty, so ``contains`` drops it while ``excludes`` keeps it — and ``min``
+    and ``max`` drop it too, since nothing is not a number.
     """
     if not filters:
         return list(items)
@@ -638,12 +700,45 @@ def apply_filters(
 def _passes(fields: dict[str, str], flt: FeedFilter) -> bool:
     """Test one item's ``fields`` against a single filter."""
     text = fields.get(flt.field, "")
+    if flt.op in NUMERIC_OPS:
+        value = _as_number(text)
+        bound = _as_number(flt.values[0])
+        if value is None or bound is None:
+            return False
+        return value >= bound if flt.op == "min" else value <= bound
+
     if flt.op == "matches":
         return any(re.search(v, text, re.IGNORECASE) for v in flt.values)
 
     lowered = text.lower()
     hit = any(v.lower() in lowered for v in flt.values)
     return hit if flt.op == "contains" else not hit
+
+
+def _as_number(text: str) -> float | None:
+    """Read ``text`` as a plain number, or as a clock duration like ``00:42:11``.
+
+    Feeds write a length both ways — YouTube and ARTE report seconds, podcasts
+    usually write ``itunes:duration`` with colons — and a ``min`` / ``max``
+    filter shouldn't care which, in either the field or the bound it is compared
+    against. ``None`` means "not a number", which is how a missing field and a
+    field holding prose both end up failing the test.
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+
+    parts = text.split(":")
+    if len(parts) > 3:
+        return None
+
+    total = 0.0
+    for part in parts:
+        try:
+            total = total * 60 + float(part)
+        except ValueError:
+            return None
+    return total
 
 
 class _DefaultingFields(dict):

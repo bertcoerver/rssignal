@@ -97,6 +97,13 @@ FORMATS = [
 INFO = {"id": VIDEO_ID, "title": "A video", "duration": DURATION, "formats": FORMATS}
 
 
+@pytest.fixture(autouse=True)
+def _signed_out(monkeypatch):
+    """Whoever runs the tests may have cookies configured; the tests do not."""
+    monkeypatch.delenv(youtube.COOKIES_ENV, raising=False)
+    monkeypatch.delenv(youtube.COOKIES_FROM_BROWSER_ENV, raising=False)
+
+
 def _patch_ytdlp(monkeypatch, *, info=None, returncode=0, stderr="", payload=b"video"):
     """Stand in for the yt-dlp binary, recording every command it was given."""
     calls = []
@@ -194,6 +201,76 @@ def test_youtube_feed_url_without_an_id_raises(monkeypatch):
 
     with pytest.raises(FeedError, match="Could not work out the channel id"):
         youtube.youtube_feed_url("https://www.youtube.com/@veritasium")
+
+
+# --- durations ------------------------------------------------------------
+
+CHANNEL_FEED = (
+    "https://www.youtube.com/feeds/videos.xml?channel_id=UCHnyfMqiRRG1u-2MsSQLbXA"
+)
+LISTING = {
+    "entries": [
+        {"id": VIDEO_ID, "duration": 1200.0},
+        {"id": "aaaaaaaaaaa", "duration": 61.0},
+    ]
+}
+
+
+def test_with_durations_puts_the_channel_listing_on_the_items(monkeypatch):
+    calls = _patch_ytdlp(monkeypatch, info=LISTING)
+    items = [_item(), _item(link="https://youtu.be/aaaaaaaaaaa")]
+
+    annotated = youtube.with_durations(CHANNEL_FEED, items)
+
+    assert [item.extra["duration_seconds"] for item in annotated] == ["1200", "61"]
+    # One request for the whole feed, not one per video.
+    cmd = calls[0]
+    assert len(calls) == 1 and "--flat-playlist" in cmd
+    assert cmd[-1] == (
+        "https://www.youtube.com/channel/UCHnyfMqiRRG1u-2MsSQLbXA/videos"
+    )
+
+
+def test_with_durations_matches_on_video_id_not_position(monkeypatch):
+    _patch_ytdlp(monkeypatch, info=LISTING)
+    items = [_item(link="https://youtu.be/aaaaaaaaaaa"), _item()]
+
+    annotated = youtube.with_durations(CHANNEL_FEED, items)
+
+    assert [item.extra["duration_seconds"] for item in annotated] == ["61", "1200"]
+
+
+def test_with_durations_follows_a_nested_listing(monkeypatch):
+    _patch_ytdlp(monkeypatch, info={"entries": [{"entries": LISTING["entries"]}]})
+
+    annotated = youtube.with_durations(CHANNEL_FEED, [_item()])
+
+    assert annotated[0].extra["duration_seconds"] == "1200"
+
+
+def test_with_durations_leaves_an_unlisted_video_alone(monkeypatch):
+    _patch_ytdlp(monkeypatch, info={"entries": []})
+    item = _item()
+
+    assert youtube.with_durations(CHANNEL_FEED, [item]) == [item]
+
+
+def test_with_durations_ignores_a_feed_that_is_not_a_channel(monkeypatch):
+    def fail(*args, **kwargs):
+        raise AssertionError("nothing to look up for a feed with no channel in it")
+
+    monkeypatch.setattr(youtube.subprocess, "run", fail)
+    items = [_item()]
+
+    assert youtube.with_durations("https://waitbutwhy.com/feed", items) == items
+
+
+def test_with_durations_survives_a_failed_lookup(monkeypatch, capsys):
+    _patch_ytdlp(monkeypatch, info={}, returncode=1, stderr="yt-dlp: unavailable")
+    items = [_item()]
+
+    assert youtube.with_durations(CHANNEL_FEED, items) == items
+    assert "duration_seconds" in capsys.readouterr().err
 
 
 # --- quality choice -------------------------------------------------------
@@ -357,6 +434,75 @@ def test_ytdlp_failure_reports_its_last_line(monkeypatch, tmp_path):
 
     with pytest.raises(FeedError, match="not a bot"):
         plan.fetch(str(tmp_path), timeout=900)
+
+
+def test_ytdlp_failure_on_the_bot_check_says_how_to_sign_in(monkeypatch, tmp_path):
+    _patch_ytdlp(monkeypatch)
+    plan = youtube.resolve(_item())
+    _patch_ytdlp(
+        monkeypatch,
+        returncode=1,
+        stderr="ERROR: [youtube] BFcjfKZ0BeI: Sign in to confirm you’re not a bot.\n",
+    )
+
+    with pytest.raises(FeedError) as excinfo:
+        plan.fetch(str(tmp_path), timeout=900)
+
+    assert youtube.COOKIES_FROM_BROWSER_ENV in str(excinfo.value)
+    assert youtube.COOKIES_ENV in str(excinfo.value)
+
+
+def test_a_cookies_file_is_passed_to_every_ytdlp_call(monkeypatch, tmp_path):
+    cookies = tmp_path / "cookies.txt"
+    cookies.write_text("# Netscape HTTP Cookie File\n")
+    monkeypatch.setenv(youtube.COOKIES_ENV, str(cookies))
+    calls = _patch_ytdlp(monkeypatch)
+
+    plan = youtube.resolve(_item())
+    plan.fetch(str(tmp_path), timeout=900)
+
+    assert len(calls) == 2
+    for cmd in calls:
+        assert cmd[cmd.index("--cookies") + 1] == str(cookies)
+
+
+def test_a_browser_is_passed_when_there_is_no_cookies_file(monkeypatch):
+    monkeypatch.setenv(youtube.COOKIES_FROM_BROWSER_ENV, "firefox")
+    calls = _patch_ytdlp(monkeypatch)
+
+    youtube.resolve(_item())
+
+    assert calls[0][calls[0].index("--cookies-from-browser") + 1] == "firefox"
+
+
+def test_a_cookies_file_wins_over_a_browser(monkeypatch, tmp_path):
+    cookies = tmp_path / "cookies.txt"
+    cookies.write_text("# Netscape HTTP Cookie File\n")
+    monkeypatch.setenv(youtube.COOKIES_ENV, str(cookies))
+    monkeypatch.setenv(youtube.COOKIES_FROM_BROWSER_ENV, "firefox")
+    calls = _patch_ytdlp(monkeypatch)
+
+    youtube.resolve(_item())
+
+    assert "--cookies" in calls[0]
+    assert "--cookies-from-browser" not in calls[0]
+
+
+def test_a_cookies_file_that_is_not_there_raises(monkeypatch, tmp_path):
+    monkeypatch.setenv(youtube.COOKIES_ENV, str(tmp_path / "nope.txt"))
+    _patch_ytdlp(monkeypatch)
+
+    with pytest.raises(FeedError, match="not a file"):
+        youtube.resolve(_item())
+
+
+def test_no_cookies_configured_signs_nothing_in(monkeypatch):
+    calls = _patch_ytdlp(monkeypatch)
+
+    youtube.resolve(_item())
+
+    assert "--cookies" not in calls[0]
+    assert "--cookies-from-browser" not in calls[0]
 
 
 def test_ytdlp_timeout_raises(monkeypatch, tmp_path):

@@ -148,6 +148,23 @@ def collection_feed(cfg: FeedConfig) -> ParsedFeed | None:
     return None
 
 
+def annotate_durations(feed_url: str, items: list[FeedItem]) -> list[FeedItem]:
+    """Fill in how long each item's video is, for the source that doesn't say.
+
+    ARTE's own listing carries a duration and puts it on the item as it reads it
+    (see :func:`~rssignal.arte.parse_arte_collection`); YouTube's Atom feed has
+    none, so it is looked up. Either way an item ends up with the same
+    ``duration_seconds`` field, which is what makes ``duration_seconds_min`` a
+    filter you can write without knowing where the item came from.
+
+    Items from anything else come back untouched — a feed that has no video in
+    it pays nothing for this.
+    """
+    from .youtube import with_durations
+
+    return with_durations(feed_url, items)
+
+
 def channel_feed_url(url: str) -> str | None:
     """The feed url behind a channel page, if ``url`` is one rssignal knows.
 
