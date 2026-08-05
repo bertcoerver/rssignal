@@ -395,3 +395,50 @@ def test_run_since_that_is_not_a_timestamp_is_refused(monkeypatch):
     with pytest.raises(SystemExit) as excinfo:
         cli.main(["run", "--since", "last tuesday"])
     assert "ISO timestamp" in str(excinfo.value)
+
+
+# --- the error log ----------------------------------------------------------
+
+
+def test_doctor_reports_where_the_error_log_goes(monkeypatch, capsys, error_log):
+    monkeypatch.setattr(cli, "find_signal_cli", lambda: "/bin/signal-cli")
+    monkeypatch.setattr(cli, "list_accounts", lambda: ["+31600000000"])
+    monkeypatch.setattr(
+        cli,
+        "get_config",
+        lambda: SimpleNamespace(account="+31600000000", recipient=None),
+    )
+
+    cli.main(["doctor"])
+
+    # Printed whether or not it exists yet: the point is knowing where to look.
+    assert not error_log.exists()
+    assert str(error_log) in capsys.readouterr().out
+
+
+def test_known_error_is_logged_with_its_traceback(monkeypatch, capsys, error_log):
+    def fake_send(message, recipient=None):
+        raise SignalSendError("failed", returncode=1, stderr="bad")
+
+    monkeypatch.setattr(cli, "send_msg", fake_send)
+
+    assert cli.main(["send", "hello"]) == 1
+
+    logged = error_log.read_text()
+    assert "rssignal send" in logged
+    assert "Traceback (most recent call last)" in logged
+    # stderr keeps its one line, and says where the rest of it is.
+    assert str(error_log) in capsys.readouterr().err
+
+
+def test_unexpected_error_is_logged_and_still_raised(monkeypatch, error_log):
+    def fake_send(message, recipient=None):
+        raise RuntimeError("something nobody planned for")
+
+    monkeypatch.setattr(cli, "send_msg", fake_send)
+
+    # A crash should still look like a crash; the log is a record, not a muzzle.
+    with pytest.raises(RuntimeError):
+        cli.main(["send", "hello"])
+
+    assert "something nobody planned for" in error_log.read_text()

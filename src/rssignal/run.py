@@ -25,6 +25,11 @@ not reconsidered every run.
 Each feed sends to a Signal group named after it, created on the first send if it
 doesn't exist yet — see :class:`_GroupResolver`.
 
+Feeds are independent of each other, and a run says so: one that fails is
+reported and left for the next run, and the ones after it are processed anyway.
+A run is usually unattended — a scheduled job, an Apple Shortcut — where losing
+every other feed to one bad video is the worst of the possible outcomes.
+
 How far a feed got is remembered in that group's own description, so a feed is
 never sent twice and running more often costs nothing. See
 :mod:`rssignal.watermark` for why the description, of all places, and
@@ -38,6 +43,7 @@ from contextlib import ExitStack
 from datetime import datetime
 
 from .download import download_temp
+from .errorlog import log_exception
 from .feeds import (
     FeedConfig,
     FeedError,
@@ -142,13 +148,50 @@ def run_feeds(
     Returns the number of items sent (or, in ``dry_run`` mode, that would be
     sent). With ``dry_run`` set nothing is sent, downloaded, created, or
     recorded — each candidate is printed instead.
+
+    A feed that fails does not stop the others: it is reported on stderr and
+    skipped, and its watermark is left where it was, so the next run picks it up
+    from the same place. Only something that stops there being feeds at all —
+    an unreadable config — raises.
     """
     feeds = load_feeds(config_path)
     resolver = _GroupResolver()
-    return sum(
-        _send_feed(cfg, resolver, dry_run=dry_run, to=to, since=since)
-        for cfg in feeds
-    )
+    sent = 0
+    failed = 0
+    logged: str | None = None
+    for cfg in feeds:
+        try:
+            sent += _send_feed(cfg, resolver, dry_run=dry_run, to=to, since=since)
+        except Exception as exc:
+            failed += 1
+            logged = _report_feed_failure(cfg, exc) or logged
+
+    if failed:
+        where = f"; full tracebacks in {logged}" if logged else ""
+        print(
+            f"{failed} of {len(feeds)} feed(s) failed{where}.", file=sys.stderr
+        )
+    return sent
+
+
+def _report_feed_failure(cfg: FeedConfig, exc: Exception) -> str | None:
+    """Explain why a feed was given up on, and carry on with the others.
+
+    A feed is a self-contained unit of work: a video that won't fetch, a source
+    that is down, a group that can't be written to are all reasons to lose *that*
+    feed for one run, and no reason at all to lose the ones after it. Whatever
+    went wrong, the next run starts again from the watermark this one didn't
+    move.
+
+    stderr gets one line, because a run that skips a feed is not a run anyone
+    wants a screenful about, and because stderr is usually nowhere at all — this
+    runs from cron and from Shortcuts. The traceback goes to
+    :mod:`rssignal.errorlog` instead, where it is still there tomorrow. Returns
+    the log's path, for the summary line to point at.
+    """
+    label = cfg.name or cfg.url
+    print(f"[{label}] skipped: {exc}", file=sys.stderr)
+    return log_exception(f"feed {label!r}", exc)
 
 
 def _send_feed(

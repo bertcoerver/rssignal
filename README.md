@@ -669,6 +669,39 @@ Worth knowing:
   put back, so the item is retried on the next run along with everything queued
   behind it. (Should the rollback *also* fail — two Signal errors in a row — that
   one item is lost; rssignal says so on stderr and `--since` replays it.)
+- **One bad feed doesn't stop the others.** A feed that fails — a video that
+  won't fetch, a source that is down, a group that can't be written to — is
+  reported on stderr and skipped, and the run carries on with the feeds after
+  it. Its marker stays where it was, so the next run picks it up from the same
+  place. `rssignal run` still exits 0 in that case, which is what keeps an
+  unattended caller (cron, an Apple Shortcut) from aborting over one feed;
+  the failures are on stderr, ending with a `N of M feed(s) failed` line.
+  Only something that leaves no feeds to run at all — an unreadable
+  `feeds.json` — exits non-zero.
+
+## The error log
+
+stderr is nowhere at all when the run comes from a scheduler or an Apple
+Shortcut, so every failure is also appended, with its full traceback, to a log
+file:
+
+```
+rssignal.log        # in the directory you run from — next to your .env
+```
+
+Set `RSSIGNAL_LOG` (in `.env`, or in the environment) to put it somewhere
+fixed instead:
+
+```bash
+RSSIGNAL_LOG=/Users/you/Library/Logs/rssignal.log
+```
+
+`rssignal doctor` prints the path it will use, whether or not the file exists
+yet. Each entry is stamped with the local time and says which feed it came
+from; the file is rotated to `rssignal.log.1` once it passes 1 MB, so the
+failure you came looking for survives the runs after it. A log that can't be
+written is a warning on stderr and nothing more — it never stops a message
+being sent.
 
 ## Development
 

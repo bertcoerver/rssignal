@@ -60,6 +60,10 @@ venv.bak/
 # Local feed configuration
 feeds.json
 
+# Error log
+rssignal.log
+rssignal.log.1
+
 # Claude Code
 .claude/
 

@@ -14,11 +14,13 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import sys
 from datetime import datetime, timezone
 
 from .config import ConfigError, get_config
+from .errorlog import log_exception, log_path
 from .feeds import (
     CORE_FIELDS,
     FeedConfig,
@@ -59,6 +61,10 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 
     ytdlp = shutil.which("yt-dlp")
     print(f"yt-dlp: {ytdlp or 'not found (only needed for YouTube feeds)'}")
+
+    # Where to look after an unattended run went wrong, printed whether or not
+    # the file exists yet — the point is knowing where it will be.
+    print(f"error log: {os.path.abspath(log_path())}")
 
     accounts = list_accounts()
     if accounts:
@@ -398,14 +404,26 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Entry point for the ``rssignal`` console script."""
+    """Entry point for the ``rssignal`` console script.
+
+    Anything that gets this far ends the command, so it is worth a traceback in
+    the log even though stderr only gets the message: this is the error someone
+    will come asking about tomorrow, when stderr is long gone. An unexpected
+    exception is re-raised after being logged — a crash should still look like a
+    crash — while the known ones exit 1 with their message.
+    """
     parser = _build_parser()
     args = parser.parse_args(argv)
     try:
         return args.func(args)
     except (SignalError, ConfigError, FeedError, ValueError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        logged = log_exception(f"rssignal {args.command}", exc)
+        where = f" (traceback in {logged})" if logged else ""
+        print(f"error: {exc}{where}", file=sys.stderr)
         return 1
+    except Exception as exc:
+        log_exception(f"rssignal {args.command}", exc)
+        raise
 
 
 if __name__ == "__main__":

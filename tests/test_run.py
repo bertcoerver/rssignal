@@ -734,7 +734,7 @@ def test_run_to_overrides_every_group(monkeypatch):
     assert calls == {"list": 0, "receive": 0, "created": [], "updated": []}
 
 
-def test_run_refuses_to_guess_between_two_groups_with_one_name(monkeypatch):
+def test_run_refuses_to_guess_between_two_groups_with_one_name(monkeypatch, capsys):
     _patch_feeds(
         monkeypatch,
         [_blog()],
@@ -743,9 +743,9 @@ def test_run_refuses_to_guess_between_two_groups_with_one_name(monkeypatch):
     )
     sends = _capture_sends(monkeypatch)
 
-    with pytest.raises(SignalError, match="2 groups are called"):
-        run_feeds("feeds.json")
+    assert run_feeds("feeds.json") == 0
     assert sends == []
+    assert "2 groups are called" in capsys.readouterr().err
 
 
 def test_run_ignores_groups_you_have_left_or_blocked(monkeypatch):
@@ -974,8 +974,7 @@ def test_run_rolls_the_watermark_back_when_a_send_fails_part_way(monkeypatch):
 
     monkeypatch.setattr(run, "send_msg", flaky_send)
 
-    with pytest.raises(SignalError):
-        run_feeds("feeds.json")
+    run_feeds("feeds.json")
 
     # Middle's marker went up before its messages, as designed; when the send
     # failed it was rolled back, so the run ends on Oldest and Middle and Latest
@@ -1004,8 +1003,7 @@ def test_run_rolls_back_to_no_watermark_when_there_was_none(monkeypatch):
 
     monkeypatch.setattr(run, "send_msg", failing_send)
 
-    with pytest.raises(SignalError):
-        run_feeds("feeds.json")
+    run_feeds("feeds.json")
 
     assert calls["updated"][-1]["description"] == blurb
     assert read_watermark(calls["updated"][-1]["description"]) is None
@@ -1034,13 +1032,14 @@ def test_run_reports_a_rollback_that_itself_fails(monkeypatch, capsys):
     monkeypatch.setattr(run, "update_group", flaky_update)
     monkeypatch.setattr(run, "send_msg", failing_send)
 
-    with pytest.raises(SignalError, match="no route to host"):
-        run_feeds("feeds.json")
+    run_feeds("feeds.json")
 
-    # The send failure is what propagates; the rollback failure is reported.
+    # Both are reported: the send failure ends the feed, and the rollback
+    # failure is the reason the item is gone rather than merely delayed.
     err = capsys.readouterr().err
     assert "undoing its watermark failed" in err
     assert "--since" in err
+    assert "no route to host" in err
 
 
 def test_run_keeps_a_hand_edited_blurb_when_it_records(monkeypatch):
@@ -1148,3 +1147,166 @@ def test_run_recording_failure_does_not_fail_the_run(monkeypatch, capsys):
 
     assert run_feeds("feeds.json") == 1
     assert "recording how far the feed got failed" in capsys.readouterr().err
+
+
+# --- one bad feed does not take the others with it --------------------------
+#
+# A run is usually unattended — a scheduled job, an Apple Shortcut — so the
+# interesting question about a feed that fails is what happens to the ones
+# after it.
+
+_BROKEN = FeedConfig(url="https://broken", name="Broken")
+_FINE = FeedConfig(url="https://fine", name="Fine")
+
+
+def _patch_two_feeds(monkeypatch, parse):
+    """Configure Broken and Fine, in that order, parsed by ``parse``."""
+    configs = [_BROKEN, _FINE]
+    monkeypatch.setattr(run, "load_feeds", lambda path: configs)
+    monkeypatch.setattr(run, "parse_feed", parse)
+    return _patch_groups(
+        monkeypatch,
+        [
+            SignalGroup(id=f"{c.name}=", name=c.name, description=LONG_AGO)
+            for c in configs
+        ],
+    )
+
+
+def _one_item(cfg):
+    return ParsedFeed(items=_stamp([FeedItem(title=cfg.name, description="d", link=f"{cfg.url}/1")]))
+
+
+def test_run_carries_on_after_a_feed_fails_to_parse(monkeypatch, capsys):
+    def parse(cfg):
+        if cfg is _BROKEN:
+            raise FeedError("could not read the feed")
+        return _one_item(cfg)
+
+    _patch_two_feeds(monkeypatch, parse)
+    sends = _capture_sends(monkeypatch)
+
+    assert run_feeds("feeds.json") == 1
+    assert [s["text"].splitlines()[0] for s in sends] == ["Fine"]
+    err = capsys.readouterr().err
+    assert "[Broken] skipped: could not read the feed" in err
+    assert "1 of 2 feed(s) failed" in err
+
+
+def test_run_logs_the_traceback_of_a_failed_feed(monkeypatch, capsys, error_log):
+    # stderr gets a line; the file gets what you actually need to debug it,
+    # and is still there when the unattended run is long over.
+    def parse(cfg):
+        if cfg is _BROKEN:
+            raise FeedError("could not read the feed")
+        return _one_item(cfg)
+
+    _patch_two_feeds(monkeypatch, parse)
+    _capture_sends(monkeypatch)
+
+    run_feeds("feeds.json")
+
+    logged = error_log.read_text()
+    assert "feed 'Broken'" in logged
+    assert "Traceback (most recent call last)" in logged
+    assert "FeedError: could not read the feed" in logged
+    # And the summary says where to look.
+    assert str(error_log) in capsys.readouterr().err
+
+
+def test_run_appends_to_the_log_rather_than_replacing_it(monkeypatch, error_log):
+    error_log.write_text("something from an earlier run\n")
+
+    def parse(cfg):
+        raise FeedError("could not read the feed")
+
+    _patch_two_feeds(monkeypatch, parse)
+    _capture_sends(monkeypatch)
+
+    run_feeds("feeds.json")
+
+    logged = error_log.read_text()
+    assert logged.startswith("something from an earlier run")
+    # Both feeds failed, and both are in there.
+    assert "feed 'Broken'" in logged and "feed 'Fine'" in logged
+
+
+def test_run_survives_a_log_that_cannot_be_written(monkeypatch, capsys, tmp_path):
+    # A log that can't be written must never be the reason a feed isn't sent.
+    monkeypatch.setenv("RSSIGNAL_LOG", str(tmp_path / "nope" / "rssignal.log"))
+
+    def parse(cfg):
+        if cfg is _BROKEN:
+            raise FeedError("could not read the feed")
+        return _one_item(cfg)
+
+    _patch_two_feeds(monkeypatch, parse)
+    sends = _capture_sends(monkeypatch)
+
+    assert run_feeds("feeds.json") == 1
+    assert [s["text"].splitlines()[0] for s in sends] == ["Fine"]
+    assert "could not write to" in capsys.readouterr().err
+
+
+def test_run_carries_on_after_a_send_fails(monkeypatch, capsys):
+    _patch_two_feeds(monkeypatch, _one_item)
+
+    sent = []
+
+    def flaky_send(text, recipient=None, **kwargs):
+        if text.startswith("Broken"):
+            raise SignalError("no route to host")
+        sent.append(text)
+
+    monkeypatch.setattr(run, "send_msg", flaky_send)
+
+    assert run_feeds("feeds.json") == 1
+    assert [t.splitlines()[0] for t in sent] == ["Fine"]
+    assert "no route to host" in capsys.readouterr().err
+
+
+def test_run_carries_on_after_a_feed_fails_unexpectedly(
+    monkeypatch, capsys, error_log
+):
+    # Not every way a feed can fail is a FeedError — yt-dlp and the parsers can
+    # still surprise us, and the run has to survive those too.
+    def parse(cfg):
+        if cfg is _BROKEN:
+            raise KeyError("format_id")
+        return _one_item(cfg)
+
+    _patch_two_feeds(monkeypatch, parse)
+    sends = _capture_sends(monkeypatch)
+
+    assert run_feeds("feeds.json") == 1
+    assert [s["text"].splitlines()[0] for s in sends] == ["Fine"]
+    assert "[Broken] skipped" in capsys.readouterr().err
+    # A bug, not a bad feed: the traceback is what makes it fixable.
+    assert "KeyError" in error_log.read_text()
+
+
+def test_run_leaves_a_failed_feed_where_it_was(monkeypatch):
+    # Nothing was sent for Broken, so nothing may be recorded for it either:
+    # the next run has to start from the same place.
+    def parse(cfg):
+        if cfg is _BROKEN:
+            raise FeedError("could not read the feed")
+        return _one_item(cfg)
+
+    calls = _patch_two_feeds(monkeypatch, parse)
+    _capture_sends(monkeypatch)
+
+    run_feeds("feeds.json")
+
+    assert [c["id"] for c in calls["updated"]] == ["Fine="]
+
+
+def test_run_still_raises_when_the_config_cannot_be_read(monkeypatch):
+    # No feeds at all means there is nothing to isolate one failure from.
+    def failing_load(path):
+        raise FeedError("feeds.json is not valid JSON")
+
+    monkeypatch.setattr(run, "load_feeds", failing_load)
+
+    with pytest.raises(FeedError):
+        run_feeds("feeds.json")

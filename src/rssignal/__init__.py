@@ -3,6 +3,7 @@
 from importlib.metadata import version, PackageNotFoundError
 
 from .config import Config, ConfigError, get_config
+from .errorlog import log_exception, log_path
 from .feeds import (
     FeedConfig,
     FeedError,
@@ -65,6 +66,8 @@ __all__ = [
     "Config",
     "ConfigError",
     "get_config",
+    "log_exception",
+    "log_path",
     "send_msg",
     "link_device",
     "list_accounts",
