@@ -678,6 +678,42 @@ Worth knowing:
   the failures are on stderr, ending with a `N of M feed(s) failed` line.
   Only something that leaves no feeds to run at all — an unreadable
   `feeds.json` — exits non-zero.
+- **A network blip is retried, not lost.** A read that fails for a reason the
+  network caused — a name that won't resolve, a refused connection, a reset
+  mid-download — is tried again up to three times, two and four seconds apart.
+  A laptop that has just woken up is the usual cause, and it is usually gone by
+  the second attempt. A feed whose XML simply doesn't parse is not retried:
+  it won't parse any better in two seconds.
+- **A source blocked on purpose is a skip, not a failure.** See below.
+
+## Blocked sources
+
+If a network-level filter closes a source off from this machine — a NextDNS
+profile that only opens YouTube at night, a firewall rule, a scheduled
+block — reading its feed is not a failure and rssignal doesn't treat it as
+one.
+
+Before a YouTube feed is read, its host is probed with a single HEAD request
+(the cheap equivalent of `curl -sI https://www.youtube.com/`, five-second
+timeout, no retry). If nothing answers, the feed is skipped with one line:
+
+```
+[Last Week Tonight] skipped: https://www.youtube.com/ is not reachable from here
+— a DNS or firewall block, not a broken feed. Skipping until it lifts.
+1 of 12 feed(s) skipped: source blocked from this machine.
+```
+
+Nothing is written to the error log, the skip is counted separately from the
+failures, and the feed's marker stays where it was — so the next run inside the
+open window sends everything that appeared while it was closed, having lost
+nothing.
+
+The probe exists because YouTube is read through yt-dlp, several requests deep,
+each willing to wait a minute: without it a blocked run spends minutes per feed
+arriving at what one request answers immediately. An HTTP error status counts as
+reachable — a 403 or a 404 is the host answering, which is all that's being
+asked. Sources read over plain HTTP (ARTE, ordinary RSS) announce an unreachable
+host quickly enough on their own and are not probed.
 
 ## The error log
 
@@ -703,6 +739,50 @@ failure you came looking for survives the runs after it. A log that can't be
 written is a warning on stderr and nothing more — it never stops a message
 being sent.
 
+## How fast a run is
+
+A run does as little as it can get away with, in as few waits as it can.
+
+**Feeds are fetched all at once.** Feeds don't depend on each other, and fetching
+one is nearly all waiting on somebody else's server, so a run waits once instead
+of once per feed. Sending stays strictly sequential — that is where the ordering
+promises live (the watermark goes up, then the item goes out, in that order,
+per item). `RSSIGNAL_FEED_WORKERS` sets how many at once; the default is 8.
+
+**One `signal-cli` per run, not one per message.** Every `signal-cli` command
+starts a JVM, which costs about a second and a half, and a podcast episode used
+to spend three of them. A run now keeps a single `signal-cli jsonRpc` process
+alive and talks to it over a pipe: the second call costs a round trip instead.
+Set `RSSIGNAL_DAEMON=0` to go back to one process per call — slower, but it is
+the path rssignal used for years, and the first thing to try if sending ever
+misbehaves.
+
+**Answers that can't change are remembered.** An ARTE programme's air date, the
+channel a YouTube `@handle` names, and the ETag a feed last handed out are kept
+in a cache file, so a run stops re-deriving yesterday's answer:
+
+```
+~/.cache/rssignal/cache.json     # or $RSSIGNAL_CACHE
+```
+
+Nothing in it decides *what gets sent* — that is the group description, and only
+the group description. Deleting the cache costs one slow run and changes nothing
+else, which is a property worth keeping: if something ever needs remembering that
+*would* change what goes out, it does not belong in there.
+
+Measured on twelve feeds with nothing new to send, which is what a scheduled run
+almost always is: **33.8s → 5.1s**.
+
+To see where a run's time actually goes:
+
+```bash
+rssignal run --dry-run --timings
+```
+
+It prints each step as it finishes and totals them by kind at the end. The
+totals can add up to more than the wall clock — that is the parallelism, and
+comparing the two is the quickest way to see how much of it there is.
+
 ## Development
 
 ```bash
@@ -710,11 +790,9 @@ pip install -e ".[dev]"
 pytest
 ```
 
-The test suite mocks all `signal-cli` calls, so it never sends real messages.
-
-> **Note:** each message currently uses a one-shot `signal-cli send`. For the
-> cloud service, running signal-cli as a long-lived JSON-RPC daemon would avoid
-> per-message JVM startup cost — a future optimization.
+The test suite mocks all `signal-cli` calls, so it never sends real messages —
+including the long-lived one, which is disabled outright for tests rather than
+left to fall back quietly.
 
 ## Release
 

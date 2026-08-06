@@ -165,6 +165,23 @@ def annotate_durations(feed_url: str, items: list[FeedItem]) -> list[FeedItem]:
     return with_durations(feed_url, items)
 
 
+def check_source_available(url: str) -> None:
+    """Fail fast if ``url``'s source can't be reached from this machine at all.
+
+    Sources differ in what they cost to find that out. ARTE is read over plain
+    HTTP with a short timeout, so an unreachable one announces itself in seconds
+    and needs nothing here. YouTube is read through yt-dlp, several requests
+    deep, each willing to wait a minute — so it gets a probe first. See
+    :func:`~rssignal.youtube.check_available`.
+
+    Raises :class:`~rssignal.feeds.SourceBlocked`, and raises nothing at all for
+    a url whose source has no such check.
+    """
+    from .youtube import check_available
+
+    check_available(url)
+
+
 def channel_feed_url(url: str) -> str | None:
     """The feed url behind a channel page, if ``url`` is one rssignal knows.
 

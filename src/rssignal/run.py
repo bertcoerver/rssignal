@@ -33,15 +33,27 @@ every other feed to one bad video is the worst of the possible outcomes.
 How far a feed got is remembered in that group's own description, so a feed is
 never sent twice and running more often costs nothing. See
 :mod:`rssignal.watermark` for why the description, of all places, and
-:func:`_send_feed` for the order things happen in.
+:func:`_send_prepared` for the order things happen in.
+
+Feeds are *fetched* all at once and *sent* one at a time. Fetching is nearly all
+waiting on other people's servers and no feed's fetch can affect another's, so a
+run waits once instead of twelve times over; see :func:`_prepare_feeds`. Sending
+stays strictly sequential, because that is where the ordering promises above live.
 """
 
 from __future__ import annotations
 
+import os
+import socket
 import sys
-from contextlib import ExitStack
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Iterator
 
+from . import cache, timing
 from .download import download_temp
 from .errorlog import log_exception
 from .feeds import (
@@ -49,6 +61,7 @@ from .feeds import (
     FeedError,
     FeedItem,
     ParsedFeed,
+    SourceBlocked,
     apply_filters,
     filter_since,
     is_audio_item,
@@ -65,6 +78,7 @@ from .signal_cli import (
     SignalGroup,
     clip_body,
     create_group,
+    daemon as signal_daemon,
     list_groups,
     match_group,
     receive,
@@ -73,6 +87,18 @@ from .signal_cli import (
 )
 from .video import VideoTooShort, is_video_item, resolve_video, video_temp
 from .watermark import compose_description, read_watermark, strip_watermark
+
+
+# How long any one network read may sit there before it is given up on. This is
+# feedparser's only timeout — it accepts none of its own, so it goes through the
+# default socket timeout or it doesn't happen at all.
+FEED_SOCKET_TIMEOUT = 30
+
+# How many feeds are fetched at once. The work is nearly all waiting on other
+# people's servers, so this is well above the core count on purpose; the ceiling
+# is politeness to those servers rather than anything local.
+DEFAULT_FEED_WORKERS = 8
+FEED_WORKERS_ENV = "RSSIGNAL_FEED_WORKERS"
 
 
 class _GroupResolver:
@@ -92,12 +118,34 @@ class _GroupResolver:
 
     def __init__(self) -> None:
         self._groups: list[SignalGroup] | None = None
+        self._lock = threading.Lock()
 
     def _listing(self) -> list[SignalGroup]:
-        if self._groups is None:
-            receive()
-            self._groups = list_groups()
-        return self._groups
+        with self._lock:
+            if self._groups is None:
+                receive()
+                self._groups = list_groups()
+            return self._groups
+
+    def prime(self) -> None:
+        """Fetch the listing now, so a later :meth:`find` is free.
+
+        Almost all of what this costs is spent waiting rather than working —
+        ``receive`` sits for its whole timeout listening for messages that
+        usually aren't coming — so :func:`run_feeds` starts it alongside the feed
+        fetches rather than before them, and the wait comes out of a window that
+        was going to be spent on the network anyway.
+
+        A failure here is deliberately swallowed. Nothing is cached, so the first
+        :meth:`find` in the sequential phase simply tries again, and the failure
+        surfaces there — attached to a feed, reported like any other feed's
+        failure, instead of coming out of a worker thread with nothing to pin it
+        to.
+        """
+        try:
+            self._listing()
+        except Exception:
+            pass
 
     def find(self, name: str) -> SignalGroup | None:
         """Return the group called ``name``, or ``None`` if there isn't one."""
@@ -156,12 +204,47 @@ def run_feeds(
     """
     feeds = load_feeds(config_path)
     resolver = _GroupResolver()
+
+    # feedparser takes no timeout of its own, and one unresponsive host would
+    # otherwise hold the run open with no way out. Set here rather than at import
+    # so it is a property of a run, not of having imported rssignal.
+    socket.setdefaulttimeout(FEED_SOCKET_TIMEOUT)
+
+    with signal_daemon():
+        return _run_prepared(feeds, resolver, dry_run=dry_run, to=to, since=since)
+
+
+def _run_prepared(
+    feeds: list[FeedConfig],
+    resolver: _GroupResolver,
+    *,
+    dry_run: bool,
+    to: str | None,
+    since: datetime | None,
+) -> int:
+    """The body of a run, with one ``signal-cli`` already up and waiting."""
+    # Fetching is the slow part and feeds don't depend on each other, so it all
+    # happens at once; sending stays sequential below. With --to no group is
+    # touched at all, so there is no listing worth priming.
+    prepared = _prepare_feeds(feeds, resolver, prime=to is None)
+
     sent = 0
     failed = 0
+    blocked = 0
     logged: str | None = None
-    for cfg in feeds:
+    for cfg, prep in zip(feeds, prepared):
         try:
-            sent += _send_feed(cfg, resolver, dry_run=dry_run, to=to, since=since)
+            if prep.error is not None:
+                raise prep.error
+            sent += _send_prepared(
+                cfg, prep, resolver, dry_run=dry_run, to=to, since=since
+            )
+        except SourceBlocked as exc:
+            # Nothing went wrong, so this is not counted with the failures and
+            # leaves no traceback: the source is deliberately unreachable right
+            # now and the watermark is waiting for the next run.
+            blocked += 1
+            print(f"[{cfg.name or cfg.url}] skipped: {exc}", file=sys.stderr)
         except Exception as exc:
             failed += 1
             logged = _report_feed_failure(cfg, exc) or logged
@@ -171,6 +254,17 @@ def run_feeds(
         print(
             f"{failed} of {len(feeds)} feed(s) failed{where}.", file=sys.stderr
         )
+    if blocked:
+        print(
+            f"{blocked} of {len(feeds)} feed(s) skipped: source blocked from "
+            "this machine.",
+            file=sys.stderr,
+        )
+
+    # Written once, at the end, rather than on every lookup. Nothing depends on
+    # it — see :mod:`rssignal.cache` — so a run that dies before here simply
+    # leaves the next one as slow as this one was.
+    cache.save()
     return sent
 
 
@@ -194,8 +288,121 @@ def _report_feed_failure(cfg: FeedConfig, exc: Exception) -> str | None:
     return log_exception(f"feed {label!r}", exc)
 
 
-def _send_feed(
+@dataclass
+class _Prepared:
+    """One feed's fetched-and-filtered items, or the exception that stopped it.
+
+    The parallel phase can't report a failure itself — a worker thread has no
+    turn of its own, and a traceback surfacing out of order would belong to no
+    feed in particular. So it carries the exception back instead, and the
+    sequential phase raises it where that feed's turn is, into the same handler
+    that has always dealt with a feed going wrong.
+    """
+
+    parsed: ParsedFeed | None = None
+    items: list[FeedItem] = field(default_factory=list)
+    error: Exception | None = None
+
+
+def _prepare_feeds(
+    feeds: list[FeedConfig], resolver: _GroupResolver, *, prime: bool
+) -> list[_Prepared]:
+    """Fetch and filter every feed at once, in ``feeds`` order.
+
+    This is the whole of the parallelism. It is safe to do here and nowhere else
+    because fetching a feed touches nothing shared: it reads its own url, builds
+    its own items, and hands them back. Everything with an ordering requirement —
+    reading a watermark, creating a group, sending, moving the watermark on —
+    stays in the sequential phase, where it always was.
+
+    Results come back in configuration order however the threads finished, so a
+    run's output reads the same as it ever did.
+    """
+    workers = _worker_count(len(feeds))
+    with _whole_lines_stderr():
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="rssignal-feed"
+        ) as pool:
+            if prime:
+                pool.submit(resolver.prime)
+            futures = [pool.submit(_prepare_feed, cfg) for cfg in feeds]
+            return [future.result() for future in futures]
+
+
+def _prepare_feed(cfg: FeedConfig) -> _Prepared:
+    """Fetch and filter one feed, catching whatever went wrong. Runs on a worker."""
+    try:
+        with timing.step("feed fetch", cfg.name or cfg.url):
+            parsed = parse_feed(cfg)
+            items = apply_filters(parsed.items, cfg.filters)
+        return _Prepared(parsed=parsed, items=items)
+    except Exception as exc:
+        return _Prepared(error=exc)
+
+
+def _worker_count(feeds: int) -> int:
+    """How many feeds to fetch at once — never more than there are feeds."""
+    try:
+        configured = int(os.environ.get(FEED_WORKERS_ENV, "") or DEFAULT_FEED_WORKERS)
+    except ValueError:
+        configured = DEFAULT_FEED_WORKERS
+    return max(1, min(configured, feeds or 1))
+
+
+@contextmanager
+def _whole_lines_stderr() -> Iterator[None]:
+    """Keep threads from writing over each other's warnings, for this block.
+
+    Several feeds fetching at once means several of them can have something to
+    complain about at once, and ``print`` reaches stderr as more than one write —
+    the text, then the newline — so two threads interleave *within* a line and
+    produce something neither of them said. Buffering each thread's output until
+    it has a full line, and writing that line under a lock, is enough to stop it:
+    a warning may land in a surprising order, but it always lands whole.
+    """
+    real = sys.stderr
+    sys.stderr = _LineSafeStderr(real)  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        sys.stderr.flush()
+        sys.stderr = real
+
+
+class _LineSafeStderr:
+    """Buffers per thread, emits whole lines under one lock. See above."""
+
+    def __init__(self, target) -> None:
+        self._target = target
+        self._lock = threading.Lock()
+        self._local = threading.local()
+
+    def write(self, text: str) -> int:
+        buffered = getattr(self._local, "buffer", "") + text
+        head, newline, tail = buffered.rpartition("\n")
+        if newline:
+            with self._lock:
+                self._target.write(head + newline)
+                self._target.flush()
+        self._local.buffer = tail
+        return len(text)
+
+    def flush(self) -> None:
+        # A last line with no newline of its own still has to get out.
+        leftover = getattr(self._local, "buffer", "")
+        with self._lock:
+            if leftover:
+                self._target.write(leftover)
+            self._target.flush()
+        self._local.buffer = ""
+
+    def __getattr__(self, name: str):
+        return getattr(self._target, name)
+
+
+def _send_prepared(
     cfg: FeedConfig,
+    prep: _Prepared,
     resolver: _GroupResolver,
     *,
     dry_run: bool,
@@ -215,8 +422,9 @@ def _send_feed(
     previous description back, so the item is retried next run instead of being
     lost to a marker for something that never arrived.
     """
-    parsed: ParsedFeed = parse_feed(cfg)
-    items = apply_filters(parsed.items, cfg.filters)
+    assert prep.parsed is not None  # a _Prepared without an error always has one
+    parsed: ParsedFeed = prep.parsed
+    items = prep.items
     if not items:
         return 0
 

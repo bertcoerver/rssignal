@@ -35,6 +35,7 @@ import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from . import cache, timing
 from .download import fetch_text
 from .feeds import (
     FeedConfig,
@@ -77,6 +78,11 @@ ARTE_PLAYLIST_API = "https://api.arte.tv/api/player/v2/playlist/{lang}/{collecti
 # right answer for the back catalogue — a new group should not open with a
 # hundred videos.
 ARTE_DATED_ITEMS = 12
+
+# Cache namespaces: the date a programme became available, and the fact that one
+# had none to give. See :mod:`rssignal.cache`.
+_PUBLISHED_NS = "arte_published"
+_UNDATED_NS = "arte_undated"
 
 # H.265 rungs duplicate resolutions that also exist in H.264, at no useful size
 # saving here, and play back unevenly across Signal's clients. Not worth the
@@ -296,17 +302,38 @@ def _published(program_id: str, lang: str) -> datetime | None:
     left undated rather than guessed at, and a failed lookup doesn't take the
     whole feed down with it.
     """
+    # A date is the one thing here worth remembering between runs: the playlist
+    # carries none, so every run would otherwise re-ask ARTE for a dozen of them
+    # per collection, and the answer — the day a rights window opened — has been
+    # settled since before the episode aired.
+    hit = cache.get(_PUBLISHED_NS, program_id, max_age=cache.ARTE_PUBLISHED_TTL)
+    if hit is not None:
+        return _as_datetime(hit)
+    if cache.get(_UNDATED_NS, program_id, max_age=cache.ARTE_UNDATED_TTL):
+        return None
+
     try:
         attributes = _config_attributes(program_id, lang)
     except FeedError:
         return None
 
     begin = (attributes.get("rights") or {}).get("begin")
-    if not begin:
+    published = _as_datetime(begin) if begin else None
+    if published is None:
+        # Remembered too, but briefly: usually this means the rights window has
+        # not been announced yet, and that changes.
+        cache.put(_UNDATED_NS, program_id, True)
         return None
+
+    cache.put(_PUBLISHED_NS, program_id, begin)
+    return published
+
+
+def _as_datetime(begin: object) -> datetime | None:
+    """Read an ARTE rights-window timestamp, or ``None`` if it isn't one."""
     try:
-        return datetime.fromisoformat(begin).astimezone(timezone.utc)
-    except ValueError:
+        return datetime.fromisoformat(str(begin)).astimezone(timezone.utc)
+    except (TypeError, ValueError):
         return None
 
 
@@ -451,9 +478,10 @@ def _run_ffmpeg(
     ]
 
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, check=False
-        )
+        with timing.step("ffmpeg"):
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout, check=False
+            )
     except subprocess.TimeoutExpired as exc:
         raise FeedError(f"ffmpeg timed out after {timeout:.0f}s") from exc
     except OSError as exc:

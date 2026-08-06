@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import re
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from html import unescape
@@ -20,6 +22,17 @@ from html.parser import HTMLParser
 from urllib.parse import urlsplit
 
 import feedparser
+
+from . import cache, timing
+
+# Cache namespace for the ETag / Last-Modified a feed last handed out.
+_HTTP_NS = "feed_http"
+
+# How hard to lean on a network read before calling the feed lost. Three tries
+# two and four seconds apart covers the gap between a machine waking and its
+# network coming up, without holding a run open long enough to matter.
+RETRY_ATTEMPTS = 3
+RETRY_DELAY = 2.0
 
 # Extensions that mark an enclosure as audio when its declared type doesn't.
 AUDIO_SUFFIXES = (
@@ -106,6 +119,43 @@ _MAPPED_ENTRY_KEYS = frozenset(
 
 class FeedError(Exception):
     """Raised when feed configuration or a feed itself cannot be read."""
+
+
+class SourceBlocked(FeedError):
+    """Raised when a source isn't reachable from this machine on purpose.
+
+    Distinct from a plain :class:`FeedError` because it means something
+    different to the caller and to whoever reads the log: nothing is broken. A
+    network-level filter — a DNS profile, a firewall, a schedule that only opens
+    at night — is doing exactly what it was set up to do, and the feed will read
+    fine the next time the window is open. So this is reported as a skip rather
+    than a failure, and leaves no traceback behind.
+    """
+
+
+def retrying[T](
+    work: Callable[[], T], *, attempts: int = RETRY_ATTEMPTS, delay: float = RETRY_DELAY
+) -> T:
+    """Call ``work``, trying again if it fails for a reason the network caused.
+
+    This runs unattended, on a laptop that sleeps, over a link that occasionally
+    isn't there yet: a name that won't resolve, a connection refused a second
+    after wake, a reset mid-read. Those cost a feed its whole run and a day of
+    its items, and they are almost always gone by the time anyone looks. A
+    couple of seconds spent asking again is cheaper than that.
+
+    Only :class:`OSError` causes are retried — ``URLError``, timeouts, resets.
+    A feed whose XML doesn't parse will not parse any better the second time, so
+    it fails immediately.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return work()
+        except FeedError as exc:
+            if attempt == attempts or not isinstance(exc.__cause__, OSError):
+                raise
+            time.sleep(delay * attempt)
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 @dataclass(frozen=True)
@@ -430,6 +480,48 @@ def _numeric_filter(
     return FeedFilter(field=field_name, op=op, values=(text,))
 
 
+def _read(url: str) -> feedparser.FeedParserDict:
+    """Fetch and parse ``url``, raising :class:`FeedError` if it can't be read.
+
+    feedparser doesn't raise on network or parse trouble; it records it on the
+    result instead. Turning that back into an exception — and chaining the cause
+    it recorded — is what lets :func:`retrying` tell a link that was briefly
+    down from a feed that is genuinely broken.
+
+    The validators the feed handed out last time go back with the request, so a
+    feed with nothing new answers ``304`` and sends no body at all. rssignal is
+    built to be run often and mostly find nothing, which is exactly the case that
+    pays for.
+    """
+    known = cache.get(_HTTP_NS, url) or {}
+    # Passed only when there is something to pass, so a feed nobody has a
+    # validator for is fetched exactly as it always was.
+    conditional = {
+        name: known[name]
+        for name in ("etag", "modified")
+        if isinstance(known, dict) and known.get(name)
+    }
+    parsed = feedparser.parse(url, **conditional)
+
+    if getattr(parsed, "status", None) == 304:
+        # Unchanged since last time; there is no body to look at and no reason to
+        # have wanted one. Handled before the bozo check below, which would
+        # otherwise read an empty 304 as a feed that failed to parse.
+        return parsed
+
+    etag = getattr(parsed, "etag", None)
+    modified = getattr(parsed, "modified", None)
+    if etag or modified:
+        cache.put(_HTTP_NS, url, {"etag": etag, "modified": modified})
+
+    if getattr(parsed, "bozo", False) and not parsed.entries:
+        exc = getattr(parsed, "bozo_exception", None)
+        raise FeedError(
+            f"Could not read feed {url!r}: {exc or 'unknown error'}"
+        ) from (exc if isinstance(exc, BaseException) else None)
+    return parsed
+
+
 def parse_feed(cfg: FeedConfig) -> ParsedFeed:
     """Fetch and parse ``cfg.url`` into a :class:`ParsedFeed`.
 
@@ -443,11 +535,21 @@ def parse_feed(cfg: FeedConfig) -> ParsedFeed:
     A video item also gets the one thing its feed tends to leave out — how long
     the video is — so that ``duration_seconds`` is an ordinary field like any
     other. See :func:`~rssignal.video.annotate_durations`.
+
+    Raises :class:`SourceBlocked` before doing any of that, if the source turns
+    out to be one this machine currently can't reach at all.
     """
     # Imported here, not at the top: rssignal.video builds FeedItems and so
     # imports this module. Deferring it keeps that one-way and leaves feeds.py
     # free of any knowledge of what video sources exist.
-    from .video import annotate_durations, channel_feed_url, collection_feed
+    from .video import (
+        annotate_durations,
+        channel_feed_url,
+        check_source_available,
+        collection_feed,
+    )
+
+    check_source_available(cfg.url)
 
     collection = collection_feed(cfg)
     if collection is not None:
@@ -457,11 +559,14 @@ def parse_feed(cfg: FeedConfig) -> ParsedFeed:
     if feed_url:
         cfg = replace(cfg, url=feed_url)
 
-    parsed = feedparser.parse(cfg.url)
-    # feedparser doesn't raise on network/parse trouble; it records it instead.
-    if getattr(parsed, "bozo", False) and not parsed.entries:
-        exc = getattr(parsed, "bozo_exception", "unknown error")
-        raise FeedError(f"Could not read feed {cfg.url!r}: {exc}")
+    with timing.step("feedparser", cfg.name or cfg.url):
+        parsed = retrying(lambda: _read(cfg.url))
+
+    if getattr(parsed, "status", None) == 304:
+        # Nothing has changed since the last run, so there is nothing to build
+        # and — the part worth the early return — nothing to look durations up
+        # for either, which is a yt-dlp launch this feed now never pays.
+        return ParsedFeed(items=[], image_url=None, description="")
 
     channel = getattr(parsed, "feed", None) or {}
     cget = channel.get if hasattr(channel, "get") else lambda k, d=None: getattr(channel, k, d)

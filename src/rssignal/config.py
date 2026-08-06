@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 from dataclasses import dataclass
 
@@ -52,6 +53,21 @@ def load_dotenv(path: str = ".env", *, override: bool = False) -> dict[str, str]
     return parsed
 
 
+@functools.lru_cache(maxsize=None)
+def _load_dotenv_once(path: str) -> None:
+    """:func:`load_dotenv`, but only the first time for a given path.
+
+    Loading is idempotent — it writes into ``os.environ`` and existing variables
+    win — so skipping repeats changes nothing except how often the file is read.
+    """
+    load_dotenv(path)
+
+
+def forget_dotenv() -> None:
+    """Let the next :func:`get_config` read the ``.env`` file again."""
+    _load_dotenv_once.cache_clear()
+
+
 @dataclass(frozen=True)
 class Config:
     """Runtime configuration for rssignal."""
@@ -66,8 +82,15 @@ def get_config(env_file: str = ".env") -> Config:
     Reads ``RSSIGNAL_ACCOUNT`` (required, E.164) and ``RSSIGNAL_RECIPIENT``
     (optional default recipient). Raises :class:`ConfigError` if the account is
     not set.
+
+    The ``.env`` file is read once per path rather than on every call. Every
+    ``signal-cli`` wrapper asks for the config, so a run was re-opening and
+    re-parsing the same small file dozens of times to reach the same answer —
+    and, now that feeds are fetched in parallel, doing it from several threads
+    onto the same :data:`os.environ`. Call :func:`forget_dotenv` if the file
+    changes underneath a long-lived process.
     """
-    load_dotenv(env_file)
+    _load_dotenv_once(env_file)
 
     account = os.environ.get("RSSIGNAL_ACCOUNT", "").strip()
     if not account:

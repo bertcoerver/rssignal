@@ -545,7 +545,7 @@ def test_parse_feed_routes_a_collection_url_to_arte(monkeypatch):
 
     _patch_collection(monkeypatch)
 
-    def fail(url):
+    def fail(url, **kwargs):
         raise AssertionError("feedparser must not be used for a collection url")
 
     monkeypatch.setattr(feeds.feedparser, "parse", fail)

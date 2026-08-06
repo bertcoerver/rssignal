@@ -2,6 +2,7 @@
 
 import json
 from datetime import datetime, timedelta, timezone
+from urllib.error import URLError
 
 import pytest
 
@@ -105,7 +106,7 @@ def test_parse_feed_regular(monkeypatch):
             "published_parsed": (2026, 7, 20, 10, 0, 0, 0, 0, 0),
         }
     ]
-    monkeypatch.setattr(feeds.feedparser, "parse", lambda url: fake)
+    monkeypatch.setattr(feeds.feedparser, "parse", lambda url, **kwargs: fake)
 
     items = parse_feed(FeedConfig(url="https://a")).items
 
@@ -130,7 +131,7 @@ def test_parse_feed_podcast_enclosure(monkeypatch):
             "enclosures": [{"href": "https://a/ep1.mp3", "type": "audio/mpeg"}],
         }
     ]
-    monkeypatch.setattr(feeds.feedparser, "parse", lambda url: fake)
+    monkeypatch.setattr(feeds.feedparser, "parse", lambda url, **kwargs: fake)
 
     item = parse_feed(FeedConfig(url="https://a")).items[0]
 
@@ -143,10 +144,47 @@ def test_parse_feed_bozo_no_entries_raises(monkeypatch):
     fake.bozo = True
     fake.bozo_exception = "malformed"
     fake.entries = []
-    monkeypatch.setattr(feeds.feedparser, "parse", lambda url: fake)
+    monkeypatch.setattr(feeds.feedparser, "parse", lambda url, **kwargs: fake)
 
     with pytest.raises(FeedError):
         parse_feed(FeedConfig(url="https://a"))
+
+
+def _unreadable(exception):
+    fake = type("Parsed", (), {})()
+    fake.bozo = True
+    fake.bozo_exception = exception
+    fake.entries = []
+    return fake
+
+
+def test_parse_feed_retries_when_the_feed_could_not_be_reached(monkeypatch):
+    calls = []
+
+    def flaky(url, **kwargs):
+        calls.append(url)
+        if len(calls) < 3:
+            return _unreadable(URLError("nodename nor servname provided"))
+        return _parsed([{"title": "Ep", "link": _MP3}])
+
+    monkeypatch.setattr(feeds.feedparser, "parse", flaky)
+
+    assert parse_feed(FeedConfig(url="https://a")).items
+    assert len(calls) == 3
+
+
+def test_parse_feed_does_not_retry_malformed_markup(monkeypatch):
+    calls = []
+
+    def malformed(url, **kwargs):
+        calls.append(url)
+        return _unreadable("malformed")
+
+    monkeypatch.setattr(feeds.feedparser, "parse", malformed)
+
+    with pytest.raises(FeedError):
+        parse_feed(FeedConfig(url="https://a"))
+    assert len(calls) == 1
 
 
 def _item(published):
@@ -277,7 +315,7 @@ def test_parse_feed_lifts_author_categories_and_extras(monkeypatch):
             "title_detail": {"value": "Episode 1"},
         }
     ]
-    monkeypatch.setattr(feeds.feedparser, "parse", lambda url: fake)
+    monkeypatch.setattr(feeds.feedparser, "parse", lambda url, **kwargs: fake)
 
     item = parse_feed(FeedConfig(url="https://a", name="Pod")).items[0]
 
@@ -488,7 +526,7 @@ def _parsed(entries, feed=None):
 
 def _parse_one(monkeypatch, entry, feed=None):
     monkeypatch.setattr(
-        feeds.feedparser, "parse", lambda url: _parsed([entry], feed)
+        feeds.feedparser, "parse", lambda url, **kwargs: _parsed([entry], feed)
     )
     return parse_feed(FeedConfig(url="https://a")).items[0]
 
@@ -737,7 +775,7 @@ _MP3 = "https://pod.example/file/show/54321/an-episode.mp3?token=abc"
 def _extracted(monkeypatch, pattern):
     """Parse a one-item feed through a single ``episode_id`` rule."""
     monkeypatch.setattr(
-        feeds.feedparser, "parse", lambda url: _parsed([{"title": "Ep", "link": _MP3}])
+        feeds.feedparser, "parse", lambda url, **kwargs: _parsed([{"title": "Ep", "link": _MP3}])
     )
     cfg = FeedConfig(
         url="https://a",
@@ -878,7 +916,7 @@ def test_parse_feed_takes_the_channel_description(monkeypatch):
     monkeypatch.setattr(
         feeds.feedparser,
         "parse",
-        lambda url: _parsed([{"title": "Ep"}], {"summary": "<p>A daily &amp; show</p>"}),
+        lambda url, **kwargs: _parsed([{"title": "Ep"}], {"summary": "<p>A daily &amp; show</p>"}),
     )
     parsed = parse_feed(FeedConfig(url="https://a"))
     # HTML is stripped: it becomes a Signal group description, not a web page.
@@ -889,7 +927,7 @@ def test_parse_feed_falls_back_to_the_channel_subtitle(monkeypatch):
     monkeypatch.setattr(
         feeds.feedparser,
         "parse",
-        lambda url: _parsed([{"title": "Ep"}], {"subtitle": "Short blurb"}),
+        lambda url, **kwargs: _parsed([{"title": "Ep"}], {"subtitle": "Short blurb"}),
     )
     assert parse_feed(FeedConfig(url="https://a")).description == (
         "Short blurb"
@@ -898,7 +936,7 @@ def test_parse_feed_falls_back_to_the_channel_subtitle(monkeypatch):
 
 def test_parse_feed_without_a_channel_description(monkeypatch):
     monkeypatch.setattr(
-        feeds.feedparser, "parse", lambda url: _parsed([{"title": "Ep"}])
+        feeds.feedparser, "parse", lambda url, **kwargs: _parsed([{"title": "Ep"}])
     )
     assert parse_feed(FeedConfig(url="https://a")).description == ""
 
@@ -908,6 +946,6 @@ def test_channel_description_does_not_leak_into_items(monkeypatch):
     monkeypatch.setattr(
         feeds.feedparser,
         "parse",
-        lambda url: _parsed([{"title": "Ep"}], {"summary": "Show blurb"}),
+        lambda url, **kwargs: _parsed([{"title": "Ep"}], {"summary": "Show blurb"}),
     )
     assert parse_feed(FeedConfig(url="https://a")).items[0].description == ""

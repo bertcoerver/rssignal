@@ -18,12 +18,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 
 from PIL import Image, UnidentifiedImageError
 
-from .config import get_config
+from . import timing
+from .config import ConfigError, get_config
 from .watermark import compose_description, read_watermark, shorten
 
 # Signal silently drops a group avatar that is too large: the upload is accepted,
@@ -33,6 +36,16 @@ from .watermark import compose_description, read_watermark, shorten
 # arriving intact on a card, so previews are sent at their original size rather
 # than needlessly degraded.
 GROUP_AVATAR_MAX_PX = 512
+
+# How long `signal-cli receive` keeps listening after the queue falls quiet. See
+# :func:`receive` — this is idle waiting, not work, so it is kept short enough to
+# disappear into the window a run already spends fetching feeds.
+DEFAULT_RECEIVE_TIMEOUT = 5.0
+RECEIVE_TIMEOUT_ENV = "RSSIGNAL_RECEIVE_TIMEOUT"
+
+# Set to 0 to make every signal-cli call start its own process again. See
+# :func:`daemon_enabled`.
+DAEMON_ENV = "RSSIGNAL_DAEMON"
 
 # Signal caps group descriptions, but signal-cli documents no figure and rejects
 # nothing locally. This is a conservative cap so a long feed blurb is shortened
@@ -173,7 +186,7 @@ def list_accounts() -> list[str]:
     return accounts
 
 
-def receive(*, account: str | None = None, timeout: float = 10) -> None:
+def receive(*, account: str | None = None, timeout: float | None = None) -> None:
     """Drain the incoming message queue, updating local state.
 
     rssignal runs as a linked secondary device, so it only learns about new
@@ -182,18 +195,48 @@ def receive(*, account: str | None = None, timeout: float = 10) -> None:
     stays invisible until those messages are received at least once.
 
     Incoming message content is discarded — this is called for its side effect on
-    local state. ``timeout`` is how long signal-cli waits for more messages
-    before returning.
+    local state. ``timeout`` is how long signal-cli keeps listening for *further*
+    messages once the queue has gone quiet, so it is idle waiting rather than
+    work: whatever was queued has already arrived by the time it starts counting.
+    That makes it the single longest thing an otherwise empty run does, which is
+    why it defaults low and why :func:`rssignal.run.run_feeds` starts it
+    alongside the feed fetches — at :data:`DEFAULT_RECEIVE_TIMEOUT` it finishes
+    inside that window and costs the run nothing at all.
+
+    Raise it with :data:`RECEIVE_TIMEOUT_ENV` on a slow or busy link, where sync
+    messages may still be arriving after the queue first falls quiet.
     """
+    if timeout is None:
+        try:
+            timeout = float(
+                os.environ.get(RECEIVE_TIMEOUT_ENV, "") or DEFAULT_RECEIVE_TIMEOUT
+            )
+        except ValueError:
+            timeout = DEFAULT_RECEIVE_TIMEOUT
+
+    if _daemon is not None:
+        # jsonRpc mode receives on its own from the moment it starts, so there
+        # is no call to make here — but there is still a wait to keep. What the
+        # timeout buys is the queue being *drained* before the group listing is
+        # read, and the reason that matters is in
+        # :class:`rssignal.run._GroupResolver`: a group you have left goes on
+        # reading as active until the sync messages land, and sending into it
+        # fails silently. So the window stays; only the JVM start goes away.
+        # Nothing is lost to waiting here, because a run spends it fetching.
+        with timing.step("signal-cli", "receive (daemon settle)"):
+            time.sleep(timeout)
+        return
+
     binary = find_signal_cli()
     if account is None:
         account = get_config().account
 
-    result = subprocess.run(
-        [binary, "-a", account, "receive", "--timeout", str(timeout)],
-        capture_output=True,
-        text=True,
-    )
+    with timing.step("signal-cli", "receive"):
+        result = subprocess.run(
+            [binary, "-a", account, "receive", "--timeout", str(timeout)],
+            capture_output=True,
+            text=True,
+        )
     if result.returncode != 0:
         raise SignalSendError(
             "`signal-cli receive` failed.",
@@ -224,6 +267,210 @@ class SignalGroup:
         return f"{GROUP_PREFIX}{self.id}"
 
 
+def daemon_enabled() -> bool:
+    """Whether a run may keep one ``signal-cli`` alive instead of many.
+
+    On by default. Set :data:`DAEMON_ENV` to ``0`` to go back to a fresh
+    ``signal-cli`` per call — slower, but it is the path rssignal used for its
+    whole life before this, so it is the thing to try first if sending ever
+    starts behaving oddly.
+    """
+    return os.environ.get(DAEMON_ENV, "").strip().lower() not in {"0", "false", "no"}
+
+
+def _bad_recipient(recipient: str) -> str:
+    """What to say about a recipient that is neither a number nor a group."""
+    return (
+        f"Recipient {recipient!r} is neither an E.164 number (starting with "
+        f"'+') nor a group. To send to a group, prefix its id with "
+        f"'{GROUP_PREFIX}' — `rssignal groups` prints ready-to-use values."
+    )
+
+
+class _JsonRpc:
+    """One ``signal-cli jsonRpc`` process, taking commands on its stdin.
+
+    Every one-shot ``signal-cli`` call pays a JVM start — a second and a half of
+    it, measured — and a run that sends a podcast episode makes three of them for
+    that one item. This starts the JVM once and keeps it, so the second call
+    costs a round trip down a pipe instead.
+
+    Requests are JSON-RPC, one object per line, answered on stdout. Replies can
+    be interleaved with *notifications* — jsonRpc mode receives incoming messages
+    on its own and reports them the same way — so a reader thread sorts them by
+    the ``id`` a reply carries and a notification hasn't, and hands each answer to
+    whoever is waiting for it. Incoming messages themselves are dropped: rssignal
+    publishes to Signal and reads nothing back.
+
+    Started in single-account mode (``-a ACCOUNT``), which is why no request here
+    passes an ``account`` param — in that mode signal-cli rejects one.
+    """
+
+    def __init__(self, account: str) -> None:
+        self.account = account
+        self._next_id = 0
+        self._pending: dict[str, dict] = {}
+        self._events: dict[str, threading.Event] = {}
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
+        self._reader: threading.Thread | None = None
+
+    def start(self) -> None:
+        binary = find_signal_cli()
+        with timing.step("signal-cli", "jsonRpc start"):
+            try:
+                self._proc = subprocess.Popen(
+                    [binary, "-a", self.account, "jsonRpc"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1,
+                )
+            except OSError as exc:
+                raise SignalError(f"Could not start `signal-cli jsonRpc`: {exc}")
+        self._reader = threading.Thread(target=self._read, daemon=True)
+        self._reader.start()
+
+    def _read(self) -> None:
+        """Sort replies from notifications until the process closes its stdout."""
+        assert self._proc is not None and self._proc.stdout is not None
+        for line in self._proc.stdout:
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(message, dict):
+                continue
+            key = message.get("id")
+            if key is None:
+                # A notification — an incoming Signal message. Not ours.
+                continue
+            with self._lock:
+                self._pending[str(key)] = message
+                event = self._events.get(str(key))
+            if event is not None:
+                event.set()
+
+        # stdout closed: signal-cli is gone. Release anyone still waiting rather
+        # than letting them sit out their whole timeout for an answer that can
+        # never come.
+        with self._lock:
+            events = list(self._events.values())
+        for event in events:
+            event.set()
+
+    def request(self, method: str, params: dict | None = None, *, timeout: float):
+        """Call ``method`` and return its result, raising on error or timeout."""
+        if self._proc is None or self._proc.stdin is None:
+            raise SignalError("signal-cli jsonRpc is not running.")
+
+        with self._lock:
+            self._next_id += 1
+            key = str(self._next_id)
+            event = threading.Event()
+            self._events[key] = event
+
+        payload = {"jsonrpc": "2.0", "method": method, "id": key}
+        if params:
+            payload["params"] = params
+
+        try:
+            with timing.step("signal-cli", method):
+                try:
+                    self._proc.stdin.write(json.dumps(payload) + "\n")
+                    self._proc.stdin.flush()
+                except (OSError, ValueError) as exc:
+                    raise SignalSendError(
+                        f"`signal-cli {method}` could not be sent: {exc}"
+                    ) from exc
+
+                if not event.wait(timeout):
+                    raise SignalSendError(
+                        f"`signal-cli {method}` timed out after {timeout}s."
+                    )
+            with self._lock:
+                message = self._pending.pop(key, None)
+        finally:
+            with self._lock:
+                self._events.pop(key, None)
+
+        if message is None:
+            raise SignalSendError(
+                f"`signal-cli {method}` got no answer — signal-cli stopped."
+            )
+        if "error" in message:
+            error = message["error"] or {}
+            raise SignalSendError(
+                f"`signal-cli {method}` failed: "
+                f"{error.get('message') or error!r}"
+            )
+        return message.get("result")
+
+    def stop(self) -> None:
+        if self._proc is None:
+            return
+        try:
+            if self._proc.stdin is not None:
+                self._proc.stdin.close()
+            self._proc.terminate()
+            self._proc.wait(timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            self._proc.kill()
+        finally:
+            self._proc = None
+
+
+# The daemon in use, if a run has started one. Module-level because it is a
+# property of the run rather than of any one call: the wrappers below check it,
+# and everything outside a run keeps the one-shot behaviour it always had.
+_daemon: _JsonRpc | None = None
+
+
+@contextmanager
+def daemon(*, account: str | None = None):
+    """Run one ``signal-cli`` for the whole block instead of one per call.
+
+    Everything in :mod:`rssignal.signal_cli` routes through it while it is open
+    and falls back to a fresh ``signal-cli`` per call when it is not, so nothing
+    outside a run — ``rssignal send``, ``rssignal groups``, ``rssignal link`` —
+    changes behaviour or needs to know this exists.
+
+    A daemon that will not start is not an error. It is a speed measure, and the
+    one-shot path it replaces still works, so a failure here logs nothing, warns
+    nothing, and simply leaves the run to go the slow way.
+    """
+    global _daemon
+    if _daemon is not None:
+        yield _daemon
+        return
+
+    if not daemon_enabled():
+        yield None
+        return
+
+    try:
+        if account is None:
+            account = get_config().account
+    except ConfigError:
+        yield None
+        return
+
+    started = _JsonRpc(account)
+    try:
+        started.start()
+    except (SignalError, OSError):
+        yield None
+        return
+
+    _daemon = started
+    try:
+        yield started
+    finally:
+        _daemon = None
+        started.stop()
+
+
 def list_groups(*, account: str | None = None) -> list[SignalGroup]:
     """Return the groups the account belongs to, newest signal-cli order.
 
@@ -235,26 +482,31 @@ def list_groups(*, account: str | None = None) -> list[SignalGroup]:
     Groups you have left show up with ``active=False``; they are kept here and
     filtered at the call site so the caller can decide what to show.
     """
-    binary = find_signal_cli()
-    if account is None:
-        account = get_config().account
+    if _daemon is not None:
+        # Same objects as the -o json listing, so the parse below is shared.
+        raw = _daemon.request("listGroups", timeout=120) or []
+    else:
+        binary = find_signal_cli()
+        if account is None:
+            account = get_config().account
 
-    result = subprocess.run(
-        [binary, "-o", "json", "-a", account, "listGroups"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise SignalSendError(
-            "`signal-cli listGroups` failed.",
-            returncode=result.returncode,
-            stderr=result.stderr.strip(),
-        )
+        with timing.step("signal-cli", "listGroups"):
+            result = subprocess.run(
+                [binary, "-o", "json", "-a", account, "listGroups"],
+                capture_output=True,
+                text=True,
+            )
+        if result.returncode != 0:
+            raise SignalSendError(
+                "`signal-cli listGroups` failed.",
+                returncode=result.returncode,
+                stderr=result.stderr.strip(),
+            )
 
-    try:
-        raw = json.loads(result.stdout or "[]")
-    except json.JSONDecodeError as exc:
-        raise SignalError(f"Could not read `signal-cli listGroups` output: {exc}")
+        try:
+            raw = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError as exc:
+            raise SignalError(f"Could not read `signal-cli listGroups` output: {exc}")
 
     return [
         SignalGroup(
@@ -402,7 +654,10 @@ def create_group(
         argv.extend(["--set-permission-send-messages", "only-admins"])
 
     try:
-        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        with timing.step("signal-cli", "updateGroup (create)"):
+            result = subprocess.run(
+                argv, capture_output=True, text=True, timeout=timeout
+            )
     except subprocess.TimeoutExpired as exc:
         raise SignalSendError(
             f"`signal-cli updateGroup` timed out after {timeout}s. The group may "
@@ -593,6 +848,18 @@ def update_group(
     if description is None and avatar is None and expiration is None:
         return
 
+    if _daemon is not None:
+        with ExitStack() as stack:
+            params: dict = {"groupId": group_id}
+            if description is not None:
+                params["description"] = _clip(description)
+            if avatar is not None:
+                params["avatar"] = stack.enter_context(_avatar_within_limits(avatar))
+            if expiration is not None:
+                params["expiration"] = int(expiration)
+            _daemon.request("updateGroup", params, timeout=timeout)
+        return
+
     binary = find_signal_cli()
     if account is None:
         account = get_config().account
@@ -607,9 +874,10 @@ def update_group(
             argv.extend(["--expiration", str(expiration)])
 
         try:
-            result = subprocess.run(
-                argv, capture_output=True, text=True, timeout=timeout
-            )
+            with timing.step("signal-cli", "updateGroup"):
+                result = subprocess.run(
+                    argv, capture_output=True, text=True, timeout=timeout
+                )
         except subprocess.TimeoutExpired as exc:
             raise SignalSendError(
                 f"`signal-cli updateGroup` timed out after {timeout}s.",
@@ -742,6 +1010,34 @@ def send_msg(
             "`recipient=` or set a default in your environment / .env file."
         )
 
+    body = clip_body(msg, preview.url if preview else None)
+
+    if _daemon is not None:
+        # The same options as the argv below, under the names jsonRpc gives
+        # them: the camelCase of each long flag. Built separately rather than
+        # translated from argv, because a mapping between two spellings of the
+        # same thing is one more place for them to drift apart.
+        params: dict = {"message": body}
+        if attachments:
+            params["attachments"] = list(attachments)
+        if voice_note:
+            params["voiceNote"] = True
+        if preview is not None:
+            params["previewUrl"] = preview.url
+            params["previewTitle"] = preview.title
+            if preview.description:
+                params["previewDescription"] = preview.description
+            if preview.image:
+                params["previewImage"] = preview.image
+        if recipient.startswith(GROUP_PREFIX):
+            params["groupId"] = recipient[len(GROUP_PREFIX):]
+        elif recipient.startswith("+"):
+            params["recipient"] = [recipient]
+        else:
+            raise ValueError(_bad_recipient(recipient))
+        _daemon.request("send", params, timeout=timeout)
+        return
+
     # Options that take a fixed number of args go before ``-m msg``, so the
     # trailing positional recipient can't be swallowed by ``--attachment``'s
     # greedy arg list.
@@ -759,26 +1055,23 @@ def send_msg(
             argv.extend(["--preview-description", preview.description])
         if preview.image:
             argv.extend(["--preview-image", preview.image])
-    argv.extend(["-m", clip_body(msg, preview.url if preview else None)])
+    argv.extend(["-m", body])
     # Groups are addressed with -g rather than as a positional recipient.
     if recipient.startswith(GROUP_PREFIX):
         argv.extend(["-g", recipient[len(GROUP_PREFIX):]])
     elif recipient.startswith("+"):
         argv.append(recipient)
     else:
-        raise ValueError(
-            f"Recipient {recipient!r} is neither an E.164 number (starting with "
-            f"'+') nor a group. To send to a group, prefix its id with "
-            f"'{GROUP_PREFIX}' — `rssignal groups` prints ready-to-use values."
-        )
+        raise ValueError(_bad_recipient(recipient))
 
     try:
-        result = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        with timing.step("signal-cli", "send"):
+            result = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
     except subprocess.TimeoutExpired as exc:
         raise SignalSendError(
             f"`signal-cli send` timed out after {timeout}s.",

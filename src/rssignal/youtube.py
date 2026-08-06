@@ -36,8 +36,10 @@ import subprocess
 import sys
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
+from urllib.parse import urlparse
 
-from .feeds import FeedError, FeedItem
+from . import cache, timing
+from .feeds import FeedError, FeedItem, SourceBlocked
 from .video import SIZE_ESTIMATE_MARGIN, VIDEO_MAX_BYTES, VideoTooShort
 
 # A YouTube video, in any of the shapes a feed or a human might write it.
@@ -64,6 +66,23 @@ YOUTUBE_CHANNEL_RE = re.compile(
 YOUTUBE_FEED = "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
 YOUTUBE_WATCH = "https://www.youtube.com/watch?v={video_id}"
 YOUTUBE_UPLOADS = "https://www.youtube.com/channel/{channel_id}/videos"
+
+# What the reachability probe asks for. The host is the whole question, so it
+# asks for as little of it as there is.
+YOUTUBE_PROBE = "https://www.youtube.com/"
+
+# Hosts a YouTube feed or video is read from, and so the ones a network-level
+# block takes out. Matched as whole labels, not substrings, so that a lookalike
+# domain can't pass for one of these.
+YOUTUBE_HOSTS = frozenset(
+    {
+        "youtube.com",
+        "www.youtube.com",
+        "m.youtube.com",
+        "music.youtube.com",
+        "youtu.be",
+    }
+)
 
 # The channel id, read back out of the feed url rssignal rewrote a channel to.
 FEED_CHANNEL_RE = re.compile(r"[?&]channel_id=(?P<channel_id>UC[\w-]+)")
@@ -100,6 +119,11 @@ _BOT_CHECK = "not a bot"
 _VIDEO_CODEC = "avc1"
 _AUDIO_CODEC = "mp4a"
 
+# Cache namespaces: what channel an address names, and how long that channel's
+# latest uploads are. See :mod:`rssignal.cache`.
+_CHANNEL_NS = "youtube_channel_id"
+_DURATIONS_NS = "youtube_durations"
+
 
 @dataclass(frozen=True)
 class YoutubePlan:
@@ -127,6 +151,42 @@ class YoutubePlan:
     def fetch(self, into: str, *, timeout: float) -> str:
         """Download the chosen formats into ``into``, returning the file's path."""
         return _run_download(self.url, self.selector, into, timeout=timeout)
+
+
+def is_youtube_url(url: str | None) -> bool:
+    """Whether ``url`` is one that would be read from YouTube."""
+    if not url:
+        return False
+    return (urlparse(url).hostname or "").lower() in YOUTUBE_HOSTS
+
+
+def check_available(url: str) -> None:
+    """Raise :class:`SourceBlocked` if ``url`` is YouTube's and YouTube is not up.
+
+    Reading a YouTube feed means several requests through yt-dlp, each with its
+    own minute-long timeout. When the host is not reachable at all, those spend
+    minutes arriving at what one HEAD request answers in milliseconds, and leave
+    a page of traceback for a condition that isn't a fault.
+
+    The case this is really for is a scheduled DNS-level block — a NextDNS
+    profile that closes YouTube during the day and opens it at night. A run that
+    lands inside the closed window should say so in one line and move on to the
+    other feeds; the next run inside the open window reads the feed from the same
+    watermark, having lost nothing.
+
+    Anything that isn't a YouTube url returns immediately, so a config with no
+    YouTube in it never pays for this.
+    """
+    if not is_youtube_url(url):
+        return
+
+    from .download import reachable
+
+    if not reachable(YOUTUBE_PROBE):
+        raise SourceBlocked(
+            f"{YOUTUBE_PROBE} is not reachable from here — a DNS or firewall "
+            "block, not a broken feed. Skipping until it lifts."
+        )
 
 
 def youtube_video_id(link: str | None) -> str | None:
@@ -232,7 +292,16 @@ def resolve(item: FeedItem, *, max_bytes: int = VIDEO_MAX_BYTES) -> YoutubePlan:
 
 
 def _channel_id(url: str) -> str:
-    """Ask yt-dlp what channel ``url`` names."""
+    """Ask yt-dlp what channel ``url`` names, or recall what it said last time.
+
+    Worth remembering because the answer is fixed — a handle names the channel it
+    was created for — while asking costs a yt-dlp launch and a signed-out request
+    to YouTube, on every run, for a feed whose address never changes.
+    """
+    hit = cache.get(_CHANNEL_NS, url, max_age=cache.YOUTUBE_CHANNEL_TTL)
+    if isinstance(hit, str) and hit.startswith("UC"):
+        return hit
+
     info = _ytdlp_json(
         ["--flat-playlist", "--playlist-items", "1", url],
         timeout=YTDLP_QUERY_TIMEOUT,
@@ -240,6 +309,7 @@ def _channel_id(url: str) -> str:
     channel_id = info.get("channel_id") or info.get("uploader_id")
     if not channel_id or not str(channel_id).startswith("UC"):
         raise FeedError(f"Could not work out the channel id for {url!r}")
+    cache.put(_CHANNEL_NS, url, str(channel_id))
     return str(channel_id)
 
 
@@ -248,7 +318,15 @@ def _channel_durations(channel_id: str) -> dict[str, float]:
 
     ``--flat-playlist`` is what makes this one request: yt-dlp lists the channel
     without opening any of the videos, and still reports each one's duration.
+
+    Held only briefly between runs — unlike the other things rssignal remembers,
+    this one really does go stale, because which fifteen uploads are the latest
+    changes every time the channel posts.
     """
+    hit = cache.get(_DURATIONS_NS, channel_id, max_age=cache.YOUTUBE_DURATIONS_TTL)
+    if isinstance(hit, dict):
+        return {str(k): float(v) for k, v in hit.items()}
+
     info = _ytdlp_json(
         [
             "--flat-playlist",
@@ -265,6 +343,7 @@ def _channel_durations(channel_id: str) -> dict[str, float]:
         duration = entry.get("duration")
         if video_id and duration:
             durations[str(video_id)] = float(duration)
+    cache.put(_DURATIONS_NS, channel_id, durations)
     return durations
 
 
@@ -460,13 +539,14 @@ def _run_ytdlp(args: list[str], *, timeout: float) -> subprocess.CompletedProces
         )
 
     try:
-        result = subprocess.run(
-            [binary, *_cookie_args(), *args],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
+        with timing.step("yt-dlp", args[0] if args else ""):
+            result = subprocess.run(
+                [binary, *_cookie_args(), *args],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
     except subprocess.TimeoutExpired as exc:
         raise FeedError(f"yt-dlp timed out after {timeout:.0f}s") from exc
     except OSError as exc:

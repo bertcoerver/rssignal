@@ -12,8 +12,8 @@ import subprocess
 
 import pytest
 
-from rssignal import youtube
-from rssignal.feeds import FeedError, FeedItem
+from rssignal import download, feeds, youtube
+from rssignal.feeds import FeedError, FeedItem, SourceBlocked
 from rssignal.video import VideoTooShort
 
 VIDEO_ID = "BFcjfKZ0BeI"
@@ -553,7 +553,7 @@ def test_parse_feed_rewrites_a_channel_url(monkeypatch):
         entries = []
         feed = {}
 
-    def fake_parse(url):
+    def fake_parse(url, **kwargs):
         seen.append(url)
         return FakeParsed()
 
@@ -566,3 +566,51 @@ def test_parse_feed_rewrites_a_channel_url(monkeypatch):
     assert seen == [
         "https://www.youtube.com/feeds/videos.xml?channel_id=UCHnyfMqiRRG1u-2MsSQLbXA"
     ]
+
+
+def test_is_youtube_url_matches_only_youtube_hosts():
+    assert youtube.is_youtube_url("https://www.youtube.com/@veritasium")
+    assert youtube.is_youtube_url(
+        "https://www.youtube.com/feeds/videos.xml?channel_id=UCHnyfMqiRRG1u-2MsSQLbXA"
+    )
+    assert youtube.is_youtube_url("https://youtu.be/BFcjfKZ0BeI")
+    # A lookalike domain must not be taken for the real one.
+    assert not youtube.is_youtube_url("https://youtube.com.evil.test/@a")
+    assert not youtube.is_youtube_url("https://api.arte.tv/x")
+    assert not youtube.is_youtube_url(None)
+
+
+def test_check_available_passes_when_youtube_answers(monkeypatch):
+    monkeypatch.setattr(download, "reachable", lambda url, **kwargs: True)
+    youtube.check_available("https://www.youtube.com/@veritasium")
+
+
+def test_check_available_raises_when_youtube_is_blocked(monkeypatch):
+    monkeypatch.setattr(download, "reachable", lambda url, **kwargs: False)
+
+    with pytest.raises(SourceBlocked):
+        youtube.check_available("https://www.youtube.com/@veritasium")
+
+
+def test_check_available_never_probes_for_a_non_youtube_url(monkeypatch):
+    def fail(url, **kwargs):
+        raise AssertionError("a non-YouTube feed must not pay for the probe")
+
+    monkeypatch.setattr(download, "reachable", fail)
+    youtube.check_available("https://waitbutwhy.com/feed")
+
+
+def test_a_blocked_youtube_feed_never_reaches_yt_dlp(monkeypatch):
+    """The point of the probe: no minute-long yt-dlp timeouts behind a block."""
+    monkeypatch.setattr(download, "reachable", lambda url, **kwargs: False)
+
+    def fail(*args, **kwargs):
+        raise AssertionError("yt-dlp must not run when YouTube is unreachable")
+
+    monkeypatch.setattr(youtube, "_run_ytdlp", fail)
+    monkeypatch.setattr(feeds.feedparser, "parse", fail)
+
+    with pytest.raises(SourceBlocked):
+        feeds.parse_feed(
+            feeds.FeedConfig(url="https://www.youtube.com/@veritasium", name="V")
+        )

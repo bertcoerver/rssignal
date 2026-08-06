@@ -19,6 +19,7 @@ import shutil
 import sys
 from datetime import datetime, timezone
 
+from . import timing
 from .config import ConfigError, get_config
 from .errorlog import log_exception, log_path
 from .feeds import (
@@ -104,12 +105,19 @@ def _cmd_send(args: argparse.Namespace) -> int:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    count = run_feeds(
-        args.config,
-        dry_run=args.dry_run,
-        to=args.to,
-        since=_parse_since(args.since),
-    )
+    if getattr(args, "timings", False):
+        timing.enable()
+    try:
+        count = run_feeds(
+            args.config,
+            dry_run=args.dry_run,
+            to=args.to,
+            since=_parse_since(args.since),
+        )
+    finally:
+        # Reported even when the run blew up: a run that died after forty
+        # seconds is precisely the one you want the breakdown for.
+        timing.report()
     if args.dry_run:
         print(f"{count} item(s) would be sent (dry run).")
     else:
@@ -312,6 +320,11 @@ def _build_parser() -> argparse.ArgumentParser:
             "send items published after this ISO timestamp, ignoring what each "
             "group remembers (e.g. 2026-07-01, or 2026-07-01T09:00+02:00)"
         ),
+    )
+    run.add_argument(
+        "--timings",
+        action="store_true",
+        help="report on stderr how long each part of the run took",
     )
     run.set_defaults(func=_cmd_run)
 

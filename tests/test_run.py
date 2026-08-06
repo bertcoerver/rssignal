@@ -7,7 +7,14 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from rssignal import run
-from rssignal.feeds import FeedConfig, FeedError, FeedFilter, FeedItem, ParsedFeed
+from rssignal.feeds import (
+    FeedConfig,
+    FeedError,
+    FeedFilter,
+    FeedItem,
+    ParsedFeed,
+    SourceBlocked,
+)
 from rssignal.run import run_feeds
 from rssignal.signal_cli import LinkPreview, SignalError, SignalGroup
 from rssignal.video import VideoTooShort
@@ -1191,6 +1198,29 @@ def test_run_carries_on_after_a_feed_fails_to_parse(monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "[Broken] skipped: could not read the feed" in err
     assert "1 of 2 feed(s) failed" in err
+
+
+def test_run_reports_a_blocked_source_as_a_skip_not_a_failure(
+    monkeypatch, capsys, error_log
+):
+    # A DNS profile that closes YouTube during the day is not a fault: the other
+    # feeds go, the line says why, and nothing is written to the traceback log.
+    def parse(cfg):
+        if cfg is _BROKEN:
+            raise SourceBlocked("youtube.com is not reachable from here")
+        return _one_item(cfg)
+
+    _patch_two_feeds(monkeypatch, parse)
+    sends = _capture_sends(monkeypatch)
+
+    assert run_feeds("feeds.json") == 1
+    assert [s["text"].splitlines()[0] for s in sends] == ["Fine"]
+
+    err = capsys.readouterr().err
+    assert "[Broken] skipped: youtube.com is not reachable from here" in err
+    assert "1 of 2 feed(s) skipped: source blocked" in err
+    assert "failed" not in err
+    assert not error_log.exists()
 
 
 def test_run_logs_the_traceback_of_a_failed_feed(monkeypatch, capsys, error_log):
