@@ -343,9 +343,14 @@ def _run_prepared(
         except SourceBlocked as exc:
             # Nothing went wrong, so this is not counted with the failures and
             # leaves no traceback: the source is deliberately unreachable right
-            # now and the watermark is waiting for the next run.
+            # now and the watermark is waiting for the next run. It does get a
+            # line in the log, though — an unattended run throws stderr away, and
+            # "that feed has gone quiet" is a question worth being able to answer
+            # afterwards without guessing at which evenings the block was on.
             blocked += 1
-            print(f"[{cfg.name or cfg.url}] skipped: {exc}", file=sys.stderr)
+            name = cfg.name or cfg.url
+            print(f"[{name}] skipped: {exc}", file=sys.stderr)
+            log_line(f"[{name}] skipped: {exc}")
         except Exception as exc:
             failed += 1
             logged = _report_feed_failure(cfg, exc) or logged

@@ -1225,6 +1225,24 @@ def test_run_reports_a_blocked_source_as_a_skip_not_a_failure(
     assert "Traceback" not in error_log.read_text()
 
 
+def test_run_logs_which_feeds_were_blocked(monkeypatch, error_log):
+    # stderr is thrown away by a scheduled run, and "why has that feed gone
+    # quiet?" is asked days later. One stamped line, no traceback.
+    def parse(cfg):
+        if cfg is _BROKEN:
+            raise SourceBlocked("youtube.com is not reachable from here")
+        return _one_item(cfg)
+
+    _patch_two_feeds(monkeypatch, parse)
+    _capture_sends(monkeypatch)
+
+    run_feeds("feeds.json")
+
+    logged = error_log.read_text()
+    assert "[Broken] skipped: youtube.com is not reachable from here" in logged
+    assert "Traceback" not in logged
+
+
 def test_run_logs_the_traceback_of_a_failed_feed(monkeypatch, capsys, error_log):
     # stderr gets a line; the file gets what you actually need to debug it,
     # and is still there when the unattended run is long over.

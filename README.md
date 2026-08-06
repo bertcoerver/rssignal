@@ -818,6 +818,21 @@ A run stopped in a way rssignal can see (Ctrl-C, a scheduler shutting it down,
 an unreadable config) logs `run aborted after …` instead, so that case is not
 mistaken for a kill.
 
+### Why has that feed gone quiet?
+
+A feed skipped because its source is [blocked](#blocked-sources) is not a failure
+and writes no traceback, but it does get a line of its own, naming the feed:
+
+```
+2026-08-06 20:14:11 +0200  [Last Week Tonight] skipped: https://www.youtube.com/ is not reachable from here — a DNS or firewall block, not a broken feed. Skipping until it lifts.
+```
+
+Which is the difference between "my YouTube feeds are broken" and "my YouTube
+feeds only arrive after 21:00, because that is when the DNS profile opens" — a
+question asked days later, long after the stderr those runs printed to went
+nowhere. Nothing was missed: the feed's watermark hasn't moved, and the items
+arrive on the first run after the block lifts.
+
 ## How fast a run is
 
 A run does as little as it can get away with, in as few waits as it can.
