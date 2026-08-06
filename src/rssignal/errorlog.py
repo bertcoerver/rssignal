@@ -1,4 +1,5 @@
-"""Write full tracebacks to a file, so an unattended run leaves evidence.
+"""Write tracebacks and run boundaries to a file, so an unattended run leaves
+evidence.
 
 A feed that fails prints one line on stderr — enough to see *that* something
 went wrong, useless for working out *why*. When the run is a scheduled job or an
@@ -54,6 +55,23 @@ def log_exception(context: str, exc: BaseException) -> str | None:
     stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
     body = "".join(traceback.format_exception(exc))
     return _append(f"\n{'=' * 72}\n{stamp}  {context}\n{'=' * 72}\n{body}")
+
+
+def log_line(text: str) -> str | None:
+    """Append one stamped line — for facts about a run, not failures of one.
+
+    A traceback says why a feed went wrong; it says nothing about a run that
+    never got to have one. When the process is killed partway — a Shortcut that
+    hit its watchdog, a laptop that slept mid-upload — nothing is caught and
+    nothing is written, and the log afterwards is indistinguishable from a run
+    that had a quiet, successful evening.
+
+    So a run says when it started and when it stopped. A "started" line with no
+    "finished" under it is the trace a killed run leaves behind, and the only
+    way to tell that case from the quiet one.
+    """
+    stamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+    return _append(f"{stamp}  {text}\n")
 
 
 def _append(text: str) -> str | None:

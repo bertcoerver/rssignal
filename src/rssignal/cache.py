@@ -7,7 +7,8 @@ which is what lets rssignal run from anywhere, on a machine that keeps no state,
 and still never send an item twice. Deleting this file costs one slow run and
 changes nothing about the outcome of it. That property is worth protecting: if
 something ever needs to be cached that *would* change what gets sent, it does
-not belong in here.
+not belong in here. One thing does, and doesn't — see :mod:`rssignal.pending`,
+which keeps its own file beside this one.
 
 What it holds is the work a run repeats for no reason. An ARTE programme's
 rights window began when it began; a YouTube ``@handle`` has named the same

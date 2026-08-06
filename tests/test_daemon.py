@@ -11,11 +11,20 @@ message that silently never arrives.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from rssignal import signal_cli
 from rssignal.signal_cli import LinkPreview, SignalError, send_msg, update_group
+
+FAKE_BIN = "/usr/local/bin/signal-cli"
+
+
+@pytest.fixture
+def have_binary(monkeypatch):
+    """Pretend signal-cli is installed, for the fall-back path to reach for."""
+    monkeypatch.setattr(signal_cli.shutil, "which", lambda name: FAKE_BIN)
 
 
 class FakeRpc:
@@ -239,3 +248,169 @@ def test_an_error_reply_becomes_a_signal_error(monkeypatch):
 
     with pytest.raises(signal_cli.SignalSendError, match="No recipients given"):
         rpc.request("send", {}, timeout=5)
+
+
+# --- a daemon that dies mid-run --------------------------------------------
+
+
+class DeadRpc:
+    """A daemon whose process has gone, as every call after that would see it."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.stopped = False
+
+    def request(self, method, params=None, *, timeout):
+        self.calls += 1
+        raise signal_cli.DaemonGone(
+            f"`signal-cli {method}` got no answer — signal-cli stopped."
+        )
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+def test_a_waiter_released_with_no_reply_is_a_dead_daemon():
+    # What _read does when signal-cli's stdout closes: wake everyone waiting,
+    # with nothing to give them. That is the JVM having died, not a slow send —
+    # and it must be told apart from the timeout below, which is a live daemon
+    # taking too long.
+    rpc = signal_cli._JsonRpc("+31600000000")
+
+    class FakeProc:
+        class stdin:
+            @staticmethod
+            def write(text):
+                key = json.loads(text)["id"]
+                rpc._events[key].set()  # Released, but nothing in _pending.
+
+            @staticmethod
+            def flush():
+                pass
+
+    rpc._proc = FakeProc()
+
+    with pytest.raises(signal_cli.DaemonGone):
+        rpc.request("send", {}, timeout=5)
+
+
+def test_a_daemon_that_is_merely_slow_is_not_declared_dead():
+    rpc = signal_cli._JsonRpc("+31600000000")
+
+    class FakeProc:
+        class stdin:
+            @staticmethod
+            def write(text):
+                pass  # Alive, just not answering yet.
+
+            @staticmethod
+            def flush():
+                pass
+
+    rpc._proc = FakeProc()
+
+    with pytest.raises(signal_cli.SignalSendError) as excinfo:
+        rpc.request("send", {}, timeout=0.01)
+    assert not isinstance(excinfo.value, signal_cli.DaemonGone)
+
+
+def test_a_send_falls_back_to_one_shot_when_the_daemon_dies(
+    have_binary, monkeypatch, capsys
+):
+    dead = DeadRpc()
+    monkeypatch.setattr(signal_cli, "_daemon", dead)
+    argv_used = []
+    monkeypatch.setattr(
+        signal_cli.subprocess,
+        "run",
+        lambda argv, **k: argv_used.append(argv)
+        or SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    send_msg("hi", recipient="+31611111111", account="+31600000000")
+
+    # The message went out the slow way rather than being lost.
+    assert argv_used and "send" in argv_used[0]
+    assert dead.stopped
+    assert "Carrying on with one signal-cli per call" in capsys.readouterr().err
+
+
+def test_the_dead_daemon_is_not_consulted_again(have_binary, monkeypatch, capsys):
+    # The reason this matters: without retiring it, every feed left in the run
+    # rediscovers the same corpse and fails on it.
+    dead = DeadRpc()
+    monkeypatch.setattr(signal_cli, "_daemon", dead)
+    monkeypatch.setattr(
+        signal_cli.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    send_msg("one", recipient="+31611111111", account="+31600000000")
+    send_msg("two", recipient="+31611111111", account="+31600000000")
+
+    assert dead.calls == 1
+    assert signal_cli._daemon is None
+    capsys.readouterr()
+
+
+def test_a_dead_daemon_does_not_make_a_send_retry(have_binary, monkeypatch, capsys):
+    # DaemonGone is a SignalSendError, so it goes past the retry loop — which
+    # must not treat it as a blip and ask the dead pipe twice more.
+    dead = DeadRpc()
+    monkeypatch.setattr(signal_cli, "_daemon", dead)
+    monkeypatch.setattr(
+        signal_cli.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    send_msg("hi", recipient="+31611111111", account="+31600000000")
+
+    assert dead.calls == 1
+    capsys.readouterr()
+
+
+def test_update_group_falls_back_to_one_shot_when_the_daemon_dies(
+    have_binary, monkeypatch, capsys
+):
+    # The watermark rides on updateGroup, so losing this one loses a feed's
+    # place — the one call in a run that must not quietly fail.
+    dead = DeadRpc()
+    monkeypatch.setattr(signal_cli, "_daemon", dead)
+    argv_used = []
+    monkeypatch.setattr(
+        signal_cli.subprocess,
+        "run",
+        lambda argv, **k: argv_used.append(argv)
+        or SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    update_group("G=", description="a blurb", account="+31600000000")
+
+    assert argv_used and "updateGroup" in argv_used[0]
+    assert "--description" in argv_used[0]
+    capsys.readouterr()
+
+
+def test_list_groups_falls_back_to_one_shot_when_the_daemon_dies(
+    have_binary, monkeypatch, capsys
+):
+    dead = DeadRpc()
+    monkeypatch.setattr(signal_cli, "_daemon", dead)
+    monkeypatch.setattr(
+        signal_cli.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                [{"id": "G=", "name": "A Feed", "isMember": True, "description": "b"}]
+            ),
+            stderr="",
+        ),
+    )
+
+    groups = signal_cli.list_groups(account="+31600000000")
+
+    assert [g.name for g in groups] == ["A Feed"]
+    capsys.readouterr()

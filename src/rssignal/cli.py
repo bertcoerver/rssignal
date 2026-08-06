@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 
 from . import timing
 from .config import ConfigError, get_config
-from .errorlog import log_exception, log_path
+from .errorlog import log_exception, log_line, log_path
 from .feeds import (
     CORE_FIELDS,
     FeedConfig,
@@ -31,7 +31,7 @@ from .feeds import (
     parse_feed,
     render_message,
 )
-from .run import run_feeds
+from .run import AlreadyRunning, run_feeds
 from .signal_cli import (
     SignalError,
     create_group,
@@ -108,12 +108,21 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if getattr(args, "timings", False):
         timing.enable()
     try:
-        count = run_feeds(
-            args.config,
-            dry_run=args.dry_run,
-            to=args.to,
-            since=_parse_since(args.since),
-        )
+        try:
+            count = run_feeds(
+                args.config,
+                dry_run=args.dry_run,
+                to=args.to,
+                since=_parse_since(args.since),
+            )
+        except AlreadyRunning as exc:
+            # Exit 0: the last run being slow is not this run's failure, and an
+            # unattended caller — cron, a Shortcut — should not start reporting
+            # errors because a video took a while. Standing aside *is* the
+            # correct outcome, and the log line says it happened.
+            print(f"Nothing to do: {exc}.", file=sys.stderr)
+            log_line(f"run skipped: {exc}")
+            return 0
     finally:
         # Reported even when the run blew up: a run that died after forty
         # seconds is precisely the one you want the breakdown for.

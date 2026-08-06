@@ -1,12 +1,13 @@
 """Tests for rssignal.run (feeds, sending, and downloads are monkeypatched)."""
 
 import dataclasses
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from rssignal import run
+from rssignal import pending, run
 from rssignal.feeds import (
     FeedConfig,
     FeedError,
@@ -15,7 +16,7 @@ from rssignal.feeds import (
     ParsedFeed,
     SourceBlocked,
 )
-from rssignal.run import run_feeds
+from rssignal.run import AlreadyRunning, run_feeds, single_run
 from rssignal.signal_cli import LinkPreview, SignalError, SignalGroup
 from rssignal.video import VideoTooShort
 from rssignal.watermark import format_watermark, read_watermark
@@ -1204,7 +1205,8 @@ def test_run_reports_a_blocked_source_as_a_skip_not_a_failure(
     monkeypatch, capsys, error_log
 ):
     # A DNS profile that closes YouTube during the day is not a fault: the other
-    # feeds go, the line says why, and nothing is written to the traceback log.
+    # feeds go, the line says why, and no traceback is written. The log itself
+    # exists either way — every run marks its own start and end in it.
     def parse(cfg):
         if cfg is _BROKEN:
             raise SourceBlocked("youtube.com is not reachable from here")
@@ -1220,7 +1222,7 @@ def test_run_reports_a_blocked_source_as_a_skip_not_a_failure(
     assert "[Broken] skipped: youtube.com is not reachable from here" in err
     assert "1 of 2 feed(s) skipped: source blocked" in err
     assert "failed" not in err
-    assert not error_log.exists()
+    assert "Traceback" not in error_log.read_text()
 
 
 def test_run_logs_the_traceback_of_a_failed_feed(monkeypatch, capsys, error_log):
@@ -1259,6 +1261,100 @@ def test_run_appends_to_the_log_rather_than_replacing_it(monkeypatch, error_log)
     assert logged.startswith("something from an earlier run")
     # Both feeds failed, and both are in there.
     assert "feed 'Broken'" in logged and "feed 'Fine'" in logged
+
+
+def test_a_second_run_stands_aside(monkeypatch):
+    # The duplicate this exists to prevent: both runs read the same watermark,
+    # both decide the same items are new, both send them.
+    _patch_two_feeds(monkeypatch, _one_item)
+    sends = _capture_sends(monkeypatch)
+
+    with single_run():
+        with pytest.raises(AlreadyRunning):
+            run_feeds("feeds.json")
+
+    assert sends == []
+
+
+def test_the_lock_is_released_when_the_run_ends(monkeypatch):
+    _patch_two_feeds(monkeypatch, _one_item)
+    _capture_sends(monkeypatch)
+
+    assert run_feeds("feeds.json") == 2
+    # Nothing is holding it now, so the next run gets straight in.
+    with single_run():
+        pass
+
+
+def test_the_lock_is_released_when_the_run_fails(monkeypatch):
+    # A run that died must not lock the next one out — the file descriptor
+    # closing is what releases it, which happens however the block is left.
+    _patch_two_feeds(monkeypatch, _one_item)
+
+    def die(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(run, "_locked_run", die)
+
+    with pytest.raises(RuntimeError):
+        run_feeds("feeds.json")
+    with single_run():
+        pass
+
+
+def test_a_dry_run_takes_no_lock(monkeypatch, capsys):
+    # It sends nothing, so it can't collide with anything — and staying usable
+    # while a real run is going is the whole point of a dry run.
+    _patch_two_feeds(monkeypatch, _one_item)
+    _capture_sends(monkeypatch)
+
+    with single_run():
+        assert run_feeds("feeds.json", dry_run=True) == 2
+    capsys.readouterr()
+
+
+def test_run_logs_its_start_and_end(monkeypatch, error_log):
+    _patch_two_feeds(monkeypatch, _one_item)
+    _capture_sends(monkeypatch)
+
+    assert run_feeds("feeds.json") == 2
+
+    logged = error_log.read_text()
+    assert "run started: 2 feed(s)" in logged
+    assert "run finished in" in logged
+    assert "2 item(s) sent" in logged
+
+
+def test_run_killed_partway_leaves_a_start_with_no_end(monkeypatch, error_log):
+    # The whole point of the pair. Nothing here can simulate a SIGKILL, so this
+    # asserts the half that would survive one: the start line is written before
+    # any work happens, not alongside the end.
+    _patch_two_feeds(monkeypatch, _one_item)
+
+    def die(*args, **kwargs):
+        raise AssertionError("killed midway")
+
+    monkeypatch.setattr(run, "_run_prepared", die)
+
+    with pytest.raises(AssertionError):
+        run_feeds("feeds.json")
+
+    logged = error_log.read_text()
+    assert "run started" in logged
+    assert "run finished" not in logged
+    # A run that died where we could see it says so; one that was killed
+    # outright says nothing, and the missing line is the evidence.
+    assert "run aborted after" in logged
+
+
+def test_run_marks_a_dry_run_as_one(monkeypatch, error_log, capsys):
+    _patch_two_feeds(monkeypatch, _one_item)
+    _capture_sends(monkeypatch)
+
+    run_feeds("feeds.json", dry_run=True)
+    capsys.readouterr()
+
+    assert "run started (dry run)" in error_log.read_text()
 
 
 def test_run_survives_a_log_that_cannot_be_written(monkeypatch, capsys, tmp_path):
@@ -1340,3 +1436,157 @@ def test_run_still_raises_when_the_config_cannot_be_read(monkeypatch):
 
     with pytest.raises(FeedError):
         run_feeds("feeds.json")
+
+
+# --- an item that got half-way out -----------------------------------------
+#
+# A podcast episode with a card is two messages, and the gap between them is the
+# only place a run can leave an item neither sent nor unsent. The watermark
+# rollback brings the item back, which is right; what it must not do any more is
+# bring the card back with it.
+
+
+def _half_failing_sends(monkeypatch, *, fail_voice_notes):
+    """Capture sends, failing every voice note while ``fail_voice_notes`` is on.
+
+    The list is mutable on purpose: a test flips it off between runs to model the
+    upload working the second time round.
+    """
+    sends = []
+
+    def fake_send(
+        text, recipient=None, attachments=None, voice_note=False, preview=None
+    ):
+        if voice_note and fail_voice_notes[0]:
+            raise SignalError("Connection reset (PushNetworkException)")
+        sends.append(
+            {
+                "text": text,
+                "recipient": recipient,
+                "attachments": attachments,
+                "voice_note": voice_note,
+                "preview": preview,
+            }
+        )
+
+    monkeypatch.setattr(run, "send_msg", fake_send)
+    return sends
+
+
+def test_run_sends_only_the_missing_half_after_a_failed_voice_note(monkeypatch):
+    cfg = FeedConfig(url="https://a", name="Pod")
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
+    _fake_downloads(monkeypatch)
+    failing = [True]
+    sends = _half_failing_sends(monkeypatch, fail_voice_notes=failing)
+
+    run_feeds("feeds.json")  # The card lands; the upload doesn't.
+    assert [s["voice_note"] for s in sends] == [False]
+
+    # Same episode, next run: the watermark was rolled back so it comes round
+    # again, and it is the audio — not a second copy of the card — that goes out.
+    failing[0] = False
+    sends.clear()
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
+
+    assert run_feeds("feeds.json") == 1
+    assert [s["voice_note"] for s in sends] == [True]
+    assert sends[0]["attachments"] == ["/tmp/fake-ep.mp3"]
+
+
+def test_run_says_it_is_finishing_a_half_sent_item(monkeypatch, capsys):
+    cfg = FeedConfig(url="https://a", name="Pod")
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
+    _fake_downloads(monkeypatch)
+    failing = [True]
+    _half_failing_sends(monkeypatch, fail_voice_notes=failing)
+
+    run_feeds("feeds.json")
+    failing[0] = False
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
+    capsys.readouterr()
+
+    run_feeds("feeds.json")
+
+    assert "card already sent" in capsys.readouterr().err
+
+
+def test_run_owes_nothing_once_both_halves_are_out(monkeypatch):
+    # The note is cleared by the voice note landing, so an episode replayed with
+    # --since gets its card again rather than arriving as a bare audio file.
+    cfg = FeedConfig(url="https://a", name="Pod")
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
+    _fake_downloads(monkeypatch)
+    sends = _half_failing_sends(monkeypatch, fail_voice_notes=[False])
+
+    run_feeds("feeds.json")
+    assert len(sends) == 2
+
+    sends.clear()
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
+    run_feeds("feeds.json", since=NOW - timedelta(days=1))
+
+    assert [s["voice_note"] for s in sends] == [False, True]
+
+
+def test_run_owes_nothing_for_a_different_item(monkeypatch):
+    # The note names one item in one group. Nothing else may inherit it.
+    other = FeedItem(
+        title="Ep 2",
+        description="notes",
+        link="https://a/ep2.mp3",
+        enclosure_url="https://a/ep2.mp3",
+        image_url="https://a/ep.jpg",
+    )
+    cfg = FeedConfig(url="https://a", name="Pod")
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
+    _fake_downloads(monkeypatch)
+    failing = [True]
+    sends = _half_failing_sends(monkeypatch, fail_voice_notes=failing)
+
+    run_feeds("feeds.json")
+
+    failing[0] = False
+    sends.clear()
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [other]})
+    run_feeds("feeds.json")
+
+    assert [s["voice_note"] for s in sends] == [False, True]
+
+
+def test_run_writes_off_a_debt_that_is_never_paid(monkeypatch):
+    # An episode whose audio can never be sent would otherwise suppress its own
+    # card for good. After the TTL the item is treated as new again.
+    cfg = FeedConfig(url="https://a", name="Pod")
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
+    _fake_downloads(monkeypatch)
+    failing = [True]
+    sends = _half_failing_sends(monkeypatch, fail_voice_notes=failing)
+
+    run_feeds("feeds.json")
+
+    later = time.time() + pending.TTL + 1
+    monkeypatch.setattr(pending.time, "time", lambda: later)
+    failing[0] = False
+    sends.clear()
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
+    run_feeds("feeds.json")
+
+    assert [s["voice_note"] for s in sends] == [False, True]
+
+
+def test_run_sends_normally_when_the_note_cannot_be_written(monkeypatch, tmp_path):
+    # Everything here is best-effort: an unwritable note costs a duplicate card
+    # one day and must never cost a send.
+    # A real unwritable path rather than a patched one: the directory the note
+    # would live in is already a file.
+    blocked = tmp_path / "in-the-way"
+    blocked.write_text("not a directory")
+    monkeypatch.setenv(pending.PENDING_ENV, str(blocked / "pending.json"))
+    cfg = FeedConfig(url="https://a", name="Pod")
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
+    _fake_downloads(monkeypatch)
+    sends = _capture_sends(monkeypatch)
+
+    assert run_feeds("feeds.json") == 1
+    assert [s["voice_note"] for s in sends] == [False, True]

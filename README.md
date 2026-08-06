@@ -554,6 +554,22 @@ first, then the voice note on its own. Signal silently drops a preview card from
 any message that also has an attachment, so they cannot be combined. Setting
 `"link_preview": false` goes back to a single message.
 
+Two messages means two chances to fail, and the gap between them is the only
+moment in a run where an item is neither sent nor unsent. If the card arrives and
+the upload doesn't, the item's watermark is rolled back as usual — but the card
+that already landed is written down first, and the next run sends only the voice
+note:
+
+```
+[Pod] 'Episode 214': card already sent, sending only the voice note.
+```
+
+That note lives in `~/.cache/rssignal/pending.json` (or `$RSSIGNAL_PENDING`),
+written the moment the card lands, because the run that owes the voice note may
+not be the run that gets to send it. Deleting it, or losing it to a machine that
+can't write it, costs a duplicated card one day and never a lost episode. An item
+whose audio is never going to send is written off after a week.
+
 The voice note carries the episode title as its body, repeating the card just
 above it. That repetition is deliberate: a chat-list row shows a message's own
 text and falls back to a bare `🎤 Voice Message` when there is none — and the
@@ -684,6 +700,43 @@ Worth knowing:
   A laptop that has just woken up is the usual cause, and it is usually gone by
   the second attempt. A feed whose XML simply doesn't parse is not retried:
   it won't parse any better in two seconds.
+
+  Sending is retried on the same terms. Signal resetting the connection partway
+  through an upload (`Connection reset (PushNetworkException)`) is common enough
+  on a long podcast episode, and it costs the feed its whole run: the marker
+  doesn't move, so the next run downloads and uploads the same episode again to
+  fail the same way. Those get two more tries, two and four seconds apart. Only
+  failures the network caused are retried — a rejected group or a bad recipient
+  fails immediately, and so does a local timeout, which would otherwise cost
+  another two minutes to arrive at the same answer.
+- **Only one run happens at a time.** A run reads a feed's watermark from its
+  group and writes it back within that same run, so two runs at once both read
+  the same marker, both decide the same items are new, and both send them — a
+  duplicate nothing downstream can undo. A run takes an exclusive `flock` and a
+  second one stands aside with a line on stderr and exit 0, since the previous
+  run being slow is not this one's failure:
+
+  ```
+  Nothing to do: another rssignal run is still going (lock held on …/run.lock).
+  ```
+
+  This is easy to arrange by accident: a run with videos to fetch takes minutes,
+  and a scheduler firing every fifteen doesn't ask whether the last one has
+  finished. The lock is held by the kernel, not by a pid file, so it is released
+  even when a run is killed outright. `RSSIGNAL_LOCK` moves it; a dry run takes
+  no lock at all, and stays usable while a real run is going.
+- **An episode that got half-way out is finished, not repeated.** A podcast
+  episode with a card is two messages, and a failed upload between them used to
+  bring the card back round with the item on the next run — a flaky upload
+  retried three times left three identical cards and one episode. The card is
+  noted as owed the instant it lands, so the retry sends what is actually
+  missing. See [Link previews](#link-previews).
+- **A `signal-cli` that dies mid-run costs speed, not the run.** A run keeps one
+  `signal-cli jsonRpc` alive for its whole length (see below). If that process
+  goes away, the call that noticed redoes itself as a one-shot `signal-cli`, and
+  the daemon is retired for the rest of the run rather than rediscovered, feed by
+  feed, by everything after it. It is not restarted: one that died once mid-run
+  has not earned the rest of it, and the slow path is known to work.
 - **A source blocked on purpose is a skip, not a failure.** See below.
 
 ## Blocked sources
@@ -732,12 +785,38 @@ fixed instead:
 RSSIGNAL_LOG=/Users/you/Library/Logs/rssignal.log
 ```
 
+Worth doing if your checkout lives in a synced folder — iCloud Drive, Dropbox — 
+since a file appended to on every run is what sync makes conflicted copies of.
+The cache is already outside the checkout for the same reason.
+
 `rssignal doctor` prints the path it will use, whether or not the file exists
 yet. Each entry is stamped with the local time and says which feed it came
 from; the file is rotated to `rssignal.log.1` once it passes 1 MB, so the
 failure you came looking for survives the runs after it. A log that can't be
 written is a warning on stderr and nothing more — it never stops a message
 being sent.
+
+### Did the run finish?
+
+Every run also writes one line when it starts and one when it stops:
+
+```
+2026-08-06 15:10:02 +0200  run started: 9 feed(s)
+2026-08-06 15:12:40 +0200  run finished in 2m38s: 3 item(s) sent
+```
+
+This is the only way to tell a run that was *killed* from one that had a quiet
+evening — a killed process catches nothing and logs nothing, so without the
+start line the two look identical. **A `run started` with no matching line under
+it means the run did not get to finish.** If that shows up regularly, whatever
+is running rssignal is stopping it early: Apple Shortcuts supervises the shell
+scripts it runs and will cut off a long one, and a run with several new videos
+in it is easily minutes long. A LaunchAgent has no such limit, and — unlike
+plain cron — runs a job it missed once the machine wakes.
+
+A run stopped in a way rssignal can see (Ctrl-C, a scheduler shutting it down,
+an unreadable config) logs `run aborted after …` instead, so that case is not
+mistaken for a kill.
 
 ## How fast a run is
 
@@ -768,7 +847,10 @@ in a cache file, so a run stops re-deriving yesterday's answer:
 Nothing in it decides *what gets sent* — that is the group description, and only
 the group description. Deleting the cache costs one slow run and changes nothing
 else, which is a property worth keeping: if something ever needs remembering that
-*would* change what goes out, it does not belong in there.
+*would* change what goes out, it does not belong in there. (Exactly one thing
+does — the unsent half of a two-message episode — and it lives in its own file,
+`pending.json`, beside the cache rather than inside it. Losing that one costs a
+duplicated card, never a lost item.)
 
 Measured on twelve feeds with nothing new to send, which is what a scheduled run
 almost always is: **33.8s → 5.1s**.

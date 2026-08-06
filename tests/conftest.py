@@ -8,7 +8,7 @@ test keeps that from happening whether or not the test cares about logging.
 
 import pytest
 
-from rssignal import cache, config, download, feeds, signal_cli
+from rssignal import cache, config, download, feeds, pending, run, signal_cli
 from rssignal.errorlog import DEFAULT_LOG_PATH
 
 
@@ -23,6 +23,11 @@ def clean_cache(tmp_path, monkeypatch):
     since the module keeps what it read.
     """
     monkeypatch.setenv(cache.CACHE_ENV, str(tmp_path / "cache.json"))
+    # :mod:`rssignal.pending` defaults to the cache's directory, so it is already
+    # inside tmp_path by the line above — but it decides what gets sent, and a
+    # suite that wrote to the real one could suppress a real preview card. Said
+    # outright rather than inherited.
+    monkeypatch.setenv(pending.PENDING_ENV, str(tmp_path / "pending.json"))
     cache.clear()
     yield
     cache.clear()
@@ -39,6 +44,20 @@ def no_signal_daemon(monkeypatch):
     build a fake one and turn this off for themselves.
     """
     monkeypatch.setenv(signal_cli.DAEMON_ENV, "0")
+
+
+@pytest.fixture(autouse=True)
+def own_run_lock(tmp_path, monkeypatch):
+    """Give every test its own run lock.
+
+    :func:`rssignal.run.single_run` takes an exclusive lock so two runs can't
+    send the same items twice. Under ``pytest -n`` the workers are separate
+    processes, and on the shared default path they would take that seriously:
+    tests would block on each other, or fail with AlreadyRunning, depending on
+    the timing — which is the lock working exactly as designed, on the one
+    workload that must not have it.
+    """
+    monkeypatch.setenv(run.LOCK_ENV, str(tmp_path / "run.lock"))
 
 
 @pytest.fixture(autouse=True)
@@ -66,11 +85,13 @@ def no_retry_backoff(monkeypatch):
     """Keep the network retry, drop its wait.
 
     Every test that exercises a failing fetch goes through
-    :func:`rssignal.feeds.retrying`, which would otherwise sit out its backoff
-    and add seconds to the suite for nothing. The retries still happen — only
-    the sleeping is removed — so the tests still cover the loop.
+    :func:`rssignal.feeds.retrying`, and every one that exercises a failing send
+    through :func:`rssignal.signal_cli._sending`; both would otherwise sit out
+    their backoff and add seconds to the suite for nothing. The retries still
+    happen — only the sleeping is removed — so the tests still cover the loop.
     """
     monkeypatch.setattr(feeds.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(signal_cli.time, "sleep", lambda _seconds: None)
 
 
 @pytest.fixture(autouse=True)

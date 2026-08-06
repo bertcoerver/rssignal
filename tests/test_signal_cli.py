@@ -211,6 +211,56 @@ def test_send_msg_nonzero_exit_raises(have_binary, monkeypatch):
     assert "nope" in excinfo.value.stderr
 
 
+def test_send_msg_retries_a_network_failure(have_binary, monkeypatch):
+    # The failure the podcast feeds actually hit: Signal resetting the
+    # connection partway through an upload. The message never arrived, so
+    # asking again is both safe and usually enough.
+    reset = (
+        "Failed to send message: java.net.SocketException: Connection reset "
+        "(PushNetworkException) (UnexpectedErrorException)"
+    )
+    calls = []
+
+    def fake_run(*a, **k):
+        calls.append(a)
+        if len(calls) == 1:
+            return _completed(returncode=1, stderr=reset)
+        return _completed()
+
+    monkeypatch.setattr(signal_cli.subprocess, "run", fake_run)
+    send_msg("hi", recipient="+31611111111", account="+31600000000")
+    assert len(calls) == 2
+
+
+def test_send_msg_gives_up_after_the_last_attempt(have_binary, monkeypatch):
+    reset = "java.net.SocketException: Connection reset (PushNetworkException)"
+    calls = []
+
+    def fake_run(*a, **k):
+        calls.append(a)
+        return _completed(returncode=1, stderr=reset)
+
+    monkeypatch.setattr(signal_cli.subprocess, "run", fake_run)
+    with pytest.raises(SignalSendError):
+        send_msg("hi", recipient="+31611111111", account="+31600000000")
+    assert len(calls) == signal_cli.SEND_RETRY_ATTEMPTS
+
+
+def test_send_msg_does_not_retry_a_real_refusal(have_binary, monkeypatch):
+    # A group that won't take the message will not take it on the third try
+    # either — retrying that is three times the wait for the same answer.
+    calls = []
+
+    def fake_run(*a, **k):
+        calls.append(a)
+        return _completed(returncode=1, stderr="Unknown group id")
+
+    monkeypatch.setattr(signal_cli.subprocess, "run", fake_run)
+    with pytest.raises(SignalSendError):
+        send_msg("hi", recipient="+31611111111", account="+31600000000")
+    assert len(calls) == 1
+
+
 def test_send_msg_timeout_raises(have_binary, monkeypatch):
     def fake_run(*a, **k):
         raise subprocess.TimeoutExpired(cmd="signal-cli", timeout=60)

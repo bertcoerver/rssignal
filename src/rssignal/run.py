@@ -10,7 +10,8 @@ downloads its enclosure and sends it as a voice note, plus a link preview card
 whose artwork is downloaded alongside it. Those go out as two messages: Signal
 drops a preview card from any message carrying an attachment. The voice note
 repeats the episode title as its body, so the chat list names the episode instead
-of saying "Voice Message".
+of saying "Voice Message". Two messages is also the one place an item can end up
+half sent, which :mod:`rssignal.pending` exists to finish rather than repeat.
 
 An item that only *links* to a video — :func:`~rssignal.video.is_video_item`,
 decided per item from the link in the same spirit — has its video fetched and
@@ -43,19 +44,21 @@ stays strictly sequential, because that is where the ordering promises above liv
 
 from __future__ import annotations
 
+import fcntl
 import os
 import socket
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Iterator
 
-from . import cache, timing
+from . import cache, pending, timing
 from .download import download_temp
-from .errorlog import log_exception
+from .errorlog import log_exception, log_line
 from .feeds import (
     FeedConfig,
     FeedError,
@@ -99,6 +102,60 @@ FEED_SOCKET_TIMEOUT = 30
 # is politeness to those servers rather than anything local.
 DEFAULT_FEED_WORKERS = 8
 FEED_WORKERS_ENV = "RSSIGNAL_FEED_WORKERS"
+
+# Where the "one run at a time" lock lives. Beside the cache rather than beside
+# feeds.json: the repo may sit in a synced folder, and a lock file is the last
+# thing that should be replicated to another machine. ``RSSIGNAL_LOCK`` moves it.
+LOCK_ENV = "RSSIGNAL_LOCK"
+DEFAULT_LOCK_NAME = "run.lock"
+
+
+class AlreadyRunning(Exception):
+    """Raised when another rssignal run holds the lock."""
+
+
+def lock_path() -> str:
+    """Where the run lock is, honouring :data:`LOCK_ENV`."""
+    override = os.environ.get(LOCK_ENV, "").strip()
+    if override:
+        return os.path.expanduser(override)
+    return os.path.join(os.path.dirname(cache.path()), DEFAULT_LOCK_NAME)
+
+
+@contextmanager
+def single_run() -> Iterator[None]:
+    """Hold the run lock for the block, or raise :class:`AlreadyRunning`.
+
+    A run is not safe to overlap with itself. How far a feed got is read from
+    its group's description and written back within one run (see
+    :func:`_send_prepared`), so two runs at once both read the same watermark,
+    both decide the same items are new, and both send them. Nothing downstream
+    can undo that: the duplicate is a real message in a real chat.
+
+    Overlapping is easy to arrange by accident rather than exotic. A run that
+    has videos to fetch takes minutes, and a scheduler firing every fifteen
+    does not ask whether the last one has finished.
+
+    The lock is an ``flock`` on a file, which the kernel releases when the
+    process ends however it ends — including the kill this is most needed
+    against. A pid file would need the dead run to clean up after itself, which
+    is exactly what a killed run cannot do.
+    """
+    path = lock_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Opened, never truncated: the file is a handle to lock, not a place to
+    # keep anything. Deleting it between runs is harmless.
+    handle = open(path, "a")
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise AlreadyRunning(
+                f"another rssignal run is still going (lock held on {path})"
+            ) from exc
+        yield
+    finally:
+        handle.close()
 
 
 class _GroupResolver:
@@ -201,7 +258,30 @@ def run_feeds(
     skipped, and its watermark is left where it was, so the next run picks it up
     from the same place. Only something that stops there being feeds at all —
     an unreadable config — raises.
+
+    The run's start and end are written to the error log (see
+    :func:`~rssignal.errorlog.log_line`), which is what a run killed partway
+    leaves nothing else of.
+
+    Only one run happens at a time; a second one raises
+    :class:`AlreadyRunning` rather than sending everything twice. A dry run
+    takes no lock — it sends nothing, so it cannot collide with anything, and
+    it should stay usable while a real run is going.
     """
+    with ExitStack() as outer:
+        if not dry_run:
+            outer.enter_context(single_run())
+        return _locked_run(config_path, dry_run=dry_run, to=to, since=since)
+
+
+def _locked_run(
+    config_path: str,
+    *,
+    dry_run: bool,
+    to: str | None,
+    since: datetime | None,
+) -> int:
+    """The body of :func:`run_feeds`, with the run lock already held."""
     feeds = load_feeds(config_path)
     resolver = _GroupResolver()
 
@@ -210,8 +290,29 @@ def run_feeds(
     # so it is a property of a run, not of having imported rssignal.
     socket.setdefaulttimeout(FEED_SOCKET_TIMEOUT)
 
-    with signal_daemon():
-        return _run_prepared(feeds, resolver, dry_run=dry_run, to=to, since=since)
+    started = time.monotonic()
+    kind = " (dry run)" if dry_run else ""
+    log_line(f"run started{kind}: {len(feeds)} feed(s)")
+    try:
+        with signal_daemon():
+            sent = _run_prepared(
+                feeds, resolver, dry_run=dry_run, to=to, since=since
+            )
+    except BaseException as exc:
+        # Including KeyboardInterrupt and SystemExit: a run stopped by hand or
+        # by a scheduler shutting it down is exactly the case this line exists
+        # for, and it should not look the same as one that was killed outright.
+        log_line(f"run aborted after {_elapsed(started)}: {exc!r}")
+        raise
+    log_line(f"run finished in {_elapsed(started)}: {sent} item(s) sent{kind}")
+    return sent
+
+
+def _elapsed(started: float) -> str:
+    """A monotonic start time as ``2m38s`` — how long, not how many seconds."""
+    total = int(time.monotonic() - started)
+    minutes, seconds = divmod(total, 60)
+    return f"{minutes}m{seconds:02d}s" if minutes else f"{seconds}s"
 
 
 def _run_prepared(
@@ -610,7 +711,23 @@ def _handle_item(
             # Signal drops the preview card when the same message carries an
             # attachment, so the card and the audio go out separately: the text
             # and card first, then the voice note on its own.
-            send_msg(text, recipient=recipient, preview=preview)
+            #
+            # Two messages is two chances to fail, and a failure between them is
+            # the one moment in a run where an item is neither sent nor unsent.
+            # The card is noted as owed the instant it lands, so if the voice
+            # note never follows — the watermark rolls back and the item comes
+            # round again — this run sends what is actually missing instead of
+            # posting a second copy of the card. See :mod:`rssignal.pending`.
+            key = pending.item_key(recipient, item)
+            if not pending.owed(key):
+                send_msg(text, recipient=recipient, preview=preview)
+                pending.remember(key)
+            else:
+                print(
+                    f"[{label}] {item.title!r}: card already sent, sending only "
+                    "the voice note.",
+                    file=sys.stderr,
+                )
             send_msg(
                 # The title, not an empty body. A chat-list row shows the
                 # message's own text, falling back to a bare "Voice Message"
@@ -623,6 +740,7 @@ def _handle_item(
                 attachments=attachments,
                 voice_note=True,
             )
+            pending.forget(key)
         else:
             send_msg(
                 text,

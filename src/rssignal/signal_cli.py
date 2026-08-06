@@ -86,6 +86,32 @@ _CONFIG_DIR_HINT = "~/.local/share/signal-cli"
 # Marks a recipient as a group id rather than a phone number.
 GROUP_PREFIX = "group:"
 
+# How hard to lean on a send that failed for a reason the network caused. The
+# mirror of :data:`rssignal.feeds.RETRY_ATTEMPTS` for fetching, and for the same
+# reason: this runs unattended over a link that isn't always there. A reset
+# halfway through an upload costs the feed its whole run and moves no watermark,
+# so the next run downloads and uploads the same episode again to fail the same
+# way. Two more tries, four seconds apart, is much the cheaper answer.
+SEND_RETRY_ATTEMPTS = 3
+SEND_RETRY_DELAY = 2.0
+
+# What a transient send failure looks like coming back from signal-cli. There is
+# no error *code* to test — the daemon hands back a Java exception chain as
+# prose — so this matches on the names in it. Every one of these means the
+# message never reached Signal's servers, which is what makes trying again safe:
+# a failure that got far enough to be delivered would be a duplicate, not a
+# retry. Anything not named here (a rejected group, a bad recipient, a file that
+# won't upload) fails on the first attempt, as it should.
+_TRANSIENT_SEND_MARKERS = (
+    "PushNetworkException",
+    "SocketException",
+    "SocketTimeoutException",
+    "UnknownHostException",
+    "ConnectException",
+    "Connection reset",
+    "Connection refused",
+)
+
 
 class SignalError(Exception):
     """Base class for all signal-cli related errors."""
@@ -121,6 +147,53 @@ class SignalSendError(SignalError):
         self.returncode = returncode
         self.stderr = stderr
         super().__init__(message)
+
+
+class DaemonGone(SignalSendError):
+    """Raised when the shared ``signal-cli jsonRpc`` process has died.
+
+    Not a failure of the call that hit it: the daemon is an optimization, and
+    the one-shot ``signal-cli`` path it replaces is still there. So this is
+    caught at each call site, which retires the daemon and does the work the
+    slow way — the JVM going away costs a run its speed, not its evening.
+    """
+
+
+def _is_transient_send(exc: SignalSendError) -> bool:
+    """Whether ``exc`` is the network having a moment rather than a real refusal.
+
+    A local timeout is deliberately *not* transient: retrying one costs another
+    whole timeout, and a send slow enough to hit it is more likely to be a large
+    upload crawling than a blip worth asking about again. Neither is a dead
+    daemon — nothing is going to answer on that pipe however many times it is
+    asked, and the caller has a better answer for it than retrying.
+    """
+    if isinstance(exc, DaemonGone):
+        return False
+    text = f"{exc} {exc.stderr}"
+    return any(marker in text for marker in _TRANSIENT_SEND_MARKERS)
+
+
+def _sending(work, *, what: str) -> None:
+    """Run ``work``, trying again while it fails for a reason the network caused.
+
+    ``what`` names the send in the warning each retry prints, so an unattended
+    run leaves a trace of having recovered rather than looking as though nothing
+    happened.
+    """
+    for attempt in range(1, SEND_RETRY_ATTEMPTS + 1):
+        try:
+            work()
+            return
+        except SignalSendError as exc:
+            if attempt == SEND_RETRY_ATTEMPTS or not _is_transient_send(exc):
+                raise
+            print(
+                f"warning: {what} failed ({exc}); retrying "
+                f"({attempt + 1}/{SEND_RETRY_ATTEMPTS})",
+                file=sys.stderr,
+            )
+            time.sleep(SEND_RETRY_DELAY * attempt)
 
 
 @dataclass(frozen=True)
@@ -381,7 +454,10 @@ class _JsonRpc:
                     self._proc.stdin.write(json.dumps(payload) + "\n")
                     self._proc.stdin.flush()
                 except (OSError, ValueError) as exc:
-                    raise SignalSendError(
+                    # A pipe that won't take a write is a process that isn't
+                    # there — the same condition as a reply that never comes,
+                    # noticed one step earlier.
+                    raise DaemonGone(
                         f"`signal-cli {method}` could not be sent: {exc}"
                     ) from exc
 
@@ -396,7 +472,7 @@ class _JsonRpc:
                 self._events.pop(key, None)
 
         if message is None:
-            raise SignalSendError(
+            raise DaemonGone(
                 f"`signal-cli {method}` got no answer — signal-cli stopped."
             )
         if "error" in message:
@@ -425,6 +501,29 @@ class _JsonRpc:
 # property of the run rather than of any one call: the wrappers below check it,
 # and everything outside a run keeps the one-shot behaviour it always had.
 _daemon: _JsonRpc | None = None
+
+
+def _retire_daemon(exc: DaemonGone) -> None:
+    """Stop routing through the daemon: it has died, and won't be coming back.
+
+    Called by every wrapper that catches :class:`DaemonGone`, before it redoes
+    the work through a one-shot ``signal-cli``. Clearing the global is what
+    keeps the *rest* of the run from rediscovering the same corpse feed by feed:
+    without it, one JVM crash three feeds in costs every feed after it.
+
+    Restarting it instead would be the obvious alternative, and is deliberately
+    not done — a daemon that died once mid-run is not obviously worth trusting
+    with the rest of it, and the slow path is known to work.
+    """
+    global _daemon
+    if _daemon is None:
+        return
+    dead, _daemon = _daemon, None
+    print(
+        f"warning: {exc} Carrying on with one signal-cli per call.",
+        file=sys.stderr,
+    )
+    dead.stop()
 
 
 @contextmanager
@@ -482,10 +581,15 @@ def list_groups(*, account: str | None = None) -> list[SignalGroup]:
     Groups you have left show up with ``active=False``; they are kept here and
     filtered at the call site so the caller can decide what to show.
     """
+    raw = None
     if _daemon is not None:
-        # Same objects as the -o json listing, so the parse below is shared.
-        raw = _daemon.request("listGroups", timeout=120) or []
-    else:
+        try:
+            # Same objects as the -o json listing, so the parse below is shared.
+            raw = _daemon.request("listGroups", timeout=120) or []
+        except DaemonGone as exc:
+            _retire_daemon(exc)
+
+    if raw is None:
         binary = find_signal_cli()
         if account is None:
             account = get_config().account
@@ -849,16 +953,23 @@ def update_group(
         return
 
     if _daemon is not None:
-        with ExitStack() as stack:
-            params: dict = {"groupId": group_id}
-            if description is not None:
-                params["description"] = _clip(description)
-            if avatar is not None:
-                params["avatar"] = stack.enter_context(_avatar_within_limits(avatar))
-            if expiration is not None:
-                params["expiration"] = int(expiration)
-            _daemon.request("updateGroup", params, timeout=timeout)
-        return
+        try:
+            with ExitStack() as stack:
+                params: dict = {"groupId": group_id}
+                if description is not None:
+                    params["description"] = _clip(description)
+                if avatar is not None:
+                    params["avatar"] = stack.enter_context(_avatar_within_limits(avatar))
+                if expiration is not None:
+                    params["expiration"] = int(expiration)
+                _daemon.request("updateGroup", params, timeout=timeout)
+            return
+        except DaemonGone as exc:
+            # Falls through to the one-shot path below and does it again. Safe
+            # to repeat: updateGroup sets fields to what they were asked to be
+            # rather than changing them by a step, and the daemon attempt that
+            # got here never reached signal-cli at all.
+            _retire_daemon(exc)
 
     binary = find_signal_cli()
     if account is None:
@@ -991,6 +1102,9 @@ def send_msg(
     Signal renders a large one as a full-width card rather than a thumbnail, so
     downscaling it would cost the better-looking layout for nothing.
 
+    A send that fails for a reason the network caused is tried again — see
+    :func:`_sending`. Everything else fails on the first attempt.
+
     Raises :class:`SignalSendError` on a non-zero exit or timeout,
     :class:`SignalCliNotFound` if the binary is missing, and ``ValueError`` if no
     recipient can be resolved.
@@ -1035,8 +1149,18 @@ def send_msg(
             params["recipient"] = [recipient]
         else:
             raise ValueError(_bad_recipient(recipient))
-        _daemon.request("send", params, timeout=timeout)
-        return
+        try:
+            _sending(
+                lambda: _daemon.request("send", params, timeout=timeout),
+                what="send",
+            )
+            return
+        except DaemonGone as exc:
+            # The one case where falling through cannot duplicate a message:
+            # the daemon never carried this one. Either the pipe refused the
+            # write, or signal-cli died without answering — and a send that had
+            # actually gone out would have been answered, error or not.
+            _retire_daemon(exc)
 
     # Options that take a fixed number of args go before ``-m msg``, so the
     # trailing positional recipient can't be swallowed by ``--attachment``'s
@@ -1064,24 +1188,27 @@ def send_msg(
     else:
         raise ValueError(_bad_recipient(recipient))
 
-    try:
-        with timing.step("signal-cli", "send"):
-            result = subprocess.run(
-                argv,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-    except subprocess.TimeoutExpired as exc:
-        raise SignalSendError(
-            f"`signal-cli send` timed out after {timeout}s.",
-            stderr=(exc.stderr or "") if isinstance(exc.stderr, str) else "",
-        ) from exc
+    def once() -> None:
+        try:
+            with timing.step("signal-cli", "send"):
+                result = subprocess.run(
+                    argv,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+        except subprocess.TimeoutExpired as exc:
+            raise SignalSendError(
+                f"`signal-cli send` timed out after {timeout}s.",
+                stderr=(exc.stderr or "") if isinstance(exc.stderr, str) else "",
+            ) from exc
 
-    if result.returncode != 0:
-        raise SignalSendError(
-            f"`signal-cli send` failed with status {result.returncode}: "
-            f"{result.stderr.strip()}",
-            returncode=result.returncode,
-            stderr=result.stderr.strip(),
-        )
+        if result.returncode != 0:
+            raise SignalSendError(
+                f"`signal-cli send` failed with status {result.returncode}: "
+                f"{result.stderr.strip()}",
+                returncode=result.returncode,
+                stderr=result.stderr.strip(),
+            )
+
+    _sending(once, what="send")
