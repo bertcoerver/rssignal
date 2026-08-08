@@ -9,10 +9,11 @@ the relationships between them are the ones that decide the outcome.
 import json
 import os
 import subprocess
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from rssignal import download, feeds, youtube
+from rssignal import cache, download, feeds, youtube
 from rssignal.feeds import FeedError, FeedItem, SourceBlocked
 from rssignal.video import VideoTooShort
 
@@ -614,3 +615,350 @@ def test_a_blocked_youtube_feed_never_reaches_yt_dlp(monkeypatch):
         feeds.parse_feed(
             feeds.FeedConfig(url="https://www.youtube.com/@veritasium", name="V")
         )
+
+
+# --- the back catalogue, for an episodic feed ------------------------------
+
+ARCHIVE_CHANNEL = "UC3XTzVzaHQEd30rQbuvCtTQ"
+ARCHIVE_FEED = f"https://www.youtube.com/feeds/videos.xml?channel_id={ARCHIVE_CHANNEL}"
+
+# Newest first, the order the uploads playlist reports. Ids are stand-ins of the
+# right shape; the real ones are eleven characters of the same alphabet.
+CATALOGUE = [f"vid{n:08d}" for n in range(5, 0, -1)]
+
+# When each went up, oldest to newest — what one --print costs a run each.
+DATES = {
+    f"vid{n:08d}": 1_400_000_000 + n * 86_400 for n in range(1, 6)
+}
+
+
+def _patch_archive(monkeypatch, *, catalogue=None, dated=None, listing_error=None):
+    """Answer both yt-dlp calls the archive makes, and count them.
+
+    ``dated`` limits which videos will give up a timestamp; anything outside it
+    answers "NA", the way a private or removed video does.
+    """
+    catalogue = CATALOGUE if catalogue is None else catalogue
+    dated = DATES if dated is None else dated
+    asked = []
+
+    def fake_json(args, *, timeout):
+        if listing_error is not None:
+            raise FeedError(listing_error)
+        asked.append("listing")
+        return {
+            "entries": [
+                {"id": vid, "title": f"Title {vid}", "duration": 1800}
+                for vid in catalogue
+            ]
+        }
+
+    def fake_run(args, *, timeout):
+        asked.append(args[-1])
+        video_id = args[-1].rsplit("=", 1)[-1]
+        stamp = dated.get(video_id)
+        return subprocess.CompletedProcess(
+            args, 0, f"{stamp}\n" if stamp else "NA\n", ""
+        )
+
+    monkeypatch.setattr(youtube, "_ytdlp_json", fake_json)
+    monkeypatch.setattr(youtube, "_run_ytdlp", fake_run)
+    return asked
+
+
+def test_archive_puts_the_whole_channel_in_front_oldest_first(monkeypatch):
+    _patch_archive(monkeypatch)
+
+    items = youtube.archive_items(ARCHIVE_FEED, [], feed_name="Show")
+
+    assert [i.title for i in items] == [f"Title vid{n:08d}" for n in range(1, 6)]
+    assert [i.published.timestamp() for i in items] == sorted(DATES.values())
+    assert items[0].link == "https://www.youtube.com/watch?v=vid00000001"
+    assert items[0].extra["duration_seconds"] == "1800"
+
+
+def test_archive_asks_the_uploads_playlist_not_the_videos_tab(monkeypatch):
+    """The /videos tab does not stay in order past its first page."""
+    seen = {}
+
+    def fake_json(args, *, timeout):
+        seen["url"] = args[-1]
+        return {"entries": [{"id": CATALOGUE[0], "title": "T", "duration": 60}]}
+
+    monkeypatch.setattr(youtube, "_ytdlp_json", fake_json)
+    youtube.uploads(ARCHIVE_CHANNEL)
+
+    assert seen["url"] == f"https://www.youtube.com/playlist?list=UU{ARCHIVE_CHANNEL[2:]}"
+
+
+def test_a_video_that_has_no_date_is_dropped_rather_than_waited_for(monkeypatch):
+    """Asked and answered with nothing: private or removed, so not in the queue."""
+    _patch_archive(
+        monkeypatch, dated={k: v for k, v in DATES.items() if k != "vid00000003"}
+    )
+
+    items = youtube.archive_items(ARCHIVE_FEED, [], feed_name="Show")
+
+    assert [i.title for i in items] == [
+        "Title vid00000001",
+        "Title vid00000002",
+        "Title vid00000004",
+        "Title vid00000005",
+    ]
+
+
+def test_archive_stops_where_it_could_not_ask(monkeypatch, capsys):
+    """The frontier rule: never step over a video that may be dated next run.
+
+    Stepping over it would send the ones behind it, put the watermark past this
+    one, and then its real date would be *older* than the watermark — so it would
+    never be sent at all. Stopping short costs a run instead.
+    """
+    _patch_archive(monkeypatch)
+
+    real_run = youtube._run_ytdlp
+
+    def refuse_the_third(args, *, timeout):
+        if args[-1].endswith("vid00000003"):
+            raise FeedError("yt-dlp failed: temporarily unavailable")
+        return real_run(args, timeout=timeout)
+
+    monkeypatch.setattr(youtube, "_run_ytdlp", refuse_the_third)
+
+    items = youtube.archive_items(ARCHIVE_FEED, [], feed_name="Show")
+
+    assert [i.title for i in items] == ["Title vid00000001", "Title vid00000002"]
+    assert "vid00000003" in capsys.readouterr().err
+
+
+def test_archive_dates_only_its_budget_per_run(monkeypatch):
+    asked = _patch_archive(monkeypatch)
+
+    items = youtube.archive_items(ARCHIVE_FEED, [], feed_name="Show", budget=2)
+
+    assert [i.title for i in items] == ["Title vid00000001", "Title vid00000002"]
+    assert len([a for a in asked if a != "listing"]) == 2
+
+
+def test_the_dates_it_did_get_are_kept_for_the_next_run(monkeypatch):
+    asked = _patch_archive(monkeypatch)
+    youtube.archive_items(ARCHIVE_FEED, [], budget=2)
+
+    spent_first = len([a for a in asked if a != "listing"])
+    items = youtube.archive_items(ARCHIVE_FEED, [], budget=2)
+
+    # The budget buys two *new* dates each run, on top of what is remembered.
+    assert spent_first == 2
+    assert len([i for i in items]) == 4
+
+
+def test_the_feeds_own_items_win_where_the_two_overlap(monkeypatch):
+    """Same video, but with a description and a real date rather than a derived one."""
+    _patch_archive(monkeypatch)
+    real = FeedItem(
+        title="From the feed",
+        description="the description a listing does not carry",
+        link="https://www.youtube.com/watch?v=vid00000005",
+        published=datetime.fromtimestamp(DATES["vid00000005"], timezone.utc),
+    )
+
+    items = youtube.archive_items(ARCHIVE_FEED, [real])
+
+    assert items[-1] is real
+    assert sum(1 for i in items if "vid00000005" in (i.link or "")) == 1
+
+
+def test_the_feeds_head_is_held_back_until_the_archive_is_walkable(monkeypatch):
+    """Otherwise the watermark jumps years, over everything in between."""
+    _patch_archive(monkeypatch)
+    head = FeedItem(
+        title="Yesterday",
+        description="d",
+        link="https://www.youtube.com/watch?v=brandnew01",
+        published=datetime.now(timezone.utc),
+    )
+
+    items = youtube.archive_items(ARCHIVE_FEED, [head], budget=2)
+
+    assert head not in items
+    assert [i.title for i in items] == ["Title vid00000001", "Title vid00000002"]
+
+
+def test_once_the_archive_is_complete_the_feeds_newest_come_along(monkeypatch):
+    _patch_archive(monkeypatch)
+    head = FeedItem(
+        title="Yesterday",
+        description="d",
+        link="https://www.youtube.com/watch?v=brandnew01",
+        published=datetime.now(timezone.utc),
+    )
+
+    items = youtube.archive_items(ARCHIVE_FEED, [head])
+
+    assert items[-1] is head
+
+
+def test_a_listing_that_cannot_be_read_leaves_the_feed_alone(monkeypatch, capsys):
+    _patch_archive(monkeypatch, listing_error="yt-dlp failed: nope")
+    head = FeedItem(title="Yesterday", description="d", link="https://y/1")
+
+    assert youtube.archive_items(ARCHIVE_FEED, [head]) == [head]
+    assert "back catalogue" in capsys.readouterr().err
+
+
+def test_a_non_channel_feed_is_left_alone(monkeypatch):
+    def fail(*args, **kwargs):
+        raise AssertionError("nothing to list for a feed that isn't a channel")
+
+    monkeypatch.setattr(youtube, "_ytdlp_json", fail)
+    items = [FeedItem(title="A post", description="d", link="https://a/1")]
+
+    assert youtube.archive_items("https://waitbutwhy.com/feed", items) == items
+
+
+def test_a_stale_listing_beats_no_listing(monkeypatch):
+    _patch_archive(monkeypatch)
+    youtube.uploads(ARCHIVE_CHANNEL)  # fills the cache
+
+    def fail(args, *, timeout):
+        raise FeedError("YouTube said no")
+
+    monkeypatch.setattr(youtube, "_ytdlp_json", fail)
+    monkeypatch.setattr(cache, "YOUTUBE_UPLOADS_TTL", -1)  # everything is stale
+
+    assert [u.video_id for u in youtube.uploads(ARCHIVE_CHANNEL)] == CATALOGUE
+
+
+def test_a_listing_that_lost_most_of_the_channel_is_not_believed(monkeypatch):
+    """A partial answer looks exactly like a channel that deleted its history."""
+    _patch_archive(monkeypatch)
+    youtube.uploads(ARCHIVE_CHANNEL)
+
+    _patch_archive(monkeypatch, catalogue=["vid00000009", CATALOGUE[0]])
+    monkeypatch.setattr(cache, "YOUTUBE_UPLOADS_TTL", -1)
+
+    after = [u.video_id for u in youtube.uploads(ARCHIVE_CHANNEL)]
+
+    # The new one is taken; the archive behind it is kept rather than dropped.
+    assert after == ["vid00000009", *CATALOGUE]
+
+
+def test_published_prefers_a_timestamp_over_a_date(monkeypatch):
+    """upload_date is a day, and a channel posting twice a day would collide."""
+    asked = _patch_archive(monkeypatch)
+    when = youtube._published("vid00000001")
+
+    assert when == datetime.fromtimestamp(DATES["vid00000001"], timezone.utc)
+    assert when.tzinfo is timezone.utc
+    assert asked  # and it went and asked
+
+
+
+
+def test_an_age_gated_video_is_stepped_over_rather_than_walling_the_series(
+    monkeypatch,
+):
+    """A single age-gated video would otherwise be a wall nothing gets past."""
+    _patch_archive(monkeypatch)
+    real_run = youtube._run_ytdlp
+
+    def age_gate_the_third(args, *, timeout):
+        if args[-1].endswith("vid00000003"):
+            raise FeedError(
+                "yt-dlp failed: ERROR: [youtube] vid00000003: Sign in to confirm "
+                "your age. This video may be inappropriate for some users."
+            )
+        return real_run(args, timeout=timeout)
+
+    monkeypatch.setattr(youtube, "_run_ytdlp", age_gate_the_third)
+
+    items = youtube.archive_items(ARCHIVE_FEED, [], feed_name="Show")
+
+    assert [i.title for i in items] == [
+        "Title vid00000001",
+        "Title vid00000002",
+        "Title vid00000004",
+        "Title vid00000005",
+    ]
+
+
+@pytest.mark.parametrize(
+    "complaint",
+    [
+        "Sign in to confirm your age",
+        "Private video. Sign in if you've been granted access",
+        "Join this channel to get access to members-only content",
+        "Video unavailable",
+        "This video has been removed by the uploader",
+    ],
+)
+def test_the_permanent_refusals_are_told_apart_from_the_rest(complaint):
+    assert youtube._inaccessible(f"yt-dlp failed: ERROR: [youtube] x: {complaint}")
+
+
+@pytest.mark.parametrize(
+    "complaint",
+    [
+        "yt-dlp timed out after 60s",
+        "Could not run yt-dlp: [Errno 2] No such file",
+        "ERROR: unable to download video data: HTTP Error 503",
+        "Sign in to confirm you're not a bot",
+    ],
+)
+def test_an_ordinary_failure_is_not_mistaken_for_a_refusal(complaint):
+    assert not youtube._inaccessible(complaint)
+
+
+def test_a_video_ruled_out_is_never_asked_about_again(monkeypatch):
+    """It is remembered for good: re-asking is what would lose the episode."""
+    asked = _patch_archive(monkeypatch, dated={})
+
+    assert youtube._published("vid00000001") is None
+    assert youtube._published("vid00000001") is None
+    assert len(asked) == 1
+
+
+def test_videos_stamped_with_the_same_second_are_nudged_apart(monkeypatch):
+    """YouTube batch-publishes; equal dates would cost one of the two episodes."""
+    same = 1_500_000_000
+    _patch_archive(
+        monkeypatch,
+        dated={"vid00000001": same, "vid00000002": same, "vid00000003": same + 5},
+        catalogue=["vid00000003", "vid00000002", "vid00000001"],
+    )
+
+    items = youtube.archive_items(ARCHIVE_FEED, [])
+    dates = [i.published for i in items]
+
+    assert [i.title for i in items] == [
+        "Title vid00000001",
+        "Title vid00000002",
+        "Title vid00000003",
+    ]
+    assert all(a < b for a, b in zip(dates, dates[1:]))
+    # Only by the smallest step there is — the playlist order is what decides.
+    assert (dates[1] - dates[0]).total_seconds() == 1
+
+
+def test_the_nudged_date_is_the_one_that_is_remembered(monkeypatch):
+    """Or the next run would read back a different order than it sent in."""
+    same = 1_500_000_000
+    _patch_archive(
+        monkeypatch,
+        dated={"vid00000001": same, "vid00000002": same},
+        catalogue=["vid00000002", "vid00000001"],
+    )
+    first = [i.published for i in youtube.archive_items(ARCHIVE_FEED, [])]
+
+    monkeypatch.setattr(
+        youtube, "_run_ytdlp", lambda *a, **k: pytest.fail("already dated")
+    )
+    second = [i.published for i in youtube.archive_items(ARCHIVE_FEED, [])]
+
+    assert first == second
+
+
+def test_distinct_leaves_an_ordinary_gap_alone():
+    when = datetime(2014, 5, 12, 3, 30, 1, tzinfo=timezone.utc)
+    assert youtube._distinct(when, None) is when
+    assert youtube._distinct(when, when - timedelta(days=1)) is when

@@ -192,3 +192,18 @@ def channel_feed_url(url: str) -> str | None:
     from .youtube import youtube_feed_url
 
     return youtube_feed_url(url)
+
+
+def with_archive(
+    feed_url: str, items: list[FeedItem], *, feed_name: str = ""
+) -> list[FeedItem]:
+    """Put a channel's back catalogue in front of ``items``, if it has one.
+
+    Asked only for an episodic feed (:mod:`rssignal.episodic`), which is the only
+    kind with any use for what a source published years ago. Anything but a
+    YouTube channel feed comes back untouched — ARTE's collections already carry
+    as much of their own history as they carry.
+    """
+    from .youtube import archive_items
+
+    return archive_items(feed_url, items, feed_name=feed_name)

@@ -152,6 +152,8 @@ Each feed entry supports:
 | `preview_url`       | no       | Template for the card's link. Defaults to `{link}`.                    |
 | `preview_title`     | no       | Template for the card's title. Defaults to `{title}`.                  |
 | `preview_description` | no     | Template for the card's text. Omit for a card with no description.     |
+| `episodic`          | no       | Follow this feed from the beginning, at a set pace. See [episodic feeds](#episodic-feeds). |
+| `start`             | no       | Where an episodic feed begins, e.g. `"2019-01-01"`. Episodic feeds only. |
 | `<field>_contains`  | no       | Keep items whose field contains any of these terms.                    |
 | `<field>_excludes`  | no       | Drop items whose field contains any of these terms.                    |
 | `<field>_matches`   | no       | Keep items whose field matches any of these regexes.                   |
@@ -309,6 +311,91 @@ isn't retried. Expect this for anything much over half an hour: 95 MB is 95 MB.
 
 Unlike a voice note, a video goes out as a single message: these items get no
 preview card by default, so there's nothing for the attachment to displace.
+
+### Episodic feeds
+
+Most feeds are tickers: what matters is what arrived since you last looked. A
+series is the other thing — its back catalogue *is* the point, and the order to
+take it in is the order it was made.
+
+```json
+{
+  "name": "Last Week Tonight",
+  "url": "https://www.youtube.com/@LastWeekTonight",
+  "episodic": "2-weekly",
+  "start": "2019-01-01"
+}
+```
+
+`episodic` changes two things. The feed starts at its **oldest** item instead of
+its newest, and it is **paced**: you get one episode every so often rather than
+the whole archive at once.
+
+The cadence reads as a rate and is applied as an interval — `"2-weekly"` is two a
+week, which is one every three and a half days. That is deliberate: two episodes
+dumped every Monday is not what anyone means by "two a week".
+
+| Cadence      | One episode every |
+| ------------ | ----------------- |
+| `"daily"`    | 24 hours          |
+| `"2-daily"`  | 12 hours          |
+| `"weekly"`   | 7 days            |
+| `"2-weekly"` | 3.5 days          |
+| `"monthly"`  | 30 days           |
+| `true`       | no pacing at all — the whole catalogue, in one run |
+
+A month is 30 days, so that a rate divides into equal intervals. `true` is the
+honest primitive underneath the rest; on a feed with a real archive it will send
+the lot, so the string forms are the ones to reach for.
+
+`start` says where the series begins, for a back catalogue you don't want all of.
+It acts as the watermark the feed would have had, so everything published before
+it counts as already behind you. Without it a series opens at the source's very
+first item — which for a channel with nine hundred videos is a long way back.
+
+Worth knowing:
+
+- **There is no catch-up.** A machine that was off for a fortnight releases one
+  episode and picks the rhythm back up. It does not owe you four — sending four at
+  once is the avalanche the pace was set to avoid, and the queue isn't going
+  anywhere.
+- **A paced feed with nothing due isn't even fetched**, which is most runs.
+- **`--dry-run` always tells you where a series stands** — how many episodes are
+  waiting and when the next one is due — rather than going quiet.
+- **`--since` overrides the pace**, being an explicit replay. **`--to` touches no
+  group**, so it has no clock to read: it sends the next episode and changes
+  nothing.
+
+#### The YouTube back catalogue
+
+A YouTube channel's Atom feed carries only its newest 15 uploads, which is no use
+to a series that starts at the beginning. For an episodic feed rssignal reads the
+channel's **uploads playlist** instead, through yt-dlp and with no API key: one
+request returns the whole channel in order, a thousand videos in a few seconds,
+and it is kept for a week.
+
+That listing has titles and durations but **no dates**, so each video's
+publication time is looked up individually — expensive, and therefore rationed:
+25 a run, remembered permanently. A long channel is fully dated within a day of
+ordinary runs, and after that a series costs about two lookups a week.
+
+Until it *is* fully dated, the feed is offered only the part of the archive that
+is, and none of the newest 15. That is not caution for its own sake: undated items
+are never sent, so letting a video from last week past would move the watermark
+years ahead and quietly skip everything in between.
+
+Two things to expect from archive items specifically:
+
+- **`description_contains` / `description_excludes` don't apply to them.** A
+  playlist listing carries no description. Title and duration filters work
+  normally, and the newest 15 have descriptions as always.
+- **Videos rssignal can't have are skipped** — age-gated, private, members-only,
+  removed. It couldn't have downloaded them either. (An age-gated video would
+  otherwise be a wall the series never got past.)
+
+ARTE collection feeds can be marked `episodic` too, but ARTE only dates the newest
+12 programmes in a collection and undated items are never sent — so such a feed is
+capped at those 12 rather than reaching back through the archive.
 
 ### One group per feed
 
@@ -660,17 +747,33 @@ new machine, and nothing is resent.
 also leaves one *"You changed the group description"* line above it in that group.
 Runs with nothing new write nothing and stay completely silent.
 
+An [episodic feed](#episodic-feeds) keeps a second marker beside the first:
+
+```
+Every episode of a show, from the start.
+
+[rssignal 2014-05-04T22:30:00+00:00]
+[rssignal-paced 2026-08-08T09:12:44+00:00]
+```
+
+That one is a wall-clock time — the moment the last episode was released — and it
+is the only thing a pace can be measured from. The two answer different questions,
+and neither can be worked out from the other: how far through the series we are,
+and when we were last given a piece of it. Both are written in the same update, so
+they cannot disagree.
+
 Worth knowing:
 
 - **A feed with no marker yet sends exactly one item** — the newest. A new group
-  doesn't open with the whole back catalogue.
+  doesn't open with the whole back catalogue. (An episodic feed opens at the
+  *oldest* item instead, and then only one at a time.)
 - **Items with no publication date are never sent.** There is no way to tell
   whether they are new.
 - **Your own edits survive.** Rewrite a group's description in Signal and rssignal
-  moves the marker around your text instead of pasting the feed's blurb back over
+  moves the markers around your text instead of pasting the feed's blurb back over
   it. Delete the marker and the feed's newest item is sent once more.
 - **`--to` touches no group**, so it neither reads nor moves any marker. It sends
-  the newest item, every time.
+  the newest item, every time — or, for an episodic feed, the next episode.
 - **`--since` replays**, ignoring what the groups remember:
 
   ```bash
@@ -851,9 +954,17 @@ Set `RSSIGNAL_DAEMON=0` to go back to one process per call — slower, but it is
 the path rssignal used for years, and the first thing to try if sending ever
 misbehaves.
 
+**A paced feed with nothing due isn't fetched at all.** An
+[episodic](#episodic-feeds) YouTube feed reads a whole channel's uploads and dates
+the videos it hasn't seen; at one episode every few days and a run every fifteen
+minutes, almost every run would do all of that only to be told to hold the episode
+back. So the clock is read first, and on the runs where nothing is due the feed
+costs nothing.
+
 **Answers that can't change are remembered.** An ARTE programme's air date, the
-channel a YouTube `@handle` names, and the ETag a feed last handed out are kept
-in a cache file, so a run stops re-deriving yesterday's answer:
+channel a YouTube `@handle` names, when a given video went up, the order a
+channel's uploads come in, and the ETag a feed last handed out are kept in a cache
+file, so a run stops re-deriving yesterday's answer:
 
 ```
 ~/.cache/rssignal/cache.json     # or $RSSIGNAL_CACHE

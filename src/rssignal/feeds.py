@@ -24,6 +24,7 @@ from urllib.parse import urlsplit
 import feedparser
 
 from . import cache, timing
+from .episodic import Cadence, parse_cadence
 
 # Cache namespace for the ETag / Last-Modified a feed last handed out.
 _HTTP_NS = "feed_http"
@@ -77,6 +78,8 @@ KNOWN_KEYS = (
     "preview_url",
     "preview_title",
     "preview_description",
+    "episodic",
+    "start",
 )
 
 # The field names every item has, in the order item_fields lists them.
@@ -195,6 +198,11 @@ class FeedConfig:
     ``name`` doubles as the name of the Signal group this feed sends to, so
     :func:`load_feeds` requires it. It defaults to empty here only so that the
     pure rendering helpers can be exercised without one.
+
+    ``episodic`` set makes this a series rather than a ticker: oldest item first,
+    released at the cadence's pace. ``start`` is where that walk begins, for a
+    back catalogue you don't want all of — it acts as the watermark the feed
+    would have had, so everything published before it is behind us already.
     """
 
     url: str
@@ -206,6 +214,8 @@ class FeedConfig:
     preview_url: str | None = None
     preview_title: str | None = None
     preview_description: str | None = None
+    episodic: Cadence | None = None
+    start: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -343,6 +353,15 @@ def _build_feed_config(raw: object, index: int) -> FeedConfig:
             raise FeedError(f"{where} {key} must be a string.")
         previews[key] = value
 
+    episodic = None
+    if raw.get("episodic") is not None:
+        try:
+            episodic = parse_cadence(raw["episodic"], where)
+        except ValueError as exc:
+            raise FeedError(str(exc)) from exc
+
+    start = _build_start(raw.get("start"), where, episodic)
+
     return FeedConfig(
         url=url,
         name=name.strip(),
@@ -350,8 +369,44 @@ def _build_feed_config(raw: object, index: int) -> FeedConfig:
         filters=_build_filters(raw, where),
         extract=_build_extracts(raw.get("extract"), where),
         link_preview=link_preview,
+        episodic=episodic,
+        start=start,
         **previews,
     )
+
+
+def _build_start(raw: object, where: str, episodic: Cadence | None) -> datetime | None:
+    """Validate the ``start`` date an episodic feed begins its walk at.
+
+    Only meaningful on an episodic feed: on a ticker the first run sends the
+    newest item and everything before it is behind us by definition, so a
+    ``start`` there would be a setting that quietly did nothing.
+
+    A bare date means midnight UTC, which is what somebody writing ``2019-01-01``
+    means by it. The stamp is compared against feed timestamps, so it has to be
+    aware; a naive one is read as UTC, as everywhere else here.
+    """
+    if raw is None:
+        return None
+    if episodic is None:
+        raise FeedError(
+            f"{where} has a \"start\" but is not \"episodic\". start says where a "
+            "series begins; a feed without a cadence starts at its newest item "
+            "and moves forward, so there is nothing for it to say. Add "
+            "\"episodic\", or drop \"start\" and replay with `rssignal run "
+            "--since` instead."
+        )
+    if not isinstance(raw, str):
+        raise FeedError(f"{where} start must be a date like \"2019-01-01\".")
+
+    try:
+        when = datetime.fromisoformat(raw.strip())
+    except ValueError as exc:
+        raise FeedError(
+            f"{where} start {raw!r} is not a date rssignal can read. Use "
+            "\"2019-01-01\", or a full \"2019-01-01T12:00:00+00:00\"."
+        ) from exc
+    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
 
 
 def _build_extracts(raw: object, where: str) -> tuple[FieldExtract, ...]:
@@ -480,7 +535,7 @@ def _numeric_filter(
     return FeedFilter(field=field_name, op=op, values=(text,))
 
 
-def _read(url: str) -> feedparser.FeedParserDict:
+def _read(url: str, *, conditional: bool = True) -> feedparser.FeedParserDict:
     """Fetch and parse ``url``, raising :class:`FeedError` if it can't be read.
 
     feedparser doesn't raise on network or parse trouble; it records it on the
@@ -492,16 +547,22 @@ def _read(url: str) -> feedparser.FeedParserDict:
     feed with nothing new answers ``304`` and sends no body at all. rssignal is
     built to be run often and mostly find nothing, which is exactly the case that
     pays for.
+
+    ``conditional`` off asks for the body regardless. That is for an episodic
+    feed, whose work does not depend on the feed having changed: it is walking a
+    back catalogue years behind the newest item, and "nothing new" is both true
+    and beside the point. It is not the saving it looks like either — a paced
+    feed is only fetched at all on the runs where an episode is actually due.
     """
-    known = cache.get(_HTTP_NS, url) or {}
+    known = (cache.get(_HTTP_NS, url) or {}) if conditional else {}
     # Passed only when there is something to pass, so a feed nobody has a
     # validator for is fetched exactly as it always was.
-    conditional = {
+    conditional_args = {
         name: known[name]
         for name in ("etag", "modified")
         if isinstance(known, dict) and known.get(name)
     }
-    parsed = feedparser.parse(url, **conditional)
+    parsed = feedparser.parse(url, **conditional_args)
 
     if getattr(parsed, "status", None) == 304:
         # Unchanged since last time; there is no body to look at and no reason to
@@ -536,6 +597,10 @@ def parse_feed(cfg: FeedConfig) -> ParsedFeed:
     the video is — so that ``duration_seconds`` is an ordinary field like any
     other. See :func:`~rssignal.video.annotate_durations`.
 
+    An episodic feed gets one thing more: everything the source published before
+    the handful its feed still lists, which is the material a series is made of.
+    See :func:`~rssignal.video.with_archive`.
+
     Raises :class:`SourceBlocked` before doing any of that, if the source turns
     out to be one this machine currently can't reach at all.
     """
@@ -547,6 +612,7 @@ def parse_feed(cfg: FeedConfig) -> ParsedFeed:
         channel_feed_url,
         check_source_available,
         collection_feed,
+        with_archive,
     )
 
     check_source_available(cfg.url)
@@ -560,7 +626,7 @@ def parse_feed(cfg: FeedConfig) -> ParsedFeed:
         cfg = replace(cfg, url=feed_url)
 
     with timing.step("feedparser", cfg.name or cfg.url):
-        parsed = retrying(lambda: _read(cfg.url))
+        parsed = retrying(lambda: _read(cfg.url, conditional=cfg.episodic is None))
 
     if getattr(parsed, "status", None) == 304:
         # Nothing has changed since the last run, so there is nothing to build
@@ -579,6 +645,12 @@ def parse_feed(cfg: FeedConfig) -> ParsedFeed:
     # exist because they are looked up per feed, not per entry.
     items = [_build_feed_item(entry, cfg.name) for entry in parsed.entries]
     items = annotate_durations(cfg.url, items)
+
+    # The back catalogue, for an episodic feed only, and after durations because
+    # the archive brings its own — a listing reports them, so the items that come
+    # back from here are already annotated and filter the same as the rest.
+    if cfg.episodic is not None:
+        items = with_archive(cfg.url, items, feed_name=cfg.name)
 
     return ParsedFeed(
         items=[apply_extracts(item, cfg.extract) for item in items],

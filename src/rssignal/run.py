@@ -53,11 +53,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Iterator
 
 from . import cache, pending, timing
 from .download import download_temp
+from .episodic import allowance, next_release
 from .errorlog import log_exception, log_line
 from .feeds import (
     FeedConfig,
@@ -89,7 +90,12 @@ from .signal_cli import (
     update_group,
 )
 from .video import VideoTooShort, is_video_item, resolve_video, video_temp
-from .watermark import compose_description, read_watermark, strip_watermark
+from .watermark import (
+    compose_description,
+    read_pace,
+    read_watermark,
+    strip_watermark,
+)
 
 
 # How long any one network read may sit there before it is given up on. This is
@@ -327,7 +333,15 @@ def _run_prepared(
     # Fetching is the slow part and feeds don't depend on each other, so it all
     # happens at once; sending stays sequential below. With --to no group is
     # touched at all, so there is no listing worth priming.
-    prepared = _prepare_feeds(feeds, resolver, prime=to is None)
+    #
+    # --since is an explicit replay of a particular stretch of a feed, so it
+    # overrides a pace the same way it overrides a watermark: the gate comes off
+    # and an episodic feed is fetched and sent like any other. A dry run lifts it
+    # too — it is somebody sitting and watching, who is owed the real answer for
+    # a paced feed ("four waiting, next one Thursday") rather than silence.
+    prepared = _prepare_feeds(
+        feeds, resolver, prime=to is None, gate=since is None and not dry_run
+    )
 
     sent = 0
     failed = 0
@@ -411,7 +425,7 @@ class _Prepared:
 
 
 def _prepare_feeds(
-    feeds: list[FeedConfig], resolver: _GroupResolver, *, prime: bool
+    feeds: list[FeedConfig], resolver: _GroupResolver, *, prime: bool, gate: bool = True
 ) -> list[_Prepared]:
     """Fetch and filter every feed at once, in ``feeds`` order.
 
@@ -431,19 +445,60 @@ def _prepare_feeds(
         ) as pool:
             if prime:
                 pool.submit(resolver.prime)
-            futures = [pool.submit(_prepare_feed, cfg) for cfg in feeds]
+            futures = [
+                pool.submit(_prepare_feed, cfg, resolver, gate=gate and prime)
+                for cfg in feeds
+            ]
             return [future.result() for future in futures]
 
 
-def _prepare_feed(cfg: FeedConfig) -> _Prepared:
-    """Fetch and filter one feed, catching whatever went wrong. Runs on a worker."""
+def _prepare_feed(
+    cfg: FeedConfig, resolver: _GroupResolver, *, gate: bool
+) -> _Prepared:
+    """Fetch and filter one feed, catching whatever went wrong. Runs on a worker.
+
+    A paced feed with nothing due yet is not fetched at all. That is worth the
+    look it costs: an episodic YouTube feed reads a whole channel's uploads and
+    dates the videos it hasn't seen, and with a run every fifteen minutes and an
+    episode every few days, the overwhelming majority of runs would do all of it
+    only to be told to hold the episode back. See :func:`_holding`.
+
+    Asking means reading the group listing, which :meth:`_GroupResolver.prime` is
+    already fetching in this same pool — ``_listing`` is locked and idempotent, so
+    this waits for that rather than duplicating it.
+
+    ``gate`` is off for the three cases that have no business being rationed:
+    ``--to`` (no group, so no clock), ``--since`` (an explicit replay) and
+    ``--dry-run`` (somebody watching, who is owed the real answer).
+    """
     try:
         with timing.step("feed fetch", cfg.name or cfg.url):
+            if gate and _holding(cfg, resolver):
+                return _Prepared(parsed=ParsedFeed(items=[]))
             parsed = parse_feed(cfg)
             items = apply_filters(parsed.items, cfg.filters)
         return _Prepared(parsed=parsed, items=items)
     except Exception as exc:
         return _Prepared(error=exc)
+
+
+def _holding(cfg: FeedConfig, resolver: _GroupResolver) -> bool:
+    """Whether ``cfg`` is a paced feed whose next episode isn't due yet.
+
+    A feed with no group yet has never released anything, so it is never holding:
+    its first episode goes out on this run and starts the clock.
+    """
+    if cfg.episodic is None or cfg.episodic.interval is None:
+        return False
+    group = resolver.find(cfg.name)
+    if group is None:
+        return False
+    return allowance(cfg.episodic, read_pace(group.description), _now()) < 1
+
+
+def _now() -> datetime:
+    """The current moment, in UTC. One place, so a test can move it."""
+    return datetime.now(timezone.utc)
 
 
 def _worker_count(feeds: int) -> int:
@@ -539,13 +594,26 @@ def _send_prepared(
     # a send that has no effect on rssignal's idea of where a feed got to.
     group = None if to else resolver.find(cfg.name)
     mark = since or (read_watermark(group.description) if group else None)
+    if mark is None and cfg.start is not None:
+        # A series told where to begin. The start date stands in for the
+        # watermark this feed would have had if it had already got that far.
+        mark = cfg.start
 
     if mark is None:
-        # Nothing remembered yet. One item, not the whole back catalogue.
-        latest = newest(items)
-        due = [latest] if latest else []
+        if cfg.episodic is not None:
+            # A series, opening at its beginning: the whole back catalogue is
+            # ahead of us, oldest first. What keeps that from arriving all at
+            # once is the pace, applied below.
+            due = filter_since(items, None)
+        else:
+            # Nothing remembered yet. One item, not the whole back catalogue.
+            latest = newest(items)
+            due = [latest] if latest else []
     else:
         due = filter_since(items, mark)
+
+    if cfg.episodic is not None and since is None:
+        due = _paced(cfg, group, due, to)
     if not due:
         return 0
 
@@ -569,8 +637,14 @@ def _send_prepared(
     # now, since SignalGroup is frozen and its own copy goes stale immediately.
     current = "" if to else group.description
     sent = 0
+    # The clock is stamped with the moment the episode is released, alongside the
+    # watermark and in the same write, so the two can't disagree — and so a
+    # rollback puts both back together.
+    paced = _now() if cfg.episodic is not None else None
     for item in due:
-        marked = current if to else _record_progress(group, parsed, item, current)
+        marked = (
+            current if to else _record_progress(group, parsed, item, current, paced)
+        )
         try:
             _handle_item(cfg, item, recipient, dry_run=False)
         except Exception:
@@ -585,8 +659,42 @@ def _send_prepared(
     return sent
 
 
+def _paced(
+    cfg: FeedConfig, group: SignalGroup | None, due: list[FeedItem], to: str | None
+) -> list[FeedItem]:
+    """Cut ``due`` down to what this feed's cadence allows right now.
+
+    ``due`` is oldest-first, so this takes from the front: the next episode in
+    the series, not the newest thing the source has posted.
+
+    ``--to`` gets exactly one episode however the feed is paced. It touches no
+    group by design, so there is no clock to read and nothing to write one to —
+    and an unpaced feed emptying its whole archive onto a phone number is not
+    what anyone typing a one-off test means.
+
+    A feed that has no group *yet* is a different thing: it has simply never
+    released anything, which is the case the cadence already answers.
+    """
+    if to is not None:
+        return due[:1]
+
+    released = read_pace(group.description) if group is not None else None
+    permitted = allowance(cfg.episodic, released, _now())
+    if permitted < 1 and due:
+        when = next_release(cfg.episodic, released)
+        print(
+            f"[{cfg.name}] {len(due)} episode(s) waiting; next one due "
+            f"{when:%Y-%m-%d %H:%M} UTC ({cfg.episodic.describe()})."
+        )
+    return due[:permitted]
+
+
 def _record_progress(
-    group: SignalGroup, parsed: ParsedFeed, item: FeedItem, current: str
+    group: SignalGroup,
+    parsed: ParsedFeed,
+    item: FeedItem,
+    current: str,
+    paced: datetime | None = None,
 ) -> str:
     """Move ``group``'s watermark to ``item``, and return the description now on it.
 
@@ -594,6 +702,11 @@ def _record_progress(
     the chat appears above the item rather than after it. ``current`` is what the
     description says at this point in the run — not ``group.description``, which
     is a snapshot from the listing and goes stale after the first item.
+
+    ``paced`` is the release time for an episodic feed, written in the same
+    update. The two markers answer different questions — how far through we are,
+    and when we were last given a piece of it — and both are needed to work out
+    what happens next.
 
     The blurb kept is the group's own, not the feed's: edit a group description
     in Signal and rssignal moves the marker around your text instead of pasting
@@ -606,7 +719,7 @@ def _record_progress(
     """
     blurb = strip_watermark(current) or parsed.description
     description = compose_description(
-        blurb, item.published, limit=GROUP_DESCRIPTION_MAX_CHARS
+        blurb, item.published, limit=GROUP_DESCRIPTION_MAX_CHARS, paced=paced
     )
     try:
         update_group(group.id, description=description)

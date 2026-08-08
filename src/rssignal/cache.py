@@ -12,10 +12,18 @@ which keeps its own file beside this one.
 
 What it holds is the work a run repeats for no reason. An ARTE programme's
 rights window began when it began; a YouTube ``@handle`` has named the same
-channel since it was created; a feed that has not changed will say so if it is
-asked with the ETag it gave out last time. Re-deriving those cost a run some
-forty HTTP round trips and a couple of yt-dlp launches, every fifteen minutes,
-to arrive back at yesterday's answer.
+channel since it was created; a video went up when it went up; a feed that has
+not changed will say so if it is asked with the ETag it gave out last time.
+Re-deriving those cost a run some forty HTTP round trips and a couple of yt-dlp
+launches, every fifteen minutes, to arrive back at yesterday's answer.
+
+The YouTube entries an episodic feed leans on (:mod:`rssignal.episodic`) are a
+closer call than the rest, because that feed's items are built out of them — but
+they stay on the right side of the line, and it is worth being able to say why.
+Neither is a record of what rssignal *did*: one is the order YouTube lists a
+channel's uploads in, the other is when each of them went up, and both come back
+identical when they are asked for again. Deleting them costs a slow run and one
+long listing, and the same episode goes out either way.
 
 Entries are namespaced and carry the time they were stored, so each kind of
 answer can be trusted for as long as it deserves — see the ``*_TTL`` constants.
@@ -60,6 +68,26 @@ YOUTUBE_CHANNEL_TTL = 90 * 24 * 60 * 60
 # goes stale, since the "latest fifteen" moves. Short enough that a new upload is
 # never held back by more than one run's worth of time.
 YOUTUBE_DURATIONS_TTL = 60 * 60
+
+# A channel's uploads playlist, in order: what an episodic YouTube feed walks
+# (see :mod:`rssignal.episodic`). It grows at the newest end and never reorders
+# behind that, so a week-old copy is a week-old copy of a correct answer, and
+# re-reading it costs a single request that returns a thousand videos.
+YOUTUBE_UPLOADS_TTL = 7 * 24 * 60 * 60
+
+# When a particular video went up. Fixed for the life of the video, and dear to
+# ask for — one yt-dlp launch each, because the playlist listing doesn't carry
+# dates. Kept indefinitely, like ARTE's.
+YOUTUBE_PUBLISHED_TTL = None
+
+# A video rssignal has been told it cannot have: age-gated, private,
+# members-only, removed. Unlike ARTE's undated programmes this is kept for good,
+# and the asymmetry is deliberate. Skipping such a video moves the watermark past
+# it; if it were asked about again later and answered, its date would be behind
+# that watermark and it would never be sent — a silently missing episode, which
+# is the one outcome worth ruling out. A video we cannot read the date of is one
+# we could not have downloaded either, so nothing is lost by it being final.
+YOUTUBE_UNDATED_TTL = None
 
 _lock = threading.Lock()
 _data: dict[str, dict[str, Any]] | None = None

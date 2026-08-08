@@ -8,13 +8,16 @@ from datetime import datetime, timezone
 
 from rssignal.watermark import (
     compose_description,
+    format_pace,
     format_watermark,
+    read_pace,
     read_watermark,
     shorten,
     strip_watermark,
 )
 
 WHEN = datetime(2026, 7, 23, 10, 3, 0, tzinfo=timezone.utc)
+RELEASED = datetime(2026, 8, 8, 9, 12, 44, tzinfo=timezone.utc)
 BLURB = "A made-up show about made-up things."
 
 
@@ -90,6 +93,62 @@ def test_compose_replaces_an_existing_marker_rather_than_stacking_them():
 
     assert second.count("[rssignal") == 1
     assert read_watermark(second) == later
+
+
+# --- the pace marker, for an episodic feed ---------------------------------
+
+
+def test_both_markers_round_trip():
+    description = compose_description(BLURB, WHEN, limit=480, paced=RELEASED)
+
+    assert read_watermark(description) == WHEN
+    assert read_pace(description) == RELEASED
+    assert strip_watermark(description) == BLURB
+
+
+def test_the_two_markers_do_not_read_each_other():
+    """The space after the name is the whole of what keeps them apart."""
+    assert read_watermark(format_pace(RELEASED)) is None
+    assert read_pace(format_watermark(WHEN)) is None
+
+
+def test_a_feed_without_a_pace_gets_one_marker_as_before():
+    description = compose_description(BLURB, WHEN, limit=480)
+    assert read_pace(description) is None
+    assert description.count("[rssignal") == 1
+
+
+def test_recomposing_replaces_both_markers_rather_than_stacking_them():
+    first = compose_description(BLURB, WHEN, limit=480, paced=RELEASED)
+    later = compose_description(
+        first, WHEN.replace(hour=18), limit=480, paced=RELEASED.replace(hour=20)
+    )
+
+    assert later.count("[rssignal ") == 1
+    assert later.count("[rssignal-paced ") == 1
+    assert read_watermark(later).hour == 18
+    assert read_pace(later).hour == 20
+
+
+def test_a_feed_that_stops_being_episodic_loses_its_pace_marker():
+    paced = compose_description(BLURB, WHEN, limit=480, paced=RELEASED)
+    assert read_pace(compose_description(paced, WHEN, limit=480)) is None
+
+
+def test_both_markers_survive_a_blurb_that_wants_the_whole_description():
+    description = compose_description("word " * 300, WHEN, limit=480, paced=RELEASED)
+
+    assert len(description) <= 480
+    assert read_watermark(description) == WHEN
+    assert read_pace(description) == RELEASED
+
+
+def test_an_unreadable_pace_marker_counts_as_absent():
+    assert read_pace(f"{BLURB}\n\n[rssignal-paced never]") is None
+
+
+def test_a_naive_pace_stamp_is_read_as_utc():
+    assert read_pace("[rssignal-paced 2026-08-08T09:12:44]") == RELEASED
 
 
 def test_shorten_leaves_short_text_alone():

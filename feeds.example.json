@@ -22,6 +22,12 @@
       "duration_seconds_min": "7:00",
       "duration_seconds_max": "30:00",
       "published_weekday_contains": ["Tuesday", "Wednesday", "Thursday", "Friday"]
+    },
+    {
+      "name": "Some Series From The Start",
+      "url": "https://www.youtube.com/@example",
+      "episodic": "2-weekly",
+      "start": "2019-01-01"
     }
   ]
 }
