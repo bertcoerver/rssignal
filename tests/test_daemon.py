@@ -414,3 +414,147 @@ def test_list_groups_falls_back_to_one_shot_when_the_daemon_dies(
 
     assert [g.name for g in groups] == ["A Feed"]
     capsys.readouterr()
+
+
+# --- creating a group ------------------------------------------------------
+#
+# Unlike everything above, create_group going through the daemon is not a speed
+# measure. signal-cli opens the account exclusively, so a one-shot `updateGroup`
+# launched while the run's own jsonRpc process is up blocks on a lock held until
+# the run ends and dies on its timeout. That is a bug rssignal shipped: every
+# feed whose group did not already exist failed for as long as the daemon lived.
+
+
+def _no_groups(monkeypatch, appearing=()):
+    """Make list_groups return nothing, then `appearing` on later calls."""
+    answers = iter([[], list(appearing)])
+
+    def listing(*a, **k):
+        try:
+            return next(answers)
+        except StopIteration:
+            return list(appearing)
+
+    monkeypatch.setattr(signal_cli, "list_groups", listing)
+
+
+def _group(group_id, name="3Blue1Brown"):
+    return signal_cli.SignalGroup(id=group_id, name=name, description="")
+
+
+def test_creating_a_group_goes_through_the_daemon(have_binary, monkeypatch):
+    fake = FakeRpc(result={"groupId": "NEW="})
+    monkeypatch.setattr(signal_cli, "_daemon", fake)
+    _no_groups(monkeypatch)
+    monkeypatch.setattr(signal_cli, "update_group", lambda *a, **k: None)
+    monkeypatch.setattr(
+        signal_cli.subprocess,
+        "run",
+        lambda *a, **k: pytest.fail("a one-shot signal-cli would deadlock here"),
+    )
+
+    group = signal_cli.create_group("3Blue1Brown", account="+31600000000")
+
+    assert group.id == "NEW="
+    method, params = fake.calls[0]
+    assert method == "updateGroup"
+    assert params["name"] == "3Blue1Brown"
+
+
+def test_the_announcement_flag_survives_the_daemon(have_binary, monkeypatch):
+    # camelCase of --set-permission-send-messages. Wrong here and every feed
+    # group silently lets anyone post.
+    fake = FakeRpc(result={"groupId": "NEW="})
+    monkeypatch.setattr(signal_cli, "_daemon", fake)
+    _no_groups(monkeypatch)
+    monkeypatch.setattr(signal_cli, "update_group", lambda *a, **k: None)
+
+    signal_cli.create_group(
+        "3Blue1Brown", announcement_only=True, account="+31600000000"
+    )
+
+    _, params = fake.calls[0]
+    assert params["setPermissionSendMessages"] == "only-admins"
+
+
+def test_a_created_group_with_an_unreadable_id_is_found_by_elimination(
+    have_binary, monkeypatch
+):
+    fake = FakeRpc(result=None)
+    monkeypatch.setattr(signal_cli, "_daemon", fake)
+    _no_groups(monkeypatch, appearing=[_group("FOUND=")])
+    monkeypatch.setattr(signal_cli, "update_group", lambda *a, **k: None)
+    monkeypatch.setattr(
+        signal_cli.subprocess,
+        "run",
+        lambda *a, **k: pytest.fail("the group already exists; asking again duplicates it"),
+    )
+
+    group = signal_cli.create_group("3Blue1Brown", account="+31600000000")
+
+    assert group.id == "FOUND="
+
+
+def test_a_daemon_that_dies_creating_a_group_does_not_create_a_second(
+    have_binary, monkeypatch, capsys
+):
+    # The request may have been acted on before the process went. Asking the
+    # listing is the only way to tell, and a blind retry would leave the user
+    # with two groups of the same name and a feed watermarking one of them.
+    dead = DeadRpc()
+    monkeypatch.setattr(signal_cli, "_daemon", dead)
+    _no_groups(monkeypatch, appearing=[_group("MADE=")])
+    monkeypatch.setattr(signal_cli, "update_group", lambda *a, **k: None)
+    monkeypatch.setattr(
+        signal_cli.subprocess,
+        "run",
+        lambda *a, **k: pytest.fail("it was already created; this makes a duplicate"),
+    )
+
+    group = signal_cli.create_group("3Blue1Brown", account="+31600000000")
+
+    assert group.id == "MADE="
+    capsys.readouterr()
+
+
+def test_a_daemon_that_died_before_creating_falls_back_to_one_shot(
+    have_binary, monkeypatch, capsys
+):
+    dead = DeadRpc()
+    monkeypatch.setattr(signal_cli, "_daemon", dead)
+    _no_groups(monkeypatch)
+    monkeypatch.setattr(signal_cli, "update_group", lambda *a, **k: None)
+    argv_used = []
+    monkeypatch.setattr(
+        signal_cli.subprocess,
+        "run",
+        lambda argv, **k: argv_used.append(argv)
+        or SimpleNamespace(
+            returncode=0, stdout=json.dumps({"groupId": "SLOW="}), stderr=""
+        ),
+    )
+
+    group = signal_cli.create_group("3Blue1Brown", account="+31600000000")
+
+    assert group.id == "SLOW="
+    assert argv_used and "--name" in argv_used[0]
+
+
+def test_without_a_daemon_creating_a_group_is_unchanged(have_binary, monkeypatch):
+    monkeypatch.setattr(signal_cli, "_daemon", None)
+    _no_groups(monkeypatch)
+    monkeypatch.setattr(signal_cli, "update_group", lambda *a, **k: None)
+    argv_used = []
+    monkeypatch.setattr(
+        signal_cli.subprocess,
+        "run",
+        lambda argv, **k: argv_used.append(argv)
+        or SimpleNamespace(
+            returncode=0, stdout=json.dumps({"groupId": "OLD="}), stderr=""
+        ),
+    )
+
+    group = signal_cli.create_group("3Blue1Brown", account="+31600000000")
+
+    assert group.id == "OLD="
+    assert "--name" in argv_used[0]

@@ -1249,3 +1249,26 @@ def test_clip_never_cuts_off_a_trailing_watermark():
 
     assert clipped.endswith(marker)
     assert len(clipped) <= 200
+
+
+PACE = "[rssignal-paced 2026-08-08T13:59:54+00:00]"
+WATERMARK = "[rssignal 2026-07-23T10:03:00+00:00]"
+
+
+def test_clip_keeps_the_pace_marker_beside_the_watermark():
+    # _clip recomposes, and recomposing strips both markers before re-appending.
+    # Only naming the watermark dropped the pace marker on every single write,
+    # far below any limit — a feed with no pace marker looks like one that has
+    # never released anything, so every run thinks an episode is due.
+    kept = signal_cli._clip(f"A blurb.\n\n{WATERMARK}\n{PACE}")
+
+    assert PACE in kept
+    assert WATERMARK in kept
+
+
+def test_a_long_blurb_loses_length_and_not_the_pace_marker():
+    clipped = signal_cli._clip(f"{'word ' * 300}\n\n{WATERMARK}\n{PACE}", limit=200)
+
+    assert clipped.endswith(PACE)
+    assert WATERMARK in clipped
+    assert len(clipped) <= 200

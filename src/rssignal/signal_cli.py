@@ -27,7 +27,7 @@ from PIL import Image, UnidentifiedImageError
 
 from . import timing
 from .config import ConfigError, get_config
-from .watermark import compose_description, read_watermark, shorten
+from .watermark import compose_description, read_pace, read_watermark, shorten
 
 # Signal silently drops a group avatar that is too large: the upload is accepted,
 # signal-cli exits 0, and the group simply keeps no picture. 1400x1400 is dropped,
@@ -694,6 +694,17 @@ def _parse_new_group_id(stdout: str) -> str | None:
     return None
 
 
+def _only_new_group(before: set[str], account: str | None) -> str | None:
+    """The id of the one group that has appeared since ``before`` was taken.
+
+    ``None`` when none has or when several have — in either case the answer is
+    not knowable from a listing alone, and guessing would attach a feed's
+    watermark to somebody else's group.
+    """
+    fresh = [g.id for g in list_groups(account=account) if g.id not in before]
+    return fresh[0] if len(fresh) == 1 else None
+
+
 def create_group(
     name: str,
     *,
@@ -732,6 +743,12 @@ def create_group(
     :data:`GROUP_EXPIRATION_SECONDS` — see there for why that costs rssignal
     nothing. Existing groups are never touched.
 
+    Goes through the run's daemon when there is one. That is not optional the
+    way it is for the calls that only want the speed: a one-shot ``signal-cli``
+    cannot open an account another ``signal-cli`` already holds, so creating a
+    group without the daemon is not slow but impossible for as long as the run
+    lasts.
+
     The returned :class:`SignalGroup` carries the new base64 id; its
     :attr:`~SignalGroup.recipient` is ready to send to.
     """
@@ -751,41 +768,76 @@ def create_group(
     # command's output can't be parsed.
     before = {group.id for group in list_groups(account=account)}
 
-    # No -g means "create"; no -m means the group starts with only this account.
-    # --avatar and --description are deliberately absent: see the docstring.
-    argv = [binary, "-o", "json", "-a", account, "updateGroup", "--name", name]
-    if announcement_only:
-        argv.extend(["--set-permission-send-messages", "only-admins"])
+    group_id: str | None = None
+    # Whether the group now exists. Kept separate from ``group_id``, which can
+    # be unknown for a group that was certainly created: the two questions have
+    # different answers and asking a second time costs a second group.
+    exists = False
 
-    try:
-        with timing.step("signal-cli", "updateGroup (create)"):
-            result = subprocess.run(
-                argv, capture_output=True, text=True, timeout=timeout
+    if _daemon is not None:
+        # Creating a group has to go through the daemon when there is one, and
+        # not merely to save a JVM start. signal-cli holds the account
+        # exclusively, so a one-shot `updateGroup` started while the run's own
+        # jsonRpc process is up waits on a lock that is not released until the
+        # run ends, and dies on the timeout instead. Every group rssignal tried
+        # to create mid-run failed exactly that way.
+        params: dict = {"name": name}
+        if announcement_only:
+            params["setPermissionSendMessages"] = "only-admins"
+        try:
+            answer = _daemon.request("updateGroup", params, timeout=timeout)
+            exists = True
+            if isinstance(answer, dict):
+                found = answer.get("groupId")
+                if isinstance(found, str) and found:
+                    group_id = found
+        except DaemonGone as exc:
+            # Not repeatable the way update_group's fallback is: that one sets
+            # fields to what they were asked to be, while a second create makes
+            # a second group. The daemon can die either side of signal-cli
+            # acting on the request, so the listing is asked which happened
+            # rather than assuming the more convenient answer.
+            _retire_daemon(exc)
+            group_id = _only_new_group(before, account)
+            exists = group_id is not None
+
+    if not exists:
+        # No -g means "create"; no -m means the group starts with only this
+        # account. --avatar and --description are deliberately absent: see the
+        # docstring.
+        argv = [binary, "-o", "json", "-a", account, "updateGroup", "--name", name]
+        if announcement_only:
+            argv.extend(["--set-permission-send-messages", "only-admins"])
+
+        try:
+            with timing.step("signal-cli", "updateGroup (create)"):
+                result = subprocess.run(
+                    argv, capture_output=True, text=True, timeout=timeout
+                )
+        except subprocess.TimeoutExpired as exc:
+            raise SignalSendError(
+                f"`signal-cli updateGroup` timed out after {timeout}s. The group may "
+                "or may not have been created — check `rssignal groups`.",
+                stderr=(exc.stderr or "") if isinstance(exc.stderr, str) else "",
+            ) from exc
+
+        if result.returncode != 0:
+            raise SignalSendError(
+                f"`signal-cli updateGroup` failed with status {result.returncode}: "
+                f"{result.stderr.strip()}",
+                returncode=result.returncode,
+                stderr=result.stderr.strip(),
             )
-    except subprocess.TimeoutExpired as exc:
-        raise SignalSendError(
-            f"`signal-cli updateGroup` timed out after {timeout}s. The group may "
-            "or may not have been created — check `rssignal groups`.",
-            stderr=(exc.stderr or "") if isinstance(exc.stderr, str) else "",
-        ) from exc
 
-    if result.returncode != 0:
-        raise SignalSendError(
-            f"`signal-cli updateGroup` failed with status {result.returncode}: "
-            f"{result.stderr.strip()}",
-            returncode=result.returncode,
-            stderr=result.stderr.strip(),
-        )
+        group_id = _parse_new_group_id(result.stdout)
 
-    group_id = _parse_new_group_id(result.stdout)
     if group_id is None:
-        created = [g for g in list_groups(account=account) if g.id not in before]
-        if len(created) != 1:
+        group_id = _only_new_group(before, account)
+        if group_id is None:
             raise SignalSendError(
                 "The group was created, but its id could not be determined from "
                 "signal-cli's output. Run `rssignal groups` to find it."
             )
-        group_id = created[0].id
 
     applied = ""
     try:
@@ -816,10 +868,17 @@ def _clip(text: str, limit: int = GROUP_DESCRIPTION_MAX_CHARS) -> str:
     front of it: the marker is what the next run reads to know how far the feed
     got, so losing it would silently resend items. The blurb is shortened
     instead. See :mod:`rssignal.watermark`.
+
+    An episodic feed's pace marker is carried through the same way, and has to
+    be read back out explicitly: recomposing strips *both* markers off the blurb
+    before re-appending, so anything not named here is not shortened but
+    dropped. Losing this one is quiet and expensive — a feed with no pace marker
+    reads as one that has never released anything, so every run would consider
+    an episode due and the whole back catalogue would go out one run at a time.
     """
     mark = read_watermark(text)
     if mark is not None:
-        return compose_description(text, mark, limit=limit)
+        return compose_description(text, mark, limit=limit, paced=read_pace(text))
     return shorten(text, limit)
 
 
