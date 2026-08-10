@@ -232,6 +232,28 @@ def test_send_msg_retries_a_network_failure(have_binary, monkeypatch):
     assert len(calls) == 2
 
 
+def test_send_msg_retries_a_closed_chat_service(have_binary, monkeypatch):
+    # The failure the YouTube feeds hit: the machine dozes off mid-upload and
+    # the websocket goes with it. signal-cli reports that as a bad attachment,
+    # so the marker that matters is the closed connection underneath it.
+    inactive = (
+        "Failed to send message: /tmp/rssignal-video-pqr3dtl3/video.mp4: "
+        "org.signal.libsignal.net.ChatServiceInactiveException: the connection "
+        "was closed (AttachmentInvalidException) (UnexpectedErrorException)"
+    )
+    calls = []
+
+    def fake_run(*a, **k):
+        calls.append(a)
+        if len(calls) == 1:
+            return _completed(returncode=1, stderr=inactive)
+        return _completed()
+
+    monkeypatch.setattr(signal_cli.subprocess, "run", fake_run)
+    send_msg("hi", recipient="+31611111111", account="+31600000000")
+    assert len(calls) == 2
+
+
 def test_send_msg_gives_up_after_the_last_attempt(have_binary, monkeypatch):
     reset = "java.net.SocketException: Connection reset (PushNetworkException)"
     calls = []
@@ -997,6 +1019,17 @@ def test_match_group_skips_groups_you_left_or_blocked():
 
 def test_match_group_returns_none_when_absent():
     assert match_group([_BOOK], "Weekend plans") is None
+
+
+def test_match_group_picks_the_live_one_of_a_duplicated_name():
+    # The state a feed ends up in after its group is recreated: the abandoned
+    # one keeps the name and its stale watermark. It is not a duplicate to
+    # agonise over — you are not in it — so the live one is simply the answer.
+    groups = [
+        SignalGroup(id="dead=", name="3Blue1Brown", active=False),
+        SignalGroup(id="live=", name="3Blue1Brown", active=True),
+    ]
+    assert match_group(groups, "3Blue1Brown").id == "live="
 
 
 def test_match_group_refuses_to_guess_between_duplicates():

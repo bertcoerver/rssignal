@@ -110,6 +110,12 @@ _TRANSIENT_SEND_MARKERS = (
     "ConnectException",
     "Connection reset",
     "Connection refused",
+    # The websocket to the chat service going away underneath an upload, which
+    # is what a laptop dozing off mid-run looks like from here. signal-cli wraps
+    # it as AttachmentInvalidException, which reads like a complaint about the
+    # file and isn't one: the same mp4 goes up without argument once there is a
+    # connection to put it on.
+    "ChatServiceInactiveException",
 )
 
 

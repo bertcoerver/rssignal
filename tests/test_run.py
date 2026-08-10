@@ -303,7 +303,7 @@ def test_run_video_download_failure_still_sends_the_text(monkeypatch, capsys):
     assert "video skipped: ffmpeg failed: 403" in capsys.readouterr().err
 
 
-def test_run_too_short_video_sends_nothing_at_all(monkeypatch, capsys):
+def test_run_too_short_video_sends_nothing_at_all(monkeypatch, capsys, error_log):
     """A Short is not a message — and its watermark stands, so it stays gone."""
     cfg = FeedConfig(url="https://a", name="Tube")
     item = FeedItem(title="A Short", description="d", link=YOUTUBE_LINK)
@@ -317,9 +317,13 @@ def test_run_too_short_video_sends_nothing_at_all(monkeypatch, capsys):
     # Not downloaded either: refused before anything was fetched.
     assert seen == []
     assert "skipped: 47s — a Short" in capsys.readouterr().err
+    # The watermark stands, which is what stops it being reconsidered — but
+    # nothing reached the group, so the run does not claim to have sent it.
     assert calls["updated"]
-    # It counts as dealt with, which is what stops it being reconsidered.
-    assert count == 1
+    assert count == 0
+    # And the reason is in the log, because stderr is nowhere under a scheduler
+    # and a silent skip is exactly what someone comes to the log to find.
+    assert "[Tube] skipped: 47s — a Short" in error_log.read_text()
 
 
 def test_run_dry_run_reports_the_video_quality(monkeypatch, capsys):
@@ -343,9 +347,12 @@ def test_run_dry_run_reports_a_video_it_would_not_send(monkeypatch, capsys):
 
     monkeypatch.setattr(run, "resolve_video", boom)
 
-    run_feeds("feeds.json", dry_run=True)
+    count = run_feeds("feeds.json", dry_run=True)
 
     assert "nothing sent: 47s — a Short" in capsys.readouterr().out
+    # Described but not counted, so the number a dry run reports is the number
+    # a real run would send rather than the number it would look at.
+    assert count == 0
 
 
 def test_run_dry_run_reports_an_unavailable_video(monkeypatch, capsys):

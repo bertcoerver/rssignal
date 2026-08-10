@@ -619,9 +619,10 @@ def _send_prepared(
 
     if dry_run:
         where = to or (group.recipient if group else f"(group {cfg.name!r} would be created)")
-        for item in due:
-            _handle_item(cfg, item, where, dry_run=True)
-        return len(due)
+        # Counted the same way a real run counts: an item a real run would step
+        # over is described, and then not counted, so the tally a dry run
+        # reports is the tally the evening would actually produce.
+        return sum(_handle_item(cfg, item, where, dry_run=True) for item in due)
 
     if to:
         recipient = to
@@ -646,15 +647,19 @@ def _send_prepared(
             current if to else _record_progress(group, parsed, item, current, paced)
         )
         try:
-            _handle_item(cfg, item, recipient, dry_run=False)
+            delivered = _handle_item(cfg, item, recipient, dry_run=False)
         except Exception:
             # The marker promised an item that never arrived. Put the old
             # description back so the next run tries again.
             if marked != current:
                 _rollback(group, current, item)
             raise
+        # The marker stands either way: an item deliberately stepped over is
+        # done with, and should not come round again tomorrow. Only the tally
+        # distinguishes them, because only the tally is a claim about what is
+        # sitting in the group.
         current = marked
-        sent += 1
+        sent += delivered
 
     return sent
 
@@ -759,8 +764,14 @@ def _rollback(group: SignalGroup, description: str, item: FeedItem) -> None:
 
 def _handle_item(
     cfg: FeedConfig, item: FeedItem, recipient: str, *, dry_run: bool
-) -> None:
-    """Send (or, in dry-run, describe) a single item from feed ``cfg``."""
+) -> bool:
+    """Send (or, in dry-run, describe) a single item from feed ``cfg``.
+
+    Returns whether anything actually went to the group. Not every item that
+    gets this far becomes a message — an upload that turns out to be a Short is
+    stepped over — and a run that counted those would report items the group
+    never received, which is a worse lie than a quiet evening.
+    """
     is_podcast = is_audio_item(item)
     # An item with an audio enclosure is already an episode; asking ARTE about
     # it as well would be a pointless round trip.
@@ -788,9 +799,10 @@ def _handle_item(
                 print(f"    video: {resolve_video(item).describe()}")
             except VideoTooShort as exc:
                 print(f"    nothing sent: {exc}")
+                return False
             except FeedError as exc:
                 print(f"    video: unavailable ({exc})")
-        return
+        return True
 
     if is_video:
         # Resolved before anything is sent, because the answer can be "don't
@@ -798,8 +810,15 @@ def _handle_item(
         try:
             plan = resolve_video(item)
         except VideoTooShort as exc:
+            # The watermark has already moved past this item, and stays moved:
+            # a Short does not become worth sending by being looked at again
+            # tomorrow. But nothing reaches the group, so this is not a send,
+            # and it goes in the log as well as to stderr — stderr is nowhere
+            # at all under a scheduler, and an item counted as sent that never
+            # arrived is a long evening's worth of wondering why.
             print(f"[{label}] skipped: {exc}", file=sys.stderr)
-            return
+            log_line(f"[{label}] skipped: {exc}")
+            return False
         except FeedError as exc:
             print(f"[{label}] video skipped: {exc}", file=sys.stderr)
             plan = None
@@ -867,6 +886,7 @@ def _handle_item(
                 voice_note=is_podcast,
                 preview=preview,
             )
+    return True
 
 
 def _local_image(
