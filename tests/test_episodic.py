@@ -17,7 +17,7 @@ from rssignal.run import run_feeds
 from rssignal.signal_cli import SignalGroup
 from rssignal.watermark import format_pace, format_watermark, read_pace, read_watermark
 
-from .test_run import _capture_sends, _patch_groups
+from .test_run import _capture_sends, _patch_groups, _patch_video
 
 NOW = datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -206,6 +206,38 @@ def test_an_episodic_feed_opens_at_the_beginning(monkeypatch):
     written = calls["updated"][0]["description"]
     assert read_watermark(written) == EPISODES[0].published
     assert read_pace(written) == NOW
+
+
+def test_a_skipped_episode_does_not_spend_the_pace_slot(monkeypatch):
+    """A Short nobody was sent is not this interval's episode.
+
+    The archive replay hits one sooner or later, and spending the day on it
+    would mean a paced feed going quiet for a release that never happened.
+    """
+    shorts = [
+        dataclasses.replace(ep, link="https://www.youtube.com/watch?v=BFcjfKZ0BeI")
+        for ep in EPISODES
+    ]
+    earlier = NOW - timedelta(days=8)
+    cfg = FeedConfig(url="https://a", name="Show", episodic=WEEKLY)
+    group = SignalGroup(
+        id="g=",
+        name="Show",
+        description=f"blurb\n\n{format_watermark(shorts[0].published)}\n"
+        f"{format_pace(earlier)}",
+    )
+    calls = _patch(monkeypatch, cfg, shorts, [group])
+    sends = _capture_sends(monkeypatch)
+    _patch_video(monkeypatch, resolve_fail=run.VideoTooShort("47s — a Short"))
+
+    assert run_feeds("feeds.json") == 0
+    assert sends == []
+
+    # The watermark is past the Short — it is not offered again — but the clock
+    # reads what it read before, so the next run may send episode 3 at once.
+    written = calls["updated"][-1]["description"]
+    assert read_watermark(written) == shorts[1].published
+    assert read_pace(written) == earlier
 
 
 def test_a_paced_feed_holds_the_next_episode_back(monkeypatch):

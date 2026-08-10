@@ -643,6 +643,7 @@ def _send_prepared(
     # rollback puts both back together.
     paced = _now() if cfg.episodic is not None else None
     for item in due:
+        before = current
         marked = (
             current if to else _record_progress(group, parsed, item, current, paced)
         )
@@ -651,13 +652,19 @@ def _send_prepared(
         except Exception:
             # The marker promised an item that never arrived. Put the old
             # description back so the next run tries again.
-            if marked != current:
-                _rollback(group, current, item)
+            if marked != before:
+                _rollback(group, before, item)
             raise
-        # The marker stands either way: an item deliberately stepped over is
-        # done with, and should not come round again tomorrow. Only the tally
-        # distinguishes them, because only the tally is a claim about what is
-        # sitting in the group.
+        # The watermark stands either way: an item deliberately stepped over is
+        # done with, and should not come round again tomorrow. The clock is the
+        # other half of the promise, though, and an item nobody was sent is not
+        # a release — so a skip hands the cadence slot back, and the next run
+        # offers the episode after it rather than making a paced feed sit out a
+        # day for a Short. Written as a second update rather than folded into
+        # the one above because whether an item is sendable is only known after
+        # it has been looked at, and this is the rare path, not the common one.
+        if not delivered and paced is not None and marked != before:
+            marked = _record_progress(group, parsed, item, before, read_pace(before))
         current = marked
         sent += delivered
 
