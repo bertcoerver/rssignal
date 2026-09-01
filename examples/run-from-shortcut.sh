@@ -1,8 +1,18 @@
-#!/bin/sh
+#!/bin/zsh
 # The script the "Run Shell Script" action of an Apple Shortcut runs, three
 # times a day, to fire rssignal unattended. Kept here because what a scheduled
 # run does before it reaches `rssignal run` is half of what the error log ends
 # up saying, and none of it is visible from inside rssignal itself.
+#
+# Shortcuts pastes the body of this file into its own shell and ignores the
+# shebang: the shell is whatever that action's dropdown says, which is zsh by
+# default. The shebang matches it so that running this file directly from a
+# terminal tests the same thing the Shortcut runs, and not a more forgiving one.
+#
+# zsh reserves names `sh` does not — `status` is read-only there, and assigning
+# to it aborts the script *after* rssignal has already done its work, which
+# looks alarming and means nothing. Hence `rc` below. `path` is likewise tied to
+# PATH; avoid both.
 #
 # Shortcuts starts the script with a bare PATH and no working directory, so both
 # are set first: `cd` is what makes rssignal find feeds.json and .env, and the
@@ -43,7 +53,7 @@ printf '%s  %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$(pmset -g batt | tail -1)"
 # rather than on a `brew update` that can just as well happen once the messages
 # are out — a stale yt-dlp is at most one run behind either way.
 /Users/hmcoerver/.local/bin/rssignal run
-status=$?
+rc=$?
 
 # yt-dlp goes stale fast: YouTube changes something, and every video feed fails
 # until it is updated. Homebrew's copy is the one the PATH above resolves, so
@@ -52,4 +62,4 @@ status=$?
 # the podcasts nothing, and it must not turn a clean run into a failed one.
 brew update --quiet && brew upgrade --quiet yt-dlp || true
 
-exit $status
+exit $rc
