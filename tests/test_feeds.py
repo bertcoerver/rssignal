@@ -150,6 +150,51 @@ def test_parse_feed_bozo_no_entries_raises(monkeypatch):
         parse_feed(FeedConfig(url="https://a"))
 
 
+def test_parse_feed_html_in_a_feeds_place_is_a_block_not_a_failure(monkeypatch):
+    # A DNS filter's block page parses as badly as a corrupt feed and means
+    # something completely different: nothing is broken and the next run inside
+    # the open window reads the feed fine.
+    fake = type("Parsed", (), {})()
+    fake.bozo = True
+    fake.bozo_exception = "not well-formed (invalid token)"
+    fake.entries = []
+    fake.headers = {"content-type": "text/html; charset=utf-8"}
+    monkeypatch.setattr(feeds.feedparser, "parse", lambda url, **kwargs: fake)
+
+    with pytest.raises(feeds.SourceBlocked) as caught:
+        parse_feed(FeedConfig(url="https://a"))
+    assert "text/html" in str(caught.value)
+
+
+def test_parse_feed_broken_xml_is_still_a_failure(monkeypatch):
+    # The feed says it is a feed. That it doesn't parse is a real fault and
+    # keeps its traceback — only HTML gets the benefit of the doubt.
+    fake = type("Parsed", (), {})()
+    fake.bozo = True
+    fake.bozo_exception = "mismatched tag"
+    fake.entries = []
+    fake.headers = {"content-type": "application/rss+xml"}
+    monkeypatch.setattr(feeds.feedparser, "parse", lambda url, **kwargs: fake)
+
+    with pytest.raises(FeedError) as caught:
+        parse_feed(FeedConfig(url="https://a"))
+    assert not isinstance(caught.value, feeds.SourceBlocked)
+
+
+def test_parse_feed_without_a_content_type_keeps_the_old_behaviour(monkeypatch):
+    # No header is no evidence — a feed read from a file has none either.
+    fake = type("Parsed", (), {})()
+    fake.bozo = True
+    fake.bozo_exception = "malformed"
+    fake.entries = []
+    fake.headers = {}
+    monkeypatch.setattr(feeds.feedparser, "parse", lambda url, **kwargs: fake)
+
+    with pytest.raises(FeedError) as caught:
+        parse_feed(FeedConfig(url="https://a"))
+    assert not isinstance(caught.value, feeds.SourceBlocked)
+
+
 def _unreadable(exception):
     fake = type("Parsed", (), {})()
     fake.bozo = True

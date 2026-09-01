@@ -871,6 +871,30 @@ reachable — a 403 or a 404 is the host answering, which is all that's being
 asked. Sources read over plain HTTP (ARTE, ordinary RSS) announce an unreachable
 host quickly enough on their own and are not probed.
 
+Not every filter refuses the connection, though. Some answer it, with a block
+page — and a block page passes the probe, because something *did* reply. What
+arrives where the feed should be is then a page of HTML, which fails to parse in
+a way that describes its first stray angle bracket and explains nothing:
+
+```
+FeedError: Could not read feed 'https://www.youtube.com/feeds/videos.xml?...':
+<unknown>:3:11: not well-formed (invalid token)
+```
+
+So a response that announces itself as `text/html` is read as a blocked source
+rather than a broken feed, and gets the same one-line skip:
+
+```
+[Last Week Tonight] skipped: https://www.youtube.com/feeds/videos.xml?… answered
+with text/html rather than a feed — a block page, a captive portal or a sign-in
+wall standing in front of the source, not a broken feed. Skipping until it lifts.
+```
+
+Only HTML is treated this way. A feed served as `text/plain`, or with a content
+type nobody ever configured, gets the benefit of the doubt and the traceback —
+the question being asked is not "is this a valid feed media type" but "is this
+so clearly a web page that the parse error underneath it is beside the point".
+
 ## The error log
 
 stderr is nowhere at all when the run comes from a scheduler or an Apple
@@ -916,6 +940,25 @@ is running rssignal is stopping it early: Apple Shortcuts supervises the shell
 scripts it runs and will cut off a long one, and a run with several new videos
 in it is easily minutes long. A LaunchAgent has no such limit, and — unlike
 plain cron — runs a job it missed once the machine wakes.
+
+The other way a scheduled run ends badly is the machine going back to sleep
+under it. That run *does* finish, so it leaves a matching pair of lines — but
+macOS stops the monotonic clock while it sleeps, so the duration it reports is
+how long it was awake, not how long it took. A run suspended partway says so:
+
+```
+2026-08-31 15:00:12 +0200  run started: 13 feed(s)
+2026-08-31 18:37:00 +0200  run finished in 5m29s (3h37m wall — the machine slept partway): 5 item(s) sent
+```
+
+Worth recognising, because that run's other failures are usually consequences
+of the same sleep rather than problems of their own: a download that comes back
+`Connection reset by peer`, an upload that dies as `ChatServiceInactiveException`
+when signal-cli's connection goes with the machine.
+
+See [`examples/run-from-shortcut.sh`](examples/run-from-shortcut.sh) for the
+wrapper that holds a power assertion for the length of a run — and for why it is
+not a complete answer on battery.
 
 A run stopped in a way rssignal can see (Ctrl-C, a scheduler shutting it down,
 an unreadable config) logs `run aborted after …` instead, so that case is not

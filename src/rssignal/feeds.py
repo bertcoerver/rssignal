@@ -577,10 +577,53 @@ def _read(url: str, *, conditional: bool = True) -> feedparser.FeedParserDict:
 
     if getattr(parsed, "bozo", False) and not parsed.entries:
         exc = getattr(parsed, "bozo_exception", None)
+        served = _content_type(parsed)
+        if served and not _is_feed_type(served):
+            # Not a feed that failed to parse — something else answering in a
+            # feed's place. A DNS filter's block page, a captive portal, a
+            # sign-in wall. The parse error underneath it is real and completely
+            # uninformative: it describes the first stray angle bracket in a
+            # page of HTML, and says nothing about why the page is there.
+            raise SourceBlocked(
+                f"{url} answered with {served} rather than a feed — a block "
+                "page, a captive portal or a sign-in wall standing in front of "
+                "the source, not a broken feed. Skipping until it lifts."
+            ) from (exc if isinstance(exc, BaseException) else None)
         raise FeedError(
             f"Could not read feed {url!r}: {exc or 'unknown error'}"
         ) from (exc if isinstance(exc, BaseException) else None)
     return parsed
+
+
+# The media types that are never a feed and always a page. Written as the
+# things to rule out rather than the things to accept, because the accept list
+# is the open-ended one: feeds arrive as application/rss+xml, application/atom+xml,
+# text/xml, application/json, text/plain, and whatever else a server has been
+# left misconfigured to say. A page announcing itself as HTML is the only answer
+# unambiguous enough to act on.
+_PAGE_CONTENT_TYPES = ("text/html", "application/xhtml+xml")
+
+
+def _content_type(parsed: feedparser.FeedParserDict) -> str:
+    """The media type ``parsed`` came back as, lowercased, without parameters.
+
+    Empty when the response carried no ``Content-Type`` — which is what a feed
+    read from a file or a string looks like, and is not evidence of anything.
+    """
+    headers = getattr(parsed, "headers", None) or {}
+    value = headers.get("content-type") or headers.get("Content-Type") or ""
+    return value.split(";")[0].strip().lower()
+
+
+def _is_feed_type(content_type: str) -> bool:
+    """Whether ``content_type`` leaves it possible that this was meant as a feed.
+
+    The question is not "is this a valid feed media type" but "is this so
+    clearly a web page that the parse error underneath it is beside the point".
+    Anything that isn't HTML gets the benefit of the doubt and the old
+    behaviour — a feed served as ``text/plain`` is odd, not a block page.
+    """
+    return content_type not in _PAGE_CONTENT_TYPES
 
 
 def parse_feed(cfg: FeedConfig) -> ParsedFeed:

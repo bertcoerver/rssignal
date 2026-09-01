@@ -1350,6 +1350,34 @@ def test_run_logs_its_start_and_end(monkeypatch, error_log):
     assert "2 item(s) sent" in logged
 
 
+def test_duration_reads_as_a_duration():
+    assert run._duration(38) == "38s"
+    assert run._duration(158) == "2m38s"
+    assert run._duration(13020) == "3h37m"
+
+
+def test_elapsed_says_nothing_about_sleep_when_the_clocks_agree(monkeypatch):
+    monkeypatch.setattr(run.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(run.time, "time", lambda: 1000.0)
+
+    assert run._elapsed(40.0, 940.0) == "1m00s"
+
+
+def test_elapsed_reports_the_wall_time_of_a_run_that_slept(monkeypatch):
+    # The case from 27-31 August 2026: 5m29s of work spread over 3h37m, which
+    # the monotonic clock alone reports as a perfectly healthy run.
+    monkeypatch.setattr(run.time, "monotonic", lambda: 329.0)
+    monkeypatch.setattr(run.time, "time", lambda: 13020.0)
+
+    assert run._elapsed(0.0, 0.0) == "5m29s (3h37m wall — the machine slept partway)"
+
+
+def test_elapsed_without_a_wall_clock_is_the_plain_duration(monkeypatch):
+    monkeypatch.setattr(run.time, "monotonic", lambda: 158.0)
+
+    assert run._elapsed(0.0) == "2m38s"
+
+
 def test_run_killed_partway_leaves_a_start_with_no_end(monkeypatch, error_log):
     # The whole point of the pair. Nothing here can simulate a SIGKILL, so this
     # asserts the half that would survive one: the start line is written before

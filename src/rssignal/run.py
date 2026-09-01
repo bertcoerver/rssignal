@@ -297,6 +297,7 @@ def _locked_run(
     socket.setdefaulttimeout(FEED_SOCKET_TIMEOUT)
 
     started = time.monotonic()
+    started_wall = time.time()
     kind = " (dry run)" if dry_run else ""
     log_line(f"run started{kind}: {len(feeds)} feed(s)")
     try:
@@ -308,16 +309,60 @@ def _locked_run(
         # Including KeyboardInterrupt and SystemExit: a run stopped by hand or
         # by a scheduler shutting it down is exactly the case this line exists
         # for, and it should not look the same as one that was killed outright.
-        log_line(f"run aborted after {_elapsed(started)}: {exc!r}")
+        log_line(f"run aborted after {_elapsed(started, started_wall)}: {exc!r}")
         raise
-    log_line(f"run finished in {_elapsed(started)}: {sent} item(s) sent{kind}")
+    log_line(
+        f"run finished in {_elapsed(started, started_wall)}: "
+        f"{sent} item(s) sent{kind}"
+    )
     return sent
 
 
-def _elapsed(started: float) -> str:
-    """A monotonic start time as ``2m38s`` — how long, not how many seconds."""
-    total = int(time.monotonic() - started)
-    minutes, seconds = divmod(total, 60)
+# How far the two clocks have to drift apart before the gap is worth reporting.
+# Small differences are the clocks themselves, not a sleeping machine.
+SLEEP_THRESHOLD = 60
+
+
+def _elapsed(started: float, started_wall: float | None = None) -> str:
+    """How long a run took, as ``2m38s``, noting any time it spent asleep.
+
+    macOS stops the monotonic clock while the machine is suspended, so on a
+    laptop it answers "how long was this run awake for" rather than "how long
+    did it take". Those are different numbers and both are worth having: the
+    first is the run's real cost, and the second is why a run that started at
+    15:00 delivered its messages at 18:37.
+
+    Nothing in the log otherwise tells a suspended run from a fast one — the
+    duration looks healthy, the start and finish lines are hours apart, and
+    working out which runs were affected means reading timestamps by hand. So
+    when the wall clock has moved more than :data:`SLEEP_THRESHOLD` further than
+    the monotonic one, the run slept partway and says so. That is also the
+    explanation for the failures such a run tends to bring with it: a download
+    reset mid-file, an upload that comes back as ChatServiceInactiveException.
+
+    ``started_wall`` omitted keeps the plain duration, for callers that have no
+    second clock to compare against.
+    """
+    awake = int(time.monotonic() - started)
+    if started_wall is None:
+        return _duration(awake)
+
+    wall = int(time.time() - started_wall)
+    if wall - awake <= SLEEP_THRESHOLD:
+        return _duration(awake)
+    return f"{_duration(awake)} ({_duration(wall)} wall — the machine slept partway)"
+
+
+def _duration(total: int) -> str:
+    """``38s``, ``2m38s``, ``3h37m`` — the two largest units that say anything.
+
+    A suspended run is measured in hours, which is what pulls the hour case in:
+    ``217m`` is a number to convert in your head, not a duration to read.
+    """
+    hours, rest = divmod(max(total, 0), 3600)
+    minutes, seconds = divmod(rest, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
     return f"{minutes}m{seconds:02d}s" if minutes else f"{seconds}s"
 
 
