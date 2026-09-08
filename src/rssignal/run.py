@@ -309,11 +309,15 @@ def _locked_run(
         # Including KeyboardInterrupt and SystemExit: a run stopped by hand or
         # by a scheduler shutting it down is exactly the case this line exists
         # for, and it should not look the same as one that was killed outright.
-        log_line(f"run aborted after {_elapsed(started, started_wall)}: {exc!r}")
+        log_line(
+            f"run aborted after {_elapsed(started, started_wall)}: {exc!r}"
+            f"{_sleep_note(started, started_wall)}"
+        )
         raise
     log_line(
         f"run finished in {_elapsed(started, started_wall)}: "
         f"{sent} item(s) sent{kind}"
+        f"{_sleep_note(started, started_wall, sent)}"
     )
     return sent
 
@@ -323,34 +327,75 @@ def _locked_run(
 SLEEP_THRESHOLD = 60
 
 
-def _elapsed(started: float, started_wall: float | None = None) -> str:
-    """How long a run took, as ``2m38s``, noting any time it spent asleep.
+def _slept(started: float, started_wall: float | None) -> bool:
+    """Whether the machine suspended partway through this run.
 
-    macOS stops the monotonic clock while the machine is suspended, so on a
-    laptop it answers "how long was this run awake for" rather than "how long
-    did it take". Those are different numbers and both are worth having: the
-    first is the run's real cost, and the second is why a run that started at
-    15:00 delivered its messages at 18:37.
+    macOS stops the monotonic clock while the machine is asleep and leaves the
+    wall clock running, so the two drifting apart is the suspension itself,
+    measured. Anything under :data:`SLEEP_THRESHOLD` is the clocks disagreeing
+    with each other rather than a machine that went away.
+    """
+    if started_wall is None:
+        return False
+    awake = int(time.monotonic() - started)
+    wall = int(time.time() - started_wall)
+    return wall - awake > SLEEP_THRESHOLD
+
+
+def _elapsed(started: float, started_wall: float | None = None) -> str:
+    """How long a run took, as ``2m38s``, or both clocks if it spent time asleep.
+
+    On a laptop the monotonic clock answers "how long was this run awake for"
+    rather than "how long did it take". Those are different numbers and both are
+    worth having: the first is the run's real cost, and the second is why a run
+    that started at 15:00 delivered its messages at 18:37.
 
     Nothing in the log otherwise tells a suspended run from a fast one — the
-    duration looks healthy, the start and finish lines are hours apart, and
-    working out which runs were affected means reading timestamps by hand. So
-    when the wall clock has moved more than :data:`SLEEP_THRESHOLD` further than
-    the monotonic one, the run slept partway and says so. That is also the
-    explanation for the failures such a run tends to bring with it: a download
-    reset mid-file, an upload that comes back as ChatServiceInactiveException.
+    duration looks healthy, and working out which runs were affected means
+    reading start and finish timestamps by hand.
 
     ``started_wall`` omitted keeps the plain duration, for callers that have no
     second clock to compare against.
     """
     awake = int(time.monotonic() - started)
-    if started_wall is None:
+    if not _slept(started, started_wall):
         return _duration(awake)
+    assert started_wall is not None
+    return f"{_duration(awake)} awake, {_duration(int(time.time() - started_wall))} wall"
 
-    wall = int(time.time() - started_wall)
-    if wall - awake <= SLEEP_THRESHOLD:
-        return _duration(awake)
-    return f"{_duration(awake)} ({_duration(wall)} wall — the machine slept partway)"
+
+def _sleep_note(
+    started: float, started_wall: float | None, sent: int | None = None
+) -> str:
+    """The sentence that stops a suspended run from reading as a quiet one.
+
+    ``0 item(s) sent`` is the same line whether there was nothing to send or
+    whether every send died with the network when the machine suspended. Those
+    are opposite things, and on battery the second is the common one: the run
+    wakes for a couple of minutes of DarkWake, drops back to sleep mid-download,
+    and reports a healthy-looking duration and an empty result.
+
+    So a run that slept says which it was. The reassurance at the end is the real
+    guarantee rather than a hope — a feed that fails rolls its watermark back
+    (see :func:`_send_prepared`), so the items are still queued, not lost.
+
+    ``sent`` omitted is the aborted-run case, where the count means nothing.
+    """
+    if not _slept(started, started_wall):
+        return ""
+    if sent is None:
+        cause = "the machine slept partway, which is very likely why"
+    elif sent:
+        cause = "the machine slept partway, so more may have been due"
+    else:
+        cause = (
+            "the machine slept partway, so this may be \"not delivered\" "
+            "rather than \"nothing to deliver\""
+        )
+    return (
+        f" — {cause}. Whatever failed kept its place in the feed, and the next "
+        "run that stays awake will send it."
+    )
 
 
 def _duration(total: int) -> str:

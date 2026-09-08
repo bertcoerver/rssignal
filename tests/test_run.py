@@ -1369,13 +1369,68 @@ def test_elapsed_reports_the_wall_time_of_a_run_that_slept(monkeypatch):
     monkeypatch.setattr(run.time, "monotonic", lambda: 329.0)
     monkeypatch.setattr(run.time, "time", lambda: 13020.0)
 
-    assert run._elapsed(0.0, 0.0) == "5m29s (3h37m wall — the machine slept partway)"
+    assert run._elapsed(0.0, 0.0) == "5m29s awake, 3h37m wall"
 
 
 def test_elapsed_without_a_wall_clock_is_the_plain_duration(monkeypatch):
     monkeypatch.setattr(run.time, "monotonic", lambda: 158.0)
 
     assert run._elapsed(0.0) == "2m38s"
+
+
+def _slept_clocks(monkeypatch):
+    """A run that was awake 1m00s of the 2h06m it took — 4 September 2026."""
+    monkeypatch.setattr(run.time, "monotonic", lambda: 60.0)
+    monkeypatch.setattr(run.time, "time", lambda: 7578.0)
+
+
+def test_a_run_that_stayed_awake_gets_no_sleep_note(monkeypatch):
+    monkeypatch.setattr(run.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(run.time, "time", lambda: 1000.0)
+
+    assert run._sleep_note(40.0, 940.0, 0) == ""
+
+
+def test_an_empty_run_that_slept_says_it_may_not_be_empty(monkeypatch):
+    # The point of the whole thing: "0 item(s) sent" must not read as "there was
+    # nothing to send" when the network died under it.
+    _slept_clocks(monkeypatch)
+
+    note = run._sleep_note(0.0, 0.0, 0)
+
+    assert 'may be "not delivered" rather than "nothing to deliver"' in note
+    assert "the next run that stays awake will send it" in note
+
+
+def test_a_run_that_slept_but_sent_something_says_there_may_be_more(monkeypatch):
+    _slept_clocks(monkeypatch)
+
+    assert "more may have been due" in run._sleep_note(0.0, 0.0, 2)
+
+
+def test_an_aborted_run_that_slept_blames_the_sleep(monkeypatch):
+    # No count to interpret, so the note explains the failure rather than the
+    # emptiness.
+    _slept_clocks(monkeypatch)
+
+    assert "very likely why" in run._sleep_note(0.0, 0.0)
+
+
+def test_run_that_slept_explains_its_empty_result_in_the_log(
+    monkeypatch, error_log
+):
+    _patch_two_feeds(monkeypatch, lambda cfg: ParsedFeed(items=[]))
+    _capture_sends(monkeypatch)
+    # Wall clock two hours ahead of the monotonic one, as a suspend leaves them.
+    monkeypatch.setattr(run.time, "monotonic", lambda: 0.0)
+    clock = iter([0.0] + [7200.0] * 20)
+    monkeypatch.setattr(run.time, "time", lambda: next(clock, 7200.0))
+
+    assert run_feeds("feeds.json") == 0
+
+    logged = error_log.read_text()
+    assert "0 item(s) sent" in logged
+    assert 'rather than "nothing to deliver"' in logged
 
 
 def test_run_killed_partway_leaves_a_start_with_no_end(monkeypatch, error_log):

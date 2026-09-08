@@ -948,13 +948,25 @@ how long it was awake, not how long it took. A run suspended partway says so:
 
 ```
 2026-08-31 15:00:12 +0200  run started: 13 feed(s)
-2026-08-31 18:37:00 +0200  run finished in 5m29s (3h37m wall — the machine slept partway): 5 item(s) sent
+2026-08-31 18:37:00 +0200  run finished in 5m29s awake, 3h37m wall: 5 item(s) sent — the machine slept partway, so more may have been due. Whatever failed kept its place in the feed, and the next run that stays awake will send it.
 ```
 
 Worth recognising, because that run's other failures are usually consequences
 of the same sleep rather than problems of their own: a download that comes back
 `Connection reset by peer`, an upload that dies as `ChatServiceInactiveException`
 when signal-cli's connection goes with the machine.
+
+The count is the part that misleads, which is why the line spells it out. A
+suspended run most often ends at **zero** items — every send died with the
+network — and `0 item(s) sent` on its own is also exactly what a genuinely quiet
+evening looks like. So the empty case says which one it was:
+
+```
+2026-09-04 08:36:18 +0200  run finished in 1m00s awake, 2h06m wall: 0 item(s) sent — the machine slept partway, so this may be "not delivered" rather than "nothing to deliver". Whatever failed kept its place in the feed, and the next run that stays awake will send it.
+```
+
+Nothing is lost either way: a feed that fails rolls its watermark back, so those
+items are still queued for the next run rather than skipped over.
 
 See [`examples/run-from-shortcut.sh`](examples/run-from-shortcut.sh) for the
 wrapper that holds a power assertion for the length of a run — and for why it is
