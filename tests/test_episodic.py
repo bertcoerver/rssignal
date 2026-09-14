@@ -86,9 +86,31 @@ def test_allowance_never_owes_a_backlog():
     assert allowance(cadence, NOW - timedelta(days=30), NOW) == 1
 
 
+def test_allowance_lets_the_same_run_tomorrow_through():
+    """Stamped seconds into last night's run, due at tonight's same run anyway.
+
+    A strict 24 hours holds tonight's run, and if the next run that can reach the
+    source is tomorrow night's, "daily" quietly turns into every other day.
+    """
+    cadence = parse_cadence("daily", "f")
+    released = NOW - timedelta(days=1) + timedelta(seconds=8)
+    assert allowance(cadence, released, NOW) == 1
+    # A machine that slept and released at 04:25 still makes the 01:30 run.
+    assert allowance(cadence, NOW - timedelta(hours=21, minutes=5), NOW) == 1
+
+
+def test_allowance_never_releases_two_in_one_period():
+    daily = parse_cadence("daily", "f")
+    assert allowance(daily, NOW - timedelta(hours=19), NOW) == 0
+    # Capped at a quarter of the interval, so a short cadence isn't halved.
+    twice = parse_cadence("2-daily", "f")
+    assert allowance(twice, NOW - timedelta(hours=8, minutes=59), NOW) == 0
+    assert allowance(twice, NOW - timedelta(hours=9), NOW) == 1
+
+
 def test_next_release_says_when():
     cadence = parse_cadence("2-weekly", "f")
-    assert next_release(cadence, NOW) == NOW + timedelta(days=3.5)
+    assert next_release(cadence, NOW) == NOW + timedelta(days=3.5, hours=-4)
     assert next_release(cadence, None) is None
     assert next_release(Cadence(), NOW) is None
 

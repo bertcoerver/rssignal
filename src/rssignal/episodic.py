@@ -41,6 +41,15 @@ PERIODS = {
     "monthly": timedelta(days=30),
 }
 
+# How early an episode may go out. Runs come at fixed times of day, and the clock
+# is stamped when an episode is sent — a few seconds into its run, or hours into
+# it on a machine that slept. Measured strictly, tomorrow's run at the same time
+# is those seconds short of a day and holds; if the only run that can reach the
+# source is that one (YouTube blocked by day, say), a "daily" feed becomes an
+# every-other-day one. Four hours absorbs that, and is capped at a quarter of the
+# interval so it never lets a short cadence release two where it meant one.
+EARLY = timedelta(hours=4)
+
 # What an unpaced episodic feed is allowed per run: everything it has. Used
 # rather than a bare `math.inf` so the caller can slice a list with it.
 UNPACED = 1_000_000
@@ -111,23 +120,24 @@ def allowance(cadence: Cadence, last_release: datetime | None, now: datetime) ->
     immediately, which is what starts the clock.
 
     Never more than one, however long the gap: see this module's docstring on why
-    the missed ones are not owed.
+    the missed ones are not owed. Due a little before the full interval, too:
+    see :data:`EARLY`.
     """
-    interval = cadence.interval
-    if interval is None:
+    if cadence.interval is None:
         return UNPACED
     if last_release is None:
         return 1
-    return 1 if now >= last_release + interval else 0
+    return 1 if now >= next_release(cadence, last_release) else 0
 
 
 def next_release(cadence: Cadence, last_release: datetime | None) -> datetime | None:
     """When the next episode is due, or ``None`` if one is due now.
 
     Only for saying so out loud — in a dry run, and in the line a paced feed
-    prints when it holds an episode back. Nothing decides anything on it.
+    prints when it holds an episode back, and for :func:`allowance`, so the two
+    can't disagree.
     """
     interval = cadence.interval
     if interval is None or last_release is None:
         return None
-    return last_release + interval
+    return last_release + interval - min(EARLY, interval / 4)

@@ -359,6 +359,11 @@ Worth knowing:
   episode and picks the rhythm back up. It does not owe you four — sending four at
   once is the avalanche the pace was set to avoid, and the queue isn't going
   anywhere.
+- **An episode may go out up to four hours early** (at most a quarter of the
+  interval). The clock starts when an episode is sent, a few seconds into its run,
+  so tomorrow's run at the same time is seconds short of a day. Held strictly, a
+  `"daily"` feed whose source is only reachable at one run a day would send every
+  other day.
 - **A paced feed with nothing due isn't even fetched**, which is most runs.
 - **`--dry-run` always tells you where a series stands** — how many episodes are
   waiting and when the next one is due — rather than going quiet.
