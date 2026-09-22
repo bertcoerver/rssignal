@@ -262,6 +262,34 @@ def test_a_skipped_episode_does_not_spend_the_pace_slot(monkeypatch):
     assert read_pace(written) == earlier
 
 
+def test_a_video_that_could_not_be_fetched_leaves_the_clock_alone(monkeypatch):
+    """A failed fetch costs neither the episode nor the day it was due.
+
+    The clock says when this feed last released something. A video that never
+    arrived is not a release, so both markers go back and the next run sends
+    the same episode rather than holding it back for a week it already spent.
+    """
+    videos = [
+        dataclasses.replace(ep, link="https://www.youtube.com/watch?v=BFcjfKZ0BeI")
+        for ep in EPISODES
+    ]
+    earlier = NOW - timedelta(days=8)
+    before = f"blurb\n\n{format_watermark(videos[0].published)}\n{format_pace(earlier)}"
+    cfg = FeedConfig(url="https://a", name="Show", episodic=WEEKLY)
+    group = SignalGroup(id="g=", name="Show", description=before)
+    calls = _patch(monkeypatch, cfg, videos, [group])
+    sends = _capture_sends(monkeypatch)
+    _patch_video(monkeypatch, fail=FeedError("yt-dlp failed: HTTP Error 403"))
+
+    assert run_feeds("feeds.json") == 0
+    assert sends == []
+
+    written = calls["updated"][-1]["description"]
+    assert written == before
+    assert read_watermark(written) == EPISODES[0].published
+    assert read_pace(written) == earlier
+
+
 def test_a_paced_feed_holds_the_next_episode_back(monkeypatch):
     cfg = FeedConfig(url="https://a", name="Show", episodic=WEEKLY)
     group = SignalGroup(

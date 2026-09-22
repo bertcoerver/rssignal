@@ -702,13 +702,33 @@ def parse_feed(cfg: FeedConfig) -> ParsedFeed:
     )
 
 
+def _clean_url(url: object) -> str | None:
+    """A URL out of a feed, with any over-escaping undone.
+
+    XML escapes an ampersand once and the parser unescapes it once, so a URL
+    with a query string normally survives the round trip unchanged. NPO's
+    podcast feeds escape twice — ``&amp;amp;`` in the document — which leaves a
+    literal ``&amp;`` in the query once feedparser has had its turn, renaming
+    the second parameter to ``amp;awEpisodeid``. Their file server answers that
+    with a 404, so the episode can't be downloaded at all.
+
+    No URL means ``&amp;`` where it means ``&``, so unescaping until nothing is
+    left to unescape is safe, and a no-op for every feed that got it right.
+    """
+    if not url:
+        return None
+    text = str(url)
+    while "&amp;" in text:
+        text = text.replace("&amp;", "&")
+    return text or None
+
+
 def _href(value: object) -> str | None:
     """Pull a URL out of a feedparser image/thumbnail mapping, if there is one."""
     if not value:
         return None
     get = value.get if hasattr(value, "get") else lambda k, d=None: getattr(value, k, d)
-    url = get("href") or get("url")
-    return str(url) if url else None
+    return _clean_url(get("href") or get("url"))
 
 
 def _build_feed_item(entry: object, feed_name: str = "") -> FeedItem:
@@ -717,7 +737,7 @@ def _build_feed_item(entry: object, feed_name: str = "") -> FeedItem:
 
     title = (get("title") or "").strip()
     description = strip_html(get("summary") or get("description") or "")
-    link = get("link") or None
+    link = _clean_url(get("link"))
 
     published = None
     published_parsed = get("published_parsed")
@@ -731,7 +751,7 @@ def _build_feed_item(entry: object, feed_name: str = "") -> FeedItem:
     if enclosures:
         first = enclosures[0]
         fget = first.get if isinstance(first, dict) else lambda k, d=None: getattr(first, k, d)
-        enclosure_url = fget("href") or fget("url") or None
+        enclosure_url = _clean_url(fget("href") or fget("url"))
         enclosure_type = fget("type") or None
 
     # Episode artwork only: <itunes:image> lands in "image", media RSS in

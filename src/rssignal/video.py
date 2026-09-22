@@ -49,7 +49,18 @@ class VideoTooShort(FeedError):
 
     Distinct from a plain :class:`~rssignal.feeds.FeedError` because it means
     something different to the caller: a `FeedError` is "the video couldn't be
-    had, send the text anyway", this is "there is nothing here worth a message".
+    had this time, try again next run", this is "there is nothing here worth a
+    message", and trying again tomorrow would reach the same conclusion.
+    """
+
+
+class VideoTooBig(FeedError):
+    """Raised for a video no quality of which fits inside Signal's limit.
+
+    The other permanent answer, and told apart from a plain ``FeedError`` for
+    the same reason as :class:`VideoTooShort`: a two-hour documentary is not
+    90 MB tomorrow either. A caller that retries every failure would otherwise
+    spend every run re-deciding this one, and never reach the items behind it.
     """
 
 
@@ -128,8 +139,9 @@ def video_temp(
         size = os.path.getsize(path)
         if size > max_bytes:
             # The estimate was optimistic. Better to say so than to hand
-            # signal-cli a file Signal will refuse.
-            raise FeedError(
+            # signal-cli a file Signal will refuse — and the same download would
+            # come out the same size next run, so this is a `VideoTooBig`.
+            raise VideoTooBig(
                 f"Video is {size / 1024 / 1024:.0f} MB, over the "
                 f"{max_bytes / 1024 / 1024:.0f} MB limit"
             )

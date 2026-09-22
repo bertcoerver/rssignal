@@ -18,7 +18,7 @@ from rssignal.feeds import (
 )
 from rssignal.run import AlreadyRunning, run_feeds, single_run
 from rssignal.signal_cli import LinkPreview, SignalError, SignalGroup
-from rssignal.video import VideoTooShort
+from rssignal.video import VideoTooBig, VideoTooShort
 from rssignal.watermark import format_watermark, read_watermark
 
 NOW = datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc)
@@ -238,7 +238,8 @@ def test_run_video_item_attaches_the_video(monkeypatch):
     assert sends[0]["text"] == f"Le drapeau\n\nd\n\n{ARTE_LINK}"
 
 
-def test_run_video_failure_still_sends_the_text(monkeypatch, capsys):
+def test_run_video_failure_sends_nothing_and_retries(monkeypatch):
+    """A video item is its video: no video, no message, and no watermark."""
     cfg = FeedConfig(url="https://a", name="Arte")
     item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
     calls = _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
@@ -247,13 +248,12 @@ def test_run_video_failure_still_sends_the_text(monkeypatch, capsys):
 
     count = run_feeds("feeds.json")
 
-    assert count == 1
-    assert sends[0]["attachments"] is None
-    assert sends[0]["text"].endswith(ARTE_LINK)
-    assert "video skipped: expired rights" in capsys.readouterr().err
-    # The item counted as sent, so its watermark stands rather than being
-    # rolled back for a retry that would fail the same way.
-    assert calls["updated"]
+    # The text alone would be a message the group can't watch, so it doesn't go.
+    assert sends == []
+    assert count == 0
+    # The marker went up before the send and came back down after it failed, so
+    # the next run offers the same item again.
+    assert calls["updated"][-1]["description"] == LONG_AGO
 
 
 def test_run_ordinary_link_is_not_treated_as_video(monkeypatch):
@@ -290,17 +290,46 @@ def test_run_audio_enclosure_wins_over_a_video_link(monkeypatch):
     assert seen == []
 
 
-def test_run_video_download_failure_still_sends_the_text(monkeypatch, capsys):
-    """Resolving worked and the download didn't; the text still goes out."""
+def test_run_video_download_failure_sends_nothing_and_retries(monkeypatch):
+    """Resolving worked and the download didn't; same answer, same retry."""
     cfg = FeedConfig(url="https://a", name="Arte")
     item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
-    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    calls = _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
     sends = _capture_sends(monkeypatch)
     _patch_video(monkeypatch, fail=FeedError("ffmpeg failed: 403"))
 
-    assert run_feeds("feeds.json") == 1
-    assert sends[0]["attachments"] is None
-    assert "video skipped: ffmpeg failed: 403" in capsys.readouterr().err
+    assert run_feeds("feeds.json") == 0
+    assert sends == []
+    assert calls["updated"][-1]["description"] == LONG_AGO
+
+
+def test_run_too_big_video_is_stepped_over_rather_than_retried(monkeypatch, capsys):
+    """No quality fits, and none will tomorrow: nothing sent, nothing retried."""
+    cfg = FeedConfig(url="https://a", name="Arte")
+    item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
+    calls = _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    sends = _capture_sends(monkeypatch)
+    _patch_video(monkeypatch, resolve_fail=VideoTooBig("even 640x360 is 210 MB"))
+
+    assert run_feeds("feeds.json") == 0
+    assert sends == []
+    assert "skipped: even 640x360 is 210 MB" in capsys.readouterr().err
+    # Unlike a failure, the watermark stands: retrying would decide the same.
+    assert calls["updated"][-1]["description"] != LONG_AGO
+
+
+def test_run_video_bigger_than_estimated_is_stepped_over(monkeypatch, capsys):
+    """The estimate fit and the file didn't — still permanent, still a skip."""
+    cfg = FeedConfig(url="https://a", name="Arte")
+    item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
+    calls = _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    sends = _capture_sends(monkeypatch)
+    _patch_video(monkeypatch, fail=VideoTooBig("Video is 104 MB, over the 95 MB limit"))
+
+    assert run_feeds("feeds.json") == 0
+    assert sends == []
+    assert "skipped: Video is 104 MB" in capsys.readouterr().err
+    assert calls["updated"][-1]["description"] != LONG_AGO
 
 
 def test_run_too_short_video_sends_nothing_at_all(monkeypatch, capsys, error_log):
@@ -365,9 +394,12 @@ def test_run_dry_run_reports_an_unavailable_video(monkeypatch, capsys):
 
     monkeypatch.setattr(run, "resolve_video", boom)
 
-    run_feeds("feeds.json", dry_run=True)
+    count = run_feeds("feeds.json", dry_run=True)
 
-    assert "video: unavailable (expired rights)" in capsys.readouterr().out
+    # A real run would send nothing and come back to it, so neither the message
+    # nor the count may suggest otherwise.
+    assert "nothing sent: video unavailable (expired rights)" in capsys.readouterr().out
+    assert count == 0
 
 
 def test_run_uses_message_template(monkeypatch):

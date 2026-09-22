@@ -139,6 +139,31 @@ def test_parse_feed_podcast_enclosure(monkeypatch):
     assert item.enclosure_type == "audio/mpeg"
 
 
+def test_parse_feed_unescapes_a_doubly_escaped_enclosure(monkeypatch):
+    # NPO writes "&amp;amp;" in its podcast feeds, so feedparser hands back a URL
+    # with a literal "&amp;" in the query — which their file server 404s on.
+    fake = type("Parsed", (), {})()
+    fake.bozo = False
+    fake.entries = [
+        {
+            "title": "Episode 1",
+            "published_parsed": (2026, 7, 21, 8, 0, 0, 0, 0, 0),
+            "link": "https://a/1?x=1&amp;y=2",
+            "enclosures": [
+                {"href": "https://a/ep1.mp3?a=1&amp;b=2", "type": "audio/mpeg"}
+            ],
+            "image": {"href": "https://a/art.png?a=1&amp;b=2"},
+        }
+    ]
+    monkeypatch.setattr(feeds.feedparser, "parse", lambda url, **kwargs: fake)
+
+    item = parse_feed(FeedConfig(url="https://a")).items[0]
+
+    assert item.enclosure_url == "https://a/ep1.mp3?a=1&b=2"
+    assert item.link == "https://a/1?x=1&y=2"
+    assert item.image_url == "https://a/art.png?a=1&b=2"
+
+
 def test_parse_feed_bozo_no_entries_raises(monkeypatch):
     fake = type("Parsed", (), {})()
     fake.bozo = True

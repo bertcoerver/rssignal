@@ -253,7 +253,7 @@ entirely — no message, and they aren't reconsidered on the next run.
 #### When YouTube asks you to confirm you're not a bot
 
 ```
-[The Daily Show] video skipped: yt-dlp failed: ERROR: [youtube] 14j9b34VCJI:
+[The Daily Show] skipped: yt-dlp failed: ERROR: [youtube] 14j9b34VCJI:
 Sign in to confirm you're not a bot.
 ```
 
@@ -304,10 +304,16 @@ rssignal run --dry-run
 #     video: 640x360, ~63 MB
 ```
 
-If the video can't be had — expired rights, a video too long for any quality to fit,
-ffmpeg or yt-dlp missing — that's a warning on stderr, not a failure: the item still
-goes out as text and its link. A readable message beats no message, and the item
-isn't retried. Expect this for anything much over half an hour: 95 MB is 95 MB.
+If the video can't be had — expired rights, ffmpeg or yt-dlp missing, YouTube
+asking for a login — nothing goes out at all. A video item is its video, so the run
+reports the failure and leaves the item where it is: the watermark rolls back, the
+pace clock with it, and the next run tries the same item again. A feed whose source
+stays broken therefore stays put rather than quietly filling the group with links.
+
+The exception is a video too long for any quality to fit, which is the one failure
+that won't read differently tomorrow. That one is stepped over like a Short —
+nothing sent, watermark and all — so it doesn't block the items behind it. Expect
+it for anything much over half an hour: 95 MB is 95 MB.
 
 Unlike a voice note, a video goes out as a single message: these items get no
 preview card by default, so there's nothing for the attachment to displace.

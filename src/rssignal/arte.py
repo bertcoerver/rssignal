@@ -45,7 +45,7 @@ from .feeds import (
     apply_extracts,
     strip_html,
 )
-from .video import SIZE_ESTIMATE_MARGIN, VIDEO_MAX_BYTES
+from .video import SIZE_ESTIMATE_MARGIN, VIDEO_MAX_BYTES, VideoTooBig
 
 # An ARTE programme page: language, then the programme id. Collection pages
 # (``RC-023176``) are deliberately not matched — they are a listing, not a
@@ -425,7 +425,7 @@ def _pick_variant(
     fitting = [v for v in usable if v.estimated_bytes(duration) <= max_bytes]
     if not fitting:
         smallest = min(usable, key=lambda v: v.bandwidth)
-        raise FeedError(
+        raise VideoTooBig(
             f"Video {program_id} is too big to send: even {smallest.resolution} "
             f"is about {smallest.estimated_bytes(duration) / 1024 / 1024:.0f} MB, "
             f"over the {max_bytes / 1024 / 1024:.0f} MB limit"

@@ -17,11 +17,15 @@ An item that only *links* to a video — :func:`~rssignal.video.is_video_item`,
 decided per item from the link in the same spirit — has its video fetched and
 attached to the message. That is one message, not two: these items get no
 preview card by default, so nothing is there for the attachment to displace. A
-video that can't be fetched is a warning, not a failure: the item still goes out
-as text and its link, because a readable message beats no message. The one video
-that produces no message at all is one too short to be worth a message — a
-YouTube Short — which is dropped where it stands, watermark and all, so it is
-not reconsidered every run.
+video item *is* its video, so one that can't be fetched sends nothing: the run
+reports the failure, the watermark and the pace clock roll back together, and
+the next run tries the same item again rather than leaving a bare link behind as
+the only trace of it.
+
+Two answers are permanent, and those do send nothing and stay sent-nothing,
+watermark and all, so they are not reconsidered every run: a video too short to
+be worth a message (a YouTube Short) and one no quality of which fits inside
+Signal's size limit.
 
 Each feed sends to a Signal group named after it, created on the first send if it
 doesn't exist yet — see :class:`_GroupResolver`.
@@ -89,7 +93,13 @@ from .signal_cli import (
     send_msg,
     update_group,
 )
-from .video import VideoTooShort, is_video_item, resolve_video, video_temp
+from .video import (
+    VideoTooBig,
+    VideoTooShort,
+    is_video_item,
+    resolve_video,
+    video_temp,
+)
 from .watermark import (
     compose_description,
     read_pace,
@@ -865,9 +875,13 @@ def _handle_item(
     """Send (or, in dry-run, describe) a single item from feed ``cfg``.
 
     Returns whether anything actually went to the group. Not every item that
-    gets this far becomes a message — an upload that turns out to be a Short is
-    stepped over — and a run that counted those would report items the group
-    never received, which is a worse lie than a quiet evening.
+    gets this far becomes a message — an upload that turns out to be a Short, or
+    a video too big for any quality to fit, is stepped over — and a run that
+    counted those would report items the group never received, which is a worse
+    lie than a quiet evening.
+
+    Raises if a video that ought to be sendable can't be fetched this time,
+    which leaves the item unsent and un-marked for the next run to retry.
     """
     is_podcast = is_audio_item(item)
     # An item with an audio enclosure is already an episode; asking ARTE about
@@ -894,11 +908,14 @@ def _handle_item(
             # run can report the resolution and size it would really arrive at.
             try:
                 print(f"    video: {resolve_video(item).describe()}")
-            except VideoTooShort as exc:
+            except (VideoTooShort, VideoTooBig) as exc:
                 print(f"    nothing sent: {exc}")
                 return False
             except FeedError as exc:
-                print(f"    video: unavailable ({exc})")
+                # A real run would send nothing and leave the item for the next
+                # one, so a dry run says that rather than counting a message.
+                print(f"    nothing sent: video unavailable ({exc}) — will retry")
+                return False
         return True
 
     if is_video:
@@ -906,31 +923,38 @@ def _handle_item(
         # send this at all" — a Short is not a message.
         try:
             plan = resolve_video(item)
-        except VideoTooShort as exc:
+        except (VideoTooShort, VideoTooBig) as exc:
             # The watermark has already moved past this item, and stays moved:
             # a Short does not become worth sending by being looked at again
-            # tomorrow. But nothing reaches the group, so this is not a send,
+            # tomorrow, and a two-hour documentary does not fit tomorrow
+            # either. But nothing reaches the group, so this is not a send,
             # and it goes in the log as well as to stderr — stderr is nowhere
             # at all under a scheduler, and an item counted as sent that never
             # arrived is a long evening's worth of wondering why.
             print(f"[{label}] skipped: {exc}", file=sys.stderr)
             log_line(f"[{label}] skipped: {exc}")
             return False
-        except FeedError as exc:
-            print(f"[{label}] video skipped: {exc}", file=sys.stderr)
-            plan = None
+        # Any other FeedError is left to propagate: a video item is its video,
+        # so one that can't be had right now is an item that hasn't been sent
+        # yet rather than one to paraphrase as a link. The caller rolls the
+        # watermark back — and with it the pace clock — and the next run tries
+        # the same item again.
 
     with ExitStack() as stack:
         attachments = None
         if is_podcast:
             attachments = [stack.enter_context(download_temp(item.enclosure_url))]
-        elif is_video and plan is not None:
-            # The video is the best part of the message but not the whole of
-            # it: if it can't be had, the text and its link still can.
+        elif is_video:
             try:
                 attachments = [stack.enter_context(video_temp(item, plan=plan))]
-            except FeedError as exc:
-                print(f"[{label}] video skipped: {exc}", file=sys.stderr)
+            except VideoTooBig as exc:
+                # The estimate was optimistic and the file that arrived is over
+                # the limit — which it would be again next run. Same answer as a
+                # video that never had a fitting quality: nothing goes out, and
+                # the item isn't reconsidered.
+                print(f"[{label}] skipped: {exc}", file=sys.stderr)
+                log_line(f"[{label}] skipped: {exc}")
+                return False
 
         preview = None
         if card:

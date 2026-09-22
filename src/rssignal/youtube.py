@@ -46,7 +46,7 @@ from urllib.parse import urlparse
 
 from . import cache, timing
 from .feeds import FeedError, FeedItem, SourceBlocked
-from .video import SIZE_ESTIMATE_MARGIN, VIDEO_MAX_BYTES, VideoTooShort
+from .video import SIZE_ESTIMATE_MARGIN, VIDEO_MAX_BYTES, VideoTooBig, VideoTooShort
 
 # A YouTube video, in any of the shapes a feed or a human might write it.
 YOUTUBE_LINK_RE = re.compile(
@@ -800,7 +800,7 @@ def _pick(
     if not fitting:
         if smallest is None:
             raise FeedError(f"No usable format for {video_id}")
-        raise FeedError(
+        raise VideoTooBig(
             f"Video {video_id} is too big to send: the smallest usable format "
             f"is about {smallest / 1024 / 1024:.0f} MB, over the "
             f"{max_bytes / 1024 / 1024:.0f} MB limit"
