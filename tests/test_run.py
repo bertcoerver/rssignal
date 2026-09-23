@@ -1,13 +1,14 @@
 """Tests for rssignal.run (feeds, sending, and downloads are monkeypatched)."""
 
 import dataclasses
+import os
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from rssignal import pending, run
+from rssignal import archive, pending, run
 from rssignal.feeds import (
     FeedConfig,
     FeedError,
@@ -1730,3 +1731,173 @@ def test_run_sends_normally_when_the_note_cannot_be_written(monkeypatch, tmp_pat
 
     assert run_feeds("feeds.json") == 1
     assert [s["voice_note"] for s in sends] == [False, True]
+
+
+# --- the media archive ------------------------------------------------------
+#
+# rssignal deletes everything it downloads the moment it has been uploaded.
+# `rssignal.archive` puts a second, lasting name on the file first, when
+# RSSIGNAL_MEDIA_DIR says where. These are about the wiring in `_handle_item`:
+# that it happens at all, that it happens only after a successful send, and
+# that it is over before the temporary file goes away.
+
+
+@pytest.fixture
+def media(tmp_path, monkeypatch):
+    """Switch archiving on, into a directory of this test's own."""
+    root = tmp_path / "media"
+    monkeypatch.setenv(archive.MEDIA_DIR_ENV, str(root))
+    return root
+
+
+def _real_downloads(monkeypatch, tmp_path):
+    """Patch download_temp with one that makes a real file and deletes it after.
+
+    The archive links the file rather than naming it, so unlike
+    :func:`_fake_downloads` these tests need bytes actually on disk — and need
+    the temporary name to really go away, which is the thing the archive exists
+    to survive.
+    """
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+
+    @contextmanager
+    def fake_download(url, **kwargs):
+        path = scratch / url.rsplit("/", 1)[-1]
+        path.write_bytes(b"the-bytes-of-" + url.encode())
+        try:
+            yield str(path)
+        finally:
+            path.unlink(missing_ok=True)
+
+    monkeypatch.setattr(run, "download_temp", fake_download)
+
+
+def _archived(root):
+    """Every archived file, as paths relative to the archive root."""
+    return sorted(
+        os.path.relpath(os.path.join(dirpath, name), root)
+        for dirpath, _dirs, files in os.walk(root)
+        for name in files
+    )
+
+
+def test_run_archives_the_episode_it_sent(media, tmp_path, monkeypatch):
+    cfg = FeedConfig(url="https://a", name="Pod")
+    item = FeedItem(
+        title="Ep One",
+        description="notes",
+        enclosure_url="https://a/ep.mp3",
+        published=datetime(2026, 3, 4, tzinfo=timezone.utc),
+    )
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    _capture_sends(monkeypatch)
+    _real_downloads(monkeypatch, tmp_path)
+
+    assert run_feeds("feeds.json") == 1
+
+    assert _archived(media) == [os.path.join("pod", "2026-03-04-ep-one.mp3")]
+    with open(media / "pod" / "2026-03-04-ep-one.mp3", "rb") as fh:
+        assert fh.read() == b"the-bytes-of-https://a/ep.mp3"
+
+
+def test_run_archives_the_audio_but_not_the_preview_image(media, tmp_path, monkeypatch):
+    # The card image is furniture. A media browser full of thumbnails filed
+    # alongside the episodes would be worse than one with none.
+    cfg = FeedConfig(url="https://a", name="Pod")
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
+    _capture_sends(monkeypatch)
+    _real_downloads(monkeypatch, tmp_path)
+
+    run_feeds("feeds.json")
+
+    assert [os.path.splitext(p)[1] for p in _archived(media)] == [".mp3"]
+
+
+def test_run_archives_nothing_when_the_send_fails(media, tmp_path, monkeypatch):
+    cfg = FeedConfig(url="https://a", name="Pod")
+    item = FeedItem(title="Ep", description="d", enclosure_url="https://a/ep.mp3")
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    _real_downloads(monkeypatch, tmp_path)
+
+    def fail(*_args, **_kwargs):
+        raise SignalError("send failed")
+
+    monkeypatch.setattr(run, "send_msg", fail)
+
+    run_feeds("feeds.json")
+
+    # The item will come round again next run; an archive of things nobody
+    # received would make the folder a poor record of what was sent.
+    assert not os.path.exists(media) or _archived(media) == []
+
+
+def test_dry_run_archives_nothing(media, tmp_path, monkeypatch):
+    cfg = FeedConfig(url="https://a", name="Pod")
+    item = FeedItem(title="Ep", description="d", enclosure_url="https://a/ep.mp3")
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    _real_downloads(monkeypatch, tmp_path)
+
+    run_feeds("feeds.json", dry_run=True)
+
+    assert not os.path.exists(media) or _archived(media) == []
+
+
+def test_dry_run_says_where_the_episode_would_be_archived(
+    media, monkeypatch, capsys
+):
+    cfg = FeedConfig(url="https://a", name="Pod")
+    item = FeedItem(
+        title="Ep One",
+        description="d",
+        enclosure_url="https://a/ep.mp3",
+        published=datetime(2026, 3, 4, tzinfo=timezone.utc),
+    )
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+
+    run_feeds("feeds.json", dry_run=True)
+
+    out = capsys.readouterr().out
+    assert os.path.join("pod", "2026-03-04-ep-one.*") in out
+
+
+def test_a_run_with_archiving_off_says_nothing_about_it(monkeypatch, capsys):
+    cfg = FeedConfig(url="https://a", name="Pod")
+    item = FeedItem(title="Ep", description="d", enclosure_url="https://a/ep.mp3")
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+
+    run_feeds("feeds.json", dry_run=True)
+
+    assert "archived to" not in capsys.readouterr().out
+
+
+def test_run_expires_old_archived_files(media, tmp_path, monkeypatch):
+    cfg = FeedConfig(url="https://a", name="Pod")
+    item = FeedItem(title="Ep", description="d", enclosure_url="https://a/ep.mp3")
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    _capture_sends(monkeypatch)
+    _real_downloads(monkeypatch, tmp_path)
+
+    stale = media / "old-show" / "2020-01-01-ancient.mp3"
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(b"ancient")
+    old = time.time() - 30 * 86400
+    os.utime(stale, (old, old))
+
+    run_feeds("feeds.json")
+
+    assert not stale.exists()
+    # The run's own episode is new, so it stays.
+    assert len(_archived(media)) == 1
+
+
+def test_run_points_tmpdir_at_the_staging_directory(media, monkeypatch):
+    cfg = FeedConfig(url="https://a", name="Blog")
+    _patch_feeds(monkeypatch, [cfg], {"https://a": []})
+    _capture_sends(monkeypatch)
+
+    run_feeds("feeds.json")
+
+    # Which is what lets `archive.keep` link instead of copy: downloads land on
+    # the same filesystem as the archive they are about to be linked into.
+    assert os.environ["TMPDIR"] == str(media / archive.STAGING_NAME)

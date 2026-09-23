@@ -1,0 +1,7 @@
+Drop a wheel built from this checkout here, and the add-on installs that
+instead of pulling rssignal from GitHub:
+
+    python3 -m build --wheel --outdir addon/dist .
+
+This file only exists so the directory does, because the Dockerfile's
+`COPY dist/` fails if it is missing.

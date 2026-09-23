@@ -1,0 +1,94 @@
+#!/usr/bin/with-contenv bashio
+#
+# One rssignal run, with the environment it needs.
+#
+# This is the container's version of examples/run-from-shortcut.sh, and it is
+# shorter than that script for a good reason: most of what the macOS wrapper
+# does is fight the laptop. `caffeinate -dimsw` to keep the machine awake,
+# `pmset -g batt` to record why it didn't, a guard against iCloud evicting the
+# checkout mid-run — none of that means anything here. A container on a Pi is
+# awake because the Pi is awake.
+#
+# Kept as its own script rather than inlined into the s6 service so that a
+# person who has shelled into the container can run exactly what the scheduler
+# runs, which is the difference between debugging this and guessing at it.
+
+set -e
+
+# --- where state lives ------------------------------------------------------
+#
+# /data is the add-on's persistent volume: it survives restarts, updates and
+# rebuilds. Everything that must not be lost goes there, and nothing else does.
+#
+# HOME is the important one and the least obvious. signal-cli keeps the linked
+# device's identity — its keys — under $HOME/.local/share/signal-cli, and
+# rssignal invokes signal-cli without a --config flag, so this variable is the
+# only lever there is. Get it wrong and the add-on asks to be linked again
+# after every update.
+export HOME="/data/home"
+mkdir -p "${HOME}"
+
+# rssignal's own files. The cache and pending list default to ~/.cache, which
+# HOME above would already have put on /data — said outright anyway, because
+# one of them decides whether a half-sent episode gets its second message.
+export RSSIGNAL_CACHE="/data/cache.json"
+export RSSIGNAL_PENDING="/data/pending.json"
+export RSSIGNAL_LOCK="/data/run.lock"
+export RSSIGNAL_LOG="/data/rssignal.log"
+
+# --- configuration ----------------------------------------------------------
+
+RSSIGNAL_ACCOUNT="$(bashio::config 'account')"
+export RSSIGNAL_ACCOUNT
+
+# /media is the folder Home Assistant's Media browser shows. rssignal links
+# each episode it sends into here and expires them on the schedule below; with
+# RSSIGNAL_MEDIA_DIR unset it would delete every download as it always has.
+export RSSIGNAL_MEDIA_DIR="/media/rssignal"
+RSSIGNAL_MEDIA_KEEP_DAYS="$(bashio::config 'media_keep_days')"
+export RSSIGNAL_MEDIA_KEEP_DAYS
+
+# feeds.json lives on the host at /addon_configs/<slug>/, so it can be edited
+# with the File Editor or over Samba without rebuilding anything.
+CONFIG="/config/feeds.json"
+
+if ! bashio::fs.file_exists "${CONFIG}"; then
+    bashio::log.error "No feeds.json at ${CONFIG}."
+    bashio::log.error "Put one in the add-on's config folder — see DOCS.md."
+    exit 1
+fi
+
+# --- yt-dlp ------------------------------------------------------------------
+#
+# YouTube changes its extraction often enough that a yt-dlp pinned at image
+# build time stops working within weeks; the macOS wrapper runs
+# `brew upgrade yt-dlp` on every run for the same reason. Once a day is plenty,
+# and the stamp keeps the other two runs of the day from paying for it.
+if bashio::config.true 'update_yt_dlp'; then
+    stamp="/data/.yt-dlp-updated"
+    if [ ! -f "${stamp}" ] || [ "$(find "${stamp}" -mtime +0 2>/dev/null)" ]; then
+        bashio::log.info "Updating yt-dlp..."
+        if /opt/venv/bin/pip install --no-cache-dir --quiet --upgrade yt-dlp; then
+            touch "${stamp}"
+        else
+            # A failed upgrade is not a reason to skip the run: the yt-dlp
+            # already installed worked yesterday and will probably do today.
+            bashio::log.warning "yt-dlp update failed; using the installed one."
+        fi
+    fi
+fi
+
+# --- go ----------------------------------------------------------------------
+
+bashio::log.info "Starting rssignal run..."
+
+# rssignal reports a failed feed and carries on, so a non-zero exit means
+# something stopped the whole run. Reported, not swallowed: the s6 service
+# uses it to decide what to say.
+if rssignal run --config "${CONFIG}" "$@"; then
+    bashio::log.info "Run finished."
+else
+    rc=$?
+    bashio::log.error "Run failed (exit ${rc}). See ${RSSIGNAL_LOG}."
+    exit "${rc}"
+fi

@@ -60,7 +60,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterator
 
-from . import cache, pending, timing
+from . import archive, cache, pending, timing
 from .download import download_temp
 from .episodic import allowance, next_release
 from .errorlog import log_exception, log_line
@@ -310,6 +310,11 @@ def _locked_run(
     started_wall = time.time()
     kind = " (dry run)" if dry_run else ""
     log_line(f"run started{kind}: {len(feeds)} feed(s)")
+    if not dry_run:
+        # Points TMPDIR at the archive's staging directory, so that the copy
+        # `archive.keep` makes afterwards is a hard link rather than a second
+        # write of the whole file. A dry run downloads nothing and needs neither.
+        archive.prepare()
     try:
         with signal_daemon():
             sent = _run_prepared(
@@ -324,9 +329,16 @@ def _locked_run(
             f"{_sleep_note(started, started_wall)}"
         )
         raise
+
+    # After sending, not before: expiry is nobody's hurry, and a run that does
+    # its housekeeping first would spend the time even when it had nothing to do.
+    # A dry run prunes nothing — it is supposed to leave the disk as it found it.
+    expired = 0 if dry_run else archive.prune()
+    aged = f", {expired} archived file(s) expired" if expired else ""
+
     log_line(
         f"run finished in {_elapsed(started, started_wall)}: "
-        f"{sent} item(s) sent{kind}"
+        f"{sent} item(s) sent{kind}{aged}"
         f"{_sleep_note(started, started_wall, sent)}"
     )
     return sent
@@ -916,6 +928,10 @@ def _handle_item(
                 # one, so a dry run says that rather than counting a message.
                 print(f"    nothing sent: video unavailable ({exc}) — will retry")
                 return False
+        if is_podcast or is_video:
+            kept = archive.describe(item, feed=label)
+            if kept:
+                print(f"    archived to: {kept}")
         return True
 
     if is_video:
@@ -1007,6 +1023,16 @@ def _handle_item(
                 voice_note=is_podcast,
                 preview=preview,
             )
+
+        # Still inside the ExitStack, because this links the file rather than
+        # copying it and the temporary name has to still be there to link from.
+        # After the send, not before: an item that failed to go out will come
+        # round again next run, and an archive of things nobody received would
+        # be a confusing thing to browse. Only the media itself — the preview
+        # image from `_local_image` is furniture, not content.
+        if attachments:
+            for path in attachments:
+                archive.keep(path, feed=label, item=item)
     return True
 
 

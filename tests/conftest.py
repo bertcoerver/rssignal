@@ -6,10 +6,31 @@ would leave a file behind in the checkout. Pointing it at ``tmp_path`` for every
 test keeps that from happening whether or not the test cares about logging.
 """
 
+import tempfile
+
 import pytest
 
-from rssignal import cache, config, download, feeds, pending, run, signal_cli
+from rssignal import archive, cache, config, download, feeds, pending, run, signal_cli
 from rssignal.errorlog import DEFAULT_LOG_PATH
+
+
+@pytest.fixture(autouse=True)
+def no_media_archive(monkeypatch):
+    """Archiving off by default, whatever the developer's own environment says.
+
+    :mod:`rssignal.archive` is opt-in through ``RSSIGNAL_MEDIA_DIR``, so on a
+    host that has it set — the Home Assistant add-on, or anyone who exported it
+    to try it — the suite would start writing real files into a real media
+    folder. Tests that mean to exercise the archive set it themselves.
+
+    :func:`rssignal.archive.prepare` also points :mod:`tempfile` at its staging
+    directory, which is process-global and outlives the test that caused it.
+    Left alone, one archive test would send every later test's temporary files
+    into a ``tmp_path`` that pytest had already taken away.
+    """
+    monkeypatch.delenv(archive.MEDIA_DIR_ENV, raising=False)
+    monkeypatch.delenv(archive.MEDIA_KEEP_DAYS_ENV, raising=False)
+    monkeypatch.setattr(tempfile, "tempdir", tempfile.tempdir, raising=False)
 
 
 @pytest.fixture(autouse=True)

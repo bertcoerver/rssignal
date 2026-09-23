@@ -19,7 +19,7 @@ import shutil
 import sys
 from datetime import datetime, timezone
 
-from . import timing
+from . import archive, timing
 from .config import ConfigError, get_config
 from .errorlog import log_exception, log_line, log_path
 from .feeds import (
@@ -66,6 +66,16 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     # Where to look after an unattended run went wrong, printed whether or not
     # the file exists yet — the point is knowing where it will be.
     print(f"error log: {os.path.abspath(log_path())}")
+
+    # Off unless RSSIGNAL_MEDIA_DIR is set, which is the whole answer most of
+    # the time — and when it is on, the number matters enough to say out loud.
+    media = archive.media_dir()
+    if media:
+        days = archive.keep_days()
+        expiry = f"kept {days} day(s)" if days else "kept indefinitely"
+        print(f"media archive: {os.path.abspath(media)} ({expiry})")
+    else:
+        print(f"media archive: off (set {archive.MEDIA_DIR_ENV} to keep sends)")
 
     accounts = list_accounts()
     if accounts:

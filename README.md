@@ -34,11 +34,18 @@ command-line tool, so messages come from your own linked Signal account.
 
 signal-cli stores its account state in `~/.local/share/signal-cli` by default.
 
+> On a Raspberry Pi, `signal-cli` needs more than installing: the official
+> releases carry no native library for aarch64. See
+> [the add-on](addon/DOCS.md#the-signal-cli-problem).
+
 ## Installation
 
 ```bash
 pip install -e ".[dev]"
 ```
+
+To run it on a Raspberry Pi under Home Assistant OS instead of on a laptop, see
+[`addon/DOCS.md`](addon/DOCS.md).
 
 ## Setup
 
@@ -730,6 +737,52 @@ Use a `message_template` if you would rather choose what gets sent than have the
 end of it trimmed — `{description}` is the field that tends to be long.
 `--dry-run` prints the body as it would actually be sent, already shortened.
 
+## Keeping what was sent
+
+By default rssignal keeps nothing it downloads. An episode exists on disk for as
+long as it takes to upload it and is deleted in a `finally` — the Signal message
+is the only copy, which is the right default for a bridge between a feed and a
+chat app.
+
+Set `RSSIGNAL_MEDIA_DIR` and it keeps a copy as well:
+
+```bash
+export RSSIGNAL_MEDIA_DIR=/media/rssignal
+export RSSIGNAL_MEDIA_KEEP_DAYS=14        # 0 keeps everything
+```
+
+Each episode that goes out is filed under the feed it came from:
+
+```
+/media/rssignal/le-dessous-des-images/2026-07-23-la-bataille-du-drapeau.mp4
+/media/rssignal/3blue1brown/2026-07-21-but-what-is-a-fourier-series.mp4
+```
+
+and deleted again after `RSSIGNAL_MEDIA_KEEP_DAYS`. That is counted from when
+the file was *archived*, not when the item was published — an [episodic
+feed](#episodic-feeds) releases a back catalogue years after it went up, and a
+fortnight that had expired before the episode arrived would be a strange kind of
+archive.
+
+**It costs no extra writes.** The file is hard-linked rather than copied, so the
+bytes already on disk simply gain a second name and the temporary one goes away
+as it always did. A hard link only works within one filesystem, which is why a
+run points `TMPDIR` at `<media dir>/.staging` — downloads land next to the
+archive they are about to be linked into. The leading dot keeps half-finished
+downloads out of a media browser; anything left there by a run that was killed
+partway is cleared by the next run's expiry pass.
+
+Only the media itself is kept — the preview card's image is furniture, not
+content. Nothing is archived until after the item has actually been sent, so the
+folder is a record of what arrived rather than of what was attempted.
+
+Unset, none of this happens and nothing changes. The directory is as disposable
+as the cache: rssignal still keeps no local state that decides what gets sent.
+That lives in the group description, which is the next section.
+
+This was built for [the Home Assistant add-on](addon/DOCS.md), where the
+directory is the folder Home Assistant's Media browser shows.
+
 ## What rssignal remembers
 
 rssignal sends each item once. To do that it has to remember how far each feed
@@ -982,6 +1035,22 @@ items are still queued for the next run rather than skipped over.
 See [`examples/run-from-shortcut.sh`](examples/run-from-shortcut.sh) for the
 wrapper that holds a power assertion for the length of a run — and for why it is
 not a complete answer on battery.
+
+### Running it somewhere that doesn't sleep
+
+The real answer to all of the above is not to schedule a background job on a
+laptop. [`addon/`](addon/DOCS.md) is a Home Assistant add-on that runs rssignal
+on a Raspberry Pi: a JRE, ffmpeg, yt-dlp and a signal-cli with a working native
+library, on a timer, on a machine that is always on.
+
+Moving is nearly free, because rssignal keeps its place in each feed
+[in the group description](#what-rssignal-remembers) rather than on disk. Link
+the new machine as a second device and it picks up exactly where the old one
+left off — then turn the Shortcut off, because two live hosts on one account
+will both send.
+
+The one genuinely awkward part is signal-cli, which ships no native library for
+aarch64; the add-on's `install-signal-cli.sh` explains and handles it.
 
 A run stopped in a way rssignal can see (Ctrl-C, a scheduler shutting it down,
 an unreadable config) logs `run aborted after …` instead, so that case is not

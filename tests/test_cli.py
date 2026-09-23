@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from rssignal import cli
+from rssignal import archive, cli
 from rssignal.config import ConfigError
 from rssignal.feeds import FeedConfig, FeedItem, ParsedFeed
 from rssignal.signal_cli import SignalGroup, SignalSendError
@@ -442,3 +442,48 @@ def test_unexpected_error_is_logged_and_still_raised(monkeypatch, error_log):
         cli.main(["send", "hello"])
 
     assert "something nobody planned for" in error_log.read_text()
+
+
+def _doctor_ready(monkeypatch):
+    """Patch doctor's external lookups so only its reporting is under test."""
+    monkeypatch.setattr(cli, "find_signal_cli", lambda: "/bin/signal-cli")
+    monkeypatch.setattr(cli, "list_accounts", lambda: ["+31600000000"])
+    monkeypatch.setattr(
+        cli,
+        "get_config",
+        lambda: SimpleNamespace(account="+31600000000", recipient=None),
+    )
+
+
+def test_doctor_says_the_media_archive_is_off(monkeypatch, capsys):
+    _doctor_ready(monkeypatch)
+
+    assert cli.main(["doctor"]) == 0
+    # Named rather than merely absent: "off" is a setting, and the next
+    # question is always how to turn it on.
+    assert "media archive: off" in capsys.readouterr().out
+
+
+def test_doctor_reports_the_media_archive_and_its_window(
+    monkeypatch, capsys, tmp_path
+):
+    _doctor_ready(monkeypatch)
+    monkeypatch.setenv(archive.MEDIA_DIR_ENV, str(tmp_path / "media"))
+    monkeypatch.setenv(archive.MEDIA_KEEP_DAYS_ENV, "21")
+
+    assert cli.main(["doctor"]) == 0
+
+    out = capsys.readouterr().out
+    assert str(tmp_path / "media") in out
+    assert "21 day(s)" in out
+
+
+def test_doctor_spells_out_an_archive_that_never_expires(
+    monkeypatch, capsys, tmp_path
+):
+    _doctor_ready(monkeypatch)
+    monkeypatch.setenv(archive.MEDIA_DIR_ENV, str(tmp_path / "media"))
+    monkeypatch.setenv(archive.MEDIA_KEEP_DAYS_ENV, "0")
+
+    assert cli.main(["doctor"]) == 0
+    assert "kept indefinitely" in capsys.readouterr().out

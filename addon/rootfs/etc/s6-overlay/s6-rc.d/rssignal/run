@@ -1,0 +1,81 @@
+#!/usr/bin/with-contenv bashio
+#
+# The scheduler: sleep until the next configured time, run rssignal, repeat.
+#
+# A cron daemon would do this too, and was the obvious first choice. It is not
+# used because the times come from the add-on's options, which means a crontab
+# would have to be rewritten and a daemon reloaded every time someone edits
+# them — and because a crontab's failures go somewhere other than the add-on
+# log, which is the one place anybody will look.
+#
+# A loop that computes its own next wake-up keeps the schedule, the run and the
+# log in one place, and restarting the add-on is all it takes to pick up a
+# changed schedule.
+#
+# The times are local: Supervisor gives the container the same timezone as
+# Home Assistant, so "06:30" means what it says on the wall.
+
+set -e
+
+bashio::config.require 'account'
+
+# Read the list straight out of the options file rather than through
+# `bashio::config`, which hands back a list as pretty-printed JSON — fine to
+# log, useless to iterate.
+declare -a SLOTS
+mapfile -t SLOTS < <(jq -r '.schedule[]? // empty' /data/options.json)
+
+if [ "${#SLOTS[@]}" -eq 0 ]; then
+    bashio::exit.nok "No times in 'schedule' — the add-on would never run."
+fi
+
+bashio::log.info "Schedule: ${SLOTS[*]} (${TZ:-system timezone})"
+
+# Seconds from now until the next slot, today's if one is still to come and
+# tomorrow's earliest otherwise.
+#
+# Computed from absolute epoch seconds rather than by adding up hours, because
+# the arithmetic has to survive the two days a year that are not 24 hours long.
+# `date` knows about those; a loop counting 3600s at a time does not.
+next_wait() {
+    local now soonest=0 when
+    now="$(date +%s)"
+
+    for slot in "${SLOTS[@]}"; do
+        when="$(date -d "today ${slot}" +%s 2>/dev/null)" || continue
+        if [ "${when}" -le "${now}" ]; then
+            when="$(date -d "tomorrow ${slot}" +%s)"
+        fi
+        if [ "${soonest}" -eq 0 ] || [ "${when}" -lt "${soonest}" ]; then
+            soonest="${when}"
+        fi
+    done
+
+    if [ "${soonest}" -eq 0 ]; then
+        # Every entry failed to parse, which the config schema should have
+        # prevented. Wait an hour rather than spinning.
+        echo 3600
+        return
+    fi
+
+    echo "$(( soonest - now ))"
+}
+
+while true; do
+    wait_for="$(next_wait)"
+    bashio::log.info \
+        "Next run at $(date -d "+${wait_for} seconds" '+%Y-%m-%d %H:%M %Z')."
+
+    sleep "${wait_for}"
+
+    # A failed run is logged and the loop carries on. rssignal is built to be
+    # run again — the watermark of anything it did not manage to send is left
+    # where it was, so the next slot picks up the same items rather than
+    # skipping them. A scheduler that gave up on the first bad night would turn
+    # one unreachable feed into a silent week.
+    rssignal-run || true
+
+    # One second past the slot, so that a run which finished inside the same
+    # minute is not immediately rescheduled onto the slot it just did.
+    sleep 1
+done
