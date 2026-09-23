@@ -1,0 +1,154 @@
+#!/usr/bin/with-contenv bashio
+#
+# Link this add-on to a Signal account, without a shell.
+#
+# Linking is the one step in the whole setup that needs a human: Signal shows a
+# QR code scanner, and something has to put a QR code in front of it. The
+# documented way to do that is `docker exec` into the container and run
+# `rssignal link`, which is fine on a normal Docker host and impossible on Home
+# Assistant OS — the Supervisor only exposes the Docker socket to add-ons
+# running with protection mode off, and as of Home Assistant 2026.6 the setting
+# that turned protection mode off was removed from the interface along with
+# Advanced Mode. There is no longer a supported way to get a shell in here.
+#
+# So the add-on links itself. Set `link_mode: true`, start it, scan, set it
+# back to false. The scheduler does not run while this is on.
+#
+# The QR code is published two ways, because the reliable one is not the
+# obvious one:
+#
+#   * As a PNG in Home Assistant's Media browser. This is the one to use. It is
+#     a real image at a real size, and scanning it is no different from scanning
+#     a QR code on any other web page.
+#   * As text in the add-on log. Convenient when it works, but it is at the
+#     mercy of the log viewer's font and line height, and a QR code with gaps
+#     between its rows may not scan at all.
+#
+# The PNG is deleted the moment linking finishes. It has to be: the sgnl:// URI
+# behind it is a credential, and anyone who scans it before you do gets a linked
+# device on your Signal account. It lives in a folder the Media browser shows to
+# every Home Assistant user, for as long as it takes you to scan it, and not a
+# moment longer.
+
+set -e
+
+# HOME above all: this is where signal-cli writes the keys it is about to
+# receive, and /data is the only path that survives an add-on update.
+# shellcheck source=../lib/rssignal-env.sh
+source /usr/local/lib/rssignal-env.sh
+
+DEVICE_NAME="${1:-rssignal (Home Assistant)}"
+
+# A fresh filename every attempt, rather than one fixed name. The URI inside the
+# QR is only valid while *this* signal-cli process is waiting for it, so a code
+# left over from a previous attempt is not merely old, it is poison: Signal
+# scans it, sends the dead token to the server and reports "Invalid response
+# from service", which reads like a problem with your account and is not. One
+# fixed name made that easy to hit, because the Media browser serves images
+# through the browser cache and would happily show yesterday's PNG for today's
+# process. A name that changes cannot be cached into the wrong answer.
+QR_PNG="/media/rssignal-link-$(date +%Y%m%d-%H%M%S).png"
+
+# Whatever happens next — success, a timeout, the add-on being stopped halfway
+# through — every QR code here stops being readable. EXIT catches all of it.
+# The glob rather than just ${QR_PNG}: a container killed mid-link never runs
+# this, so each attempt also clears whatever its predecessors left behind.
+cleanup() {
+    rm -f /media/rssignal-link-*.png /media/rssignal-link.png
+}
+trap cleanup EXIT
+
+# Before, as well as after: the stale ones must be gone *while* you are choosing
+# which file to scan, not merely once linking is over.
+cleanup
+
+bashio::log.warning "link_mode is on: linking only, no feeds will be sent."
+
+if signal-cli listAccounts 2>/dev/null | grep -q .; then
+    bashio::log.warning "This add-on already has a linked account."
+    bashio::log.warning "Linking again adds a second device, which is allowed"
+    bashio::log.warning "but rarely what anyone wants. Set link_mode back to"
+    bashio::log.warning "false and restart to keep the account you have."
+fi
+
+# signal-cli prints the sgnl:// URI on its first line of stdout and then blocks,
+# for several minutes, until the phone scans it and the initial sync completes.
+# So the URI has to be read out of the stream while the process is still going:
+# `$(...)` would wait for it to finish and hand over the URI after it was no
+# longer any use. The trailing `cat` matters too — it drains what signal-cli
+# writes at the end, which would otherwise block on a pipe nobody is reading.
+# errexit off across the pipeline: a failed link has to be reported with its
+# own message rather than killing the script before PIPESTATUS can be read.
+set +e
+
+signal-cli link -n "${DEVICE_NAME}" | {
+    read -r uri
+
+    if [ -z "${uri}" ]; then
+        bashio::log.error "signal-cli produced no linking URI."
+        exit 1
+    fi
+
+    # Enough of the URI to tell two attempts apart and to see at a glance that
+    # it is the real thing, without printing a credential into the add-on log.
+    bashio::log.info "Link URI: ${#uri} chars, starting ${uri:0:12}"
+
+    if qrencode -o "${QR_PNG}" -s 8 -m 2 "${uri}" 2>/dev/null; then
+        bashio::log.info "---------------------------------------------------"
+        bashio::log.info "Open Home Assistant's Media panel and find"
+        bashio::log.info "  $(basename "${QR_PNG}")"
+        bashio::log.info "It is the only rssignal-link-*.png there; any older"
+        bashio::log.info "one has just been deleted, because a QR from a"
+        bashio::log.info "previous attempt fails with 'Invalid response from"
+        bashio::log.info "service'. Scan it within a couple of minutes."
+        bashio::log.info "Then scan it with Signal on your phone:"
+        bashio::log.info "  Settings -> Linked Devices -> Link New Device"
+        bashio::log.info "---------------------------------------------------"
+    else
+        bashio::log.warning "Could not write ${QR_PNG}; use the code below."
+    fi
+
+    # The text version, as a fallback. Deliberately `UTF8` rather than the
+    # `ANSIUTF8` a terminal would want: the log viewer is HTML, and a QR code
+    # drawn in ANSI background colours depends on the browser painting cell
+    # backgrounds edge to edge, which it does not always do.
+    echo
+    qrencode -t UTF8 -m 2 "${uri}" || true
+    echo
+
+    bashio::log.info "Waiting for the scan (this blocks until sync finishes)..."
+
+    cat
+}
+
+# Copy the whole array in one go. PIPESTATUS is rebuilt after every command —
+# including a plain assignment — so reading it element by element gets the first
+# value and then an empty string.
+#
+# [0] is signal-cli's own status; [1] is the block's, which is how the "no URI
+# on stdout" case gets out.
+pipe_status=("${PIPESTATUS[@]}")
+rc="${pipe_status[0]:-1}"
+rc_block="${pipe_status[1]:-1}"
+set -e
+
+cleanup
+
+if [ "${rc}" -ne 0 ] || [ "${rc_block}" -ne 0 ]; then
+    bashio::log.error "Linking failed (signal-cli exited ${rc})."
+    bashio::log.error "Nothing was linked. Restart the add-on to try again."
+    exit 1
+fi
+
+bashio::log.info "==================================================="
+bashio::log.info "Linked. The QR code has been deleted."
+bashio::log.info ""
+bashio::log.info "Now set link_mode back to false in the Configuration"
+bashio::log.info "tab and start the add-on again. It will then run on"
+bashio::log.info "the schedule instead of linking."
+bashio::log.info "==================================================="
+
+# Exit 0, which the finish script reads as "stop the container" rather than
+# "restart it". Sitting in a sleep would leave the add-on looking like it was
+# working when it was waiting for someone to change a setting.
+exit 0

@@ -21,8 +21,14 @@ ARG JAVA_VERSION="25"
 # `rssignal[video]==<version>` and `dist/` can go away.
 ARG RSSIGNAL_SPEC="rssignal[video] @ git+https://github.com/bertcoerver/rssignal@main"
 
+# Prepend, never replace. The base image's own s6 services run with this PATH
+# too, and one of them ends in `dpkg-reconfigure`, which lives in /usr/sbin —
+# so a PATH written out in full that happens to omit /usr/sbin makes that
+# service exit 127. The base sets S6_BEHAVIOUR_IF_STAGE2_FAILS=2, meaning any
+# failed service takes the whole container down with it, so the symptom is
+# rssignal dying at startup because of a timezone script it never touches.
 ENV JAVA_HOME=/opt/java \
-    PATH=/opt/java/bin:/opt/venv/bin:/usr/local/bin:/usr/bin:/bin \
+    PATH="/opt/java/bin:/opt/venv/bin:${PATH}" \
     # Python in a container has no one to buffer for, and an add-on log that
     # only appears once a run is over is no use while the run is going.
     PYTHONUNBUFFERED=1
@@ -38,6 +44,12 @@ RUN apt-get update \
         git \
         python3 \
         python3-venv \
+        # `rssignal link` renders the sgnl:// linking URI as a scannable QR
+        # code when this is present, and prints the bare URI when it is not.
+        # A bare URI is close to useless: Signal's "Link New Device" only
+        # scans, so without this the one interactive step in the whole setup
+        # has no way to complete.
+        qrencode \
         unzip \
         zip \
     && rm -rf /var/lib/apt/lists/*
@@ -103,7 +115,8 @@ COPY rootfs /
 RUN chmod +x \
     /etc/s6-overlay/s6-rc.d/rssignal/run \
     /etc/s6-overlay/s6-rc.d/rssignal/finish \
-    /usr/local/bin/rssignal-run
+    /usr/local/bin/rssignal-run \
+    /usr/local/bin/rssignal-link
 
 LABEL \
     io.hass.name="rssignal" \

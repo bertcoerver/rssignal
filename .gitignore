@@ -78,3 +78,7 @@ Thumbs.db
 !addon/dist/
 addon/dist/*
 !addon/dist/.keep
+
+# The `lib/` rule above is meant for Python build output, but it also swallows
+# the add-on's /usr/local/lib, which holds a shell file the container needs.
+!addon/rootfs/usr/local/lib/

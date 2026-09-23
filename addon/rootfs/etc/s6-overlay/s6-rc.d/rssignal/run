@@ -17,6 +17,14 @@
 
 set -e
 
+# Linking is a mode of the add-on rather than something done in a shell, because
+# Home Assistant OS no longer offers a way to get a shell in here — see
+# /usr/local/bin/rssignal-link for the full story. While it is on, this is all
+# the add-on does; the scheduler below is not reached.
+if bashio::config.true 'link_mode'; then
+    exec /usr/local/bin/rssignal-link
+fi
+
 bashio::config.require 'account'
 
 # Read the list straight out of the options file rather than through
@@ -30,6 +38,70 @@ if [ "${#SLOTS[@]}" -eq 0 ]; then
 fi
 
 bashio::log.info "Schedule: ${SLOTS[*]} (${TZ:-system timezone})"
+
+# `rssignal doctor` on every start, because there is nowhere else to run it.
+# On a normal host this is the first thing you type after installing; here
+# there is no shell to type it in, so the add-on says it out loud instead. It
+# checks signal-cli, ffmpeg and yt-dlp on PATH, which accounts are linked, the
+# config and the log path — cheap, read-only, and the difference between
+# finding out now and finding out at 01:30.
+bashio::log.info "Checking the install..."
+#
+# `|| true` is load-bearing. `doctor` exits non-zero when it finds a problem,
+# and it will find one — "account is not linked" — every time between installing
+# the add-on and linking it. bashio runs its scripts with `pipefail`, so without
+# this the report's exit status escapes the pipeline, errexit kills the
+# scheduler, s6 restarts it, and it arrives at the same verdict a second later:
+# a restart loop caused entirely by the thing whose job is to explain problems.
+# A diagnostic reports; it does not decide whether the add-on runs.
+(
+    # shellcheck source=../../../../usr/local/lib/rssignal-env.sh
+    source /usr/local/lib/rssignal-env.sh
+
+    # Where the device keys actually are, as opposed to where they are supposed
+    # to be. `doctor` reports whether signal-cli knows about an account, which
+    # is the useful answer right up until it says "none" an hour after linking
+    # succeeded — and then the only question that matters is which directory it
+    # looked in. signal-cli takes that from HOME, or from XDG_DATA_HOME if the
+    # environment sets one, so both are printed: a link that lands in one and a
+    # check that reads the other looks exactly like a link that never happened.
+    echo "home: ${HOME}"
+    echo "xdg_data_home: ${XDG_DATA_HOME:-(unset)}"
+    store="${XDG_DATA_HOME:-${HOME}/.local/share}/signal-cli"
+    if [ -d "${store}" ]; then
+        echo "signal-cli store: ${store} [$(ls -A "${store}" | tr '\n' ' ')]"
+    else
+        echo "signal-cli store: ${store} (does not exist)"
+    fi
+    echo "/data contains: $(ls -A /data 2>/dev/null | tr '\n' ' ')"
+    # Deliberately unfiltered by path. The first version of this check only
+    # looked under */share/*, which is where signal-cli documents its store —
+    # and so it confidently found nothing while the keys sat in /root, written
+    # there by a JVM property no amount of HOME could reach. A search for a
+    # misplaced file should not assume it knows where the file would be.
+    find / -maxdepth 6 -type d -name signal-cli \
+        -not -path '/proc/*' -not -path '/sys/*' -not -path '/opt/*' 2>/dev/null |
+        while IFS= read -r found; do echo "found a store at: ${found}"; done
+
+    rssignal doctor 2>&1
+) | while IFS= read -r line; do
+    bashio::log.info "  ${line}"
+done || true
+
+# Waiting until the next slot to discover whether any of this works is a poor
+# first experience when the next slot may be twelve hours away — and without a
+# shell there is no other way to make a run happen. `dry-run` fetches every
+# feed and sends nothing; `run` is the real thing.
+case "$(bashio::config 'on_start')" in
+    dry-run)
+        bashio::log.info "on_start: dry run (fetches everything, sends nothing)"
+        rssignal-run --dry-run || true
+        ;;
+    run)
+        bashio::log.info "on_start: running now"
+        rssignal-run || true
+        ;;
+esac
 
 # Seconds from now until the next slot, today's if one is still to come and
 # tomorrow's earliest otherwise.

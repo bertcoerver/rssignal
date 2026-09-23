@@ -17,8 +17,9 @@ mid-run. A Raspberry Pi has none of those problems.
   episodes are then kept for two weeks. That is a standing few GB and on the
   order of 100 GB of writes a year, which an SD card will not enjoy.
 - A phone with Signal, to link the account.
-- A way to get files onto the host and a shell into it: the **Samba share** and
-  **Advanced SSH & Web Terminal** add-ons.
+- A way to get files onto the host: the **Samba share** add-on is the easiest.
+  No SSH add-on is needed — nothing here requires a shell, because on Home
+  Assistant OS there is no longer a way to get one into an add-on.
 
 ## Installing
 
@@ -74,22 +75,32 @@ it.
 
 ### 3. Link the Signal account
 
-rssignal sends as a linked device, like Signal Desktop, so the container needs
-to be linked to your account once. From the **Advanced SSH & Web Terminal**
-add-on (with *Protection mode* off):
+rssignal sends as a linked device, like Signal Desktop, so the add-on has to be
+linked to your account once. It links itself:
 
-```sh
-docker exec -it addon_local_rssignal bash
-export HOME=/data/home
-rssignal link
-```
+1. **Configuration** tab → set `link_mode` to **true** → Save.
+2. **Start** the add-on.
+3. Open Home Assistant's **Media** panel. There is now a file called
+   **`rssignal-link.png`** — a QR code.
+4. Scan it with **Signal → Settings → Linked Devices → Link New Device**.
+5. Wait. The add-on log says `Linked.` when the initial sync has finished, and
+   the QR code is deleted at that moment.
+6. Set `link_mode` back to **false** → Save → **Start** the add-on again.
 
-Scan the QR code with **Signal → Settings → Linked Devices → Link New Device**.
-The command blocks until linking and the initial sync finish.
+The add-on log carries a text copy of the same QR code, which is quicker if it
+happens to render legibly in your browser. The PNG is the one to rely on.
 
-`HOME` matters: it is where signal-cli keeps the device's keys, and `/data` is
-the only directory that survives an add-on update. Linking with the wrong
-`HOME` appears to work and then asks to be linked again after the next update.
+> **The QR code is a credential.** Anyone who scans it before you do gets a
+> linked device on your Signal account, and while it exists it sits in a folder
+> every Home Assistant user can browse. The add-on deletes it as soon as linking
+> finishes, or when it is stopped. Don't leave `link_mode` on.
+
+**Why not a shell?** Because there isn't one. Linking used to be
+`docker exec -it addon_local_rssignal rssignal link`, which needs the add-on to
+run with protection mode off — and Home Assistant 2026.6 removed the Advanced
+Mode setting that exposed that toggle. There is no longer a supported way to get
+a shell into an add-on, so linking had to become something the add-on does to
+itself.
 
 > **Do not copy signal-cli's state from your Mac.** Link a second device
 > instead. It is less fiddly and Signal is built for it. rssignal keeps no local
@@ -109,6 +120,8 @@ descriptions that hold the watermarks.
 | Option | Default | What it does |
 |---|---|---|
 | `account` | — | E.164 number to send from. Required. |
+| `link_mode` | `false` | Link to Signal instead of running. See above. |
+| `on_start` | `wait` | `wait`, `dry-run` or `run` — what to do at startup, before the schedule takes over. |
 | `schedule` | `01:30`, `06:30`, `15:00` | Local times to run at. |
 | `media_keep_days` | `14` | How long sent episodes stay in `/media`. `0` keeps them forever. |
 | `update_yt_dlp` | `true` | Upgrade yt-dlp once a day before the first run. |
@@ -186,40 +199,42 @@ The build fails clearly if the two versions disagree.
 
 ## Checking on it
 
-`rssignal doctor` is the fastest way to see whether the container is set up
-correctly — it checks signal-cli, ffmpeg and yt-dlp on `PATH`, the linked
-accounts, the config and the log path:
+There is no shell into an add-on on Home Assistant OS (see
+[Link the Signal account](#3-link-the-signal-account)), so everything you would
+normally type is reported or triggered from the Configuration tab instead.
 
-```sh
-docker exec -it addon_local_rssignal bash
-export HOME=/data/home
-rssignal doctor
-```
+**`rssignal doctor` runs on every start** and its output goes to the add-on log.
+It checks signal-cli, ffmpeg and yt-dlp on `PATH`, which accounts are linked,
+the config and the log path — so restarting the add-on is the way to ask "is
+this thing healthy?". The answer is the block of indented lines near the top of
+the log, under `Checking the install...`.
 
-To see what a run *would* do without sending anything:
+**To make a run happen now**, rather than waiting for the next slot, set
+`on_start` and restart:
 
-```sh
-rssignal-run --dry-run
-```
+| `on_start` | What happens at startup |
+|---|---|
+| `wait` | Nothing; sleeps until the next scheduled slot. The normal setting. |
+| `dry-run` | Fetches every feed, reports what it would send, sends nothing. |
+| `run` | A real run, immediately. |
 
-To force a run right now, rather than waiting for the next slot:
+Set it back to `wait` afterwards, or every restart will fire a run.
 
-```sh
-rssignal-run
-```
-
-`rssignal-run` is the same script the scheduler calls, with the same
-environment, so what you see by hand is what happens at 01:30.
+`dry-run` is the one to use after editing `feeds.json`: it exercises every
+feed's fetch path — and deliberately lifts the pacing gate that normally holds
+episodic feeds back — without sending anything.
 
 Longer-term evidence lives in `/data/rssignal.log`, which records the start and
 end of every run and the full traceback of every failure. A "started" line with
-no "finished" under it is what a run that was killed partway leaves behind.
+no "finished" under it is what a run that was killed partway leaves behind. It
+is inside the add-on's volume, so the way to read it is the add-on log, or a
+backup.
 
 ## What lives where
 
 | Path (in the container) | On the host | Survives updates |
 |---|---|---|
-| `/data/home/.local/share/signal-cli` | add-on volume | yes — the device keys |
+| `/data/signal-cli` | add-on volume | yes — the device keys |
 | `/data/cache.json`, `/data/pending.json` | add-on volume | yes |
 | `/data/rssignal.log` | add-on volume | yes |
 | `/config/feeds.json` | `/addon_configs/local_rssignal/` | yes |

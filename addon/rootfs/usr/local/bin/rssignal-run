@@ -17,40 +17,12 @@ set -e
 
 # --- where state lives ------------------------------------------------------
 #
-# /data is the add-on's persistent volume: it survives restarts, updates and
-# rebuilds. Everything that must not be lost goes there, and nothing else does.
-#
-# HOME is the important one and the least obvious. signal-cli keeps the linked
-# device's identity — its keys — under $HOME/.local/share/signal-cli, and
-# rssignal invokes signal-cli without a --config flag, so this variable is the
-# only lever there is. Get it wrong and the add-on asks to be linked again
-# after every update.
-export HOME="/data/home"
-mkdir -p "${HOME}"
+# Shared with the scheduler, which runs `rssignal doctor` with the same
+# environment so that what it reports is what a run actually uses.
+# shellcheck source=../lib/rssignal-env.sh
+source /usr/local/lib/rssignal-env.sh
 
-# rssignal's own files. The cache and pending list default to ~/.cache, which
-# HOME above would already have put on /data — said outright anyway, because
-# one of them decides whether a half-sent episode gets its second message.
-export RSSIGNAL_CACHE="/data/cache.json"
-export RSSIGNAL_PENDING="/data/pending.json"
-export RSSIGNAL_LOCK="/data/run.lock"
-export RSSIGNAL_LOG="/data/rssignal.log"
-
-# --- configuration ----------------------------------------------------------
-
-RSSIGNAL_ACCOUNT="$(bashio::config 'account')"
-export RSSIGNAL_ACCOUNT
-
-# /media is the folder Home Assistant's Media browser shows. rssignal links
-# each episode it sends into here and expires them on the schedule below; with
-# RSSIGNAL_MEDIA_DIR unset it would delete every download as it always has.
-export RSSIGNAL_MEDIA_DIR="/media/rssignal"
-RSSIGNAL_MEDIA_KEEP_DAYS="$(bashio::config 'media_keep_days')"
-export RSSIGNAL_MEDIA_KEEP_DAYS
-
-# feeds.json lives on the host at /addon_configs/<slug>/, so it can be edited
-# with the File Editor or over Samba without rebuilding anything.
-CONFIG="/config/feeds.json"
+CONFIG="${RSSIGNAL_CONFIG}"
 
 if ! bashio::fs.file_exists "${CONFIG}"; then
     bashio::log.error "No feeds.json at ${CONFIG}."

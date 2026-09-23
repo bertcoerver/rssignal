@@ -5,7 +5,7 @@
 # is why there is no `image:` key — its absence is what tells Supervisor to
 # build the Dockerfile next to this file.
 name: rssignal
-version: "0.1.0"
+version: "0.2.0"
 slug: rssignal
 description: Forward RSS feeds to Signal, on a machine that never sleeps
 url: https://github.com/bertcoerver/rssignal
@@ -36,6 +36,8 @@ map:
 
 options:
   account: ""
+  link_mode: false
+  on_start: wait
   schedule:
     - "01:30"
     - "06:30"
@@ -46,8 +48,18 @@ options:
 
 schema:
   # The E.164 number rssignal sends from — the account linked with
-  # `rssignal link`. Required; the add-on refuses to start without it.
+  # `link_mode` below. Required; the add-on refuses to start without it.
   account: str
+  # Turn on, start the add-on, scan the QR code it puts in the Media browser,
+  # turn off again. Nothing is sent while this is on. It exists because Home
+  # Assistant 2026.6 removed the setting that allowed a shell into an add-on,
+  # which is how linking used to be done.
+  link_mode: bool
+  # What to do the moment the add-on starts, before settling into the schedule.
+  # `wait` is the normal answer. `dry-run` fetches every feed and sends nothing,
+  # which is how you check a new feeds.json; `run` sends for real. Both exist
+  # because there is no shell here to run them from.
+  on_start: list(wait|dry-run|run)
   # Local times to run at, HH:MM. Keep three or so spread across the day: the
   # `EARLY` allowance in rssignal.episodic is sized for runs a few hours apart,
   # and a single daily run would make a "daily" feed drift to every other day.
