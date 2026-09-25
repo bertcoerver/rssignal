@@ -22,7 +22,7 @@ from .feeds import (
     preview_fields,
     render_message,
 )
-from .run import run_feeds
+from .run import refresh_group_images, run_feeds
 from .signal_cli import (
     AccountNotLinked,
     LinkPreview,
@@ -86,6 +86,7 @@ __all__ = [
     "AccountNotLinked",
     "SignalSendError",
     "run_feeds",
+    "refresh_group_images",
     "load_feeds",
     "parse_feed",
     "FeedConfig",

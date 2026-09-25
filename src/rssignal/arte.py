@@ -234,18 +234,8 @@ def parse_arte_collection(cfg: FeedConfig) -> ParsedFeed:
     undated, and therefore unsent. See :data:`ARTE_DATED_ITEMS` for why that is
     the behaviour you want rather than a limitation.
     """
-    found = arte_collection_id(cfg.url)
-    if not found:
-        raise FeedError(f"Not an ARTE collection url: {cfg.url!r}")
-    collection_id, lang = found
-
-    raw = fetch_text(ARTE_PLAYLIST_API.format(lang=lang, collection_id=collection_id))
-    try:
-        attributes = json.loads(raw)["data"]["attributes"]
-        entries = attributes["items"]
-    except (ValueError, KeyError, TypeError) as exc:
-        raise FeedError(f"Unexpected playlist for {collection_id}: {exc}") from exc
-
+    collection_id, lang, attributes = _playlist(cfg.url)
+    entries = attributes["items"]
     if not entries:
         raise FeedError(f"ARTE collection {collection_id} listed no episodes")
 
@@ -263,6 +253,37 @@ def parse_arte_collection(cfg: FeedConfig) -> ParsedFeed:
         image_url=_first_image(show),
         description=strip_html(show.get("description") or ""),
     )
+
+
+def collection_image(url: str) -> str:
+    """The show's own artwork for an ARTE collection url, as it is right now.
+
+    The same playlist :func:`parse_arte_collection` reads, without dating any of
+    its episodes — the picture is all that is wanted.
+    """
+    collection_id, _, attributes = _playlist(url)
+    image = _first_image(attributes.get("metadata") or {})
+    if image is None:
+        raise FeedError(f"ARTE collection {collection_id} has no image")
+    return image
+
+
+def _playlist(url: str) -> tuple[str, str, dict]:
+    """Fetch an ARTE collection's playlist: ``(collection_id, lang, attributes)``."""
+    found = arte_collection_id(url)
+    if not found:
+        raise FeedError(f"Not an ARTE collection url: {url!r}")
+    collection_id, lang = found
+
+    raw = fetch_text(ARTE_PLAYLIST_API.format(lang=lang, collection_id=collection_id))
+    try:
+        attributes = json.loads(raw)["data"]["attributes"]
+        # Touched here so a playlist without episodes reads as malformed, the
+        # same as one without attributes, whichever caller wanted it.
+        attributes["items"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise FeedError(f"Unexpected playlist for {collection_id}: {exc}") from exc
+    return collection_id, lang, attributes
 
 
 def _collection_item(

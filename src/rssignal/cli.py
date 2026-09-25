@@ -9,6 +9,7 @@ Subcommands:
     fields          show the fields an item exposes, for writing templates
     groups          list the Signal groups you can send to
     create-group    create a new group containing only you
+    refresh-images  update each feed group's picture from its source's artwork
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from .feeds import (
     parse_feed,
     render_message,
 )
-from .run import AlreadyRunning, run_feeds
+from .run import AlreadyRunning, refresh_group_images, run_feeds
 from .signal_cli import (
     SignalError,
     create_group,
@@ -124,6 +125,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 dry_run=args.dry_run,
                 to=args.to,
                 since=_parse_since(args.since),
+                refresh_images=args.refresh_images,
             )
         except AlreadyRunning as exc:
             # Exit 0: the last run being slow is not this run's failure, and an
@@ -282,6 +284,19 @@ def _cmd_create_group(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_refresh_images(args: argparse.Namespace) -> int:
+    try:
+        count = refresh_group_images(args.config, dry_run=args.dry_run)
+    except AlreadyRunning as exc:
+        print(f"Nothing to do: {exc}.", file=sys.stderr)
+        return 0
+    if args.dry_run:
+        print(f"{count} group image(s) would be updated (dry run).")
+    else:
+        print(f"{count} group image(s) updated.")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rssignal", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -338,6 +353,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "send items published after this ISO timestamp, ignoring what each "
             "group remembers (e.g. 2026-07-01, or 2026-07-01T09:00+02:00)"
+        ),
+    )
+    run.add_argument(
+        "--refresh-images",
+        action="store_true",
+        help=(
+            "after sending, refresh every feed group's picture from its source "
+            "(otherwise done at random, about once a month); no effect with "
+            "--dry-run or --to"
         ),
     )
     run.add_argument(
@@ -431,6 +455,27 @@ def _build_parser() -> argparse.ArgumentParser:
         help="print only the recipient value",
     )
     create.set_defaults(func=_cmd_create_group)
+
+    refresh = subparsers.add_parser(
+        "refresh-images",
+        help="update each feed group's picture from its source's artwork",
+        description=(
+            "Fetch every feed's current artwork and set it as the picture of "
+            "the feed's group, where it has changed. `rssignal run` does this "
+            "by itself about once a month."
+        ),
+    )
+    refresh.add_argument(
+        "--config",
+        default="feeds.json",
+        help="path to the feeds JSON config (default: feeds.json)",
+    )
+    refresh.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report which groups would get a new picture without changing any",
+    )
+    refresh.set_defaults(func=_cmd_refresh_images)
 
     return parser
 

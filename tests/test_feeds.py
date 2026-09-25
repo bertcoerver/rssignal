@@ -1019,3 +1019,61 @@ def test_channel_description_does_not_leak_into_items(monkeypatch):
         lambda url, **kwargs: _parsed([{"title": "Ep"}], {"summary": "Show blurb"}),
     )
     assert parse_feed(FeedConfig(url="https://a")).items[0].description == ""
+
+
+# --- the feed's own artwork -------------------------------------------------
+
+
+def _channel_with_image(href):
+    fake = type("Parsed", (), {})()
+    fake.bozo = False
+    fake.entries = []
+    fake.feed = {"image": {"href": href}} if href else {}
+    fake.etag = "new-etag"
+    return fake
+
+
+def test_feed_image_reads_the_channel_artwork(monkeypatch):
+    fake = _channel_with_image("https://a/show.jpg")
+    monkeypatch.setattr(feeds.feedparser, "parse", lambda url, **kwargs: fake)
+
+    assert feeds.feed_image(FeedConfig(url="https://a", name="Pod")) == (
+        "https://a/show.jpg"
+    )
+
+
+def test_feed_image_of_a_feed_without_artwork_is_none(monkeypatch):
+    fake = _channel_with_image(None)
+    monkeypatch.setattr(feeds.feedparser, "parse", lambda url, **kwargs: fake)
+
+    assert feeds.feed_image(FeedConfig(url="https://a", name="Pod")) is None
+
+
+def test_feed_image_reads_unconditionally_and_leaves_the_etag_alone(monkeypatch):
+    # A 304 would say nothing about the picture; and handing the run a fresh
+    # ETag would make it answer "nothing new" about items it never saw.
+    feeds.cache.put(feeds._HTTP_NS, "https://a", {"etag": "old-etag", "modified": None})
+    asked = []
+
+    def fake_parse(url, **kwargs):
+        asked.append(kwargs)
+        return _channel_with_image("https://a/show.jpg")
+
+    monkeypatch.setattr(feeds.feedparser, "parse", fake_parse)
+
+    feeds.feed_image(FeedConfig(url="https://a", name="Pod"))
+
+    assert asked == [{}]
+    assert feeds.cache.get(feeds._HTTP_NS, "https://a")["etag"] == "old-etag"
+
+
+def test_feed_image_asks_a_video_source_instead_of_its_feed(monkeypatch):
+    from rssignal import video
+
+    monkeypatch.setattr(video, "source_image", lambda url: "https://yt3/avatar")
+    monkeypatch.setattr(
+        feeds.feedparser, "parse", lambda *a, **k: pytest.fail("feed read")
+    )
+
+    cfg = FeedConfig(url="https://www.youtube.com/channel/UCabc", name="Chan")
+    assert feeds.feed_image(cfg) == "https://yt3/avatar"

@@ -351,8 +351,12 @@ def test_create_group_error_returns_1(monkeypatch, capsys):
 def _capture_run_feeds(monkeypatch):
     captured = {}
 
-    def fake_run_feeds(config, *, dry_run=False, to=None, since=None):
+    def fake_run_feeds(
+        config, *, dry_run=False, to=None, since=None, refresh_images=False
+    ):
         captured.update(config=config, dry_run=dry_run, to=to, since=since)
+        if refresh_images:
+            captured["refresh_images"] = True
         return 0
 
     monkeypatch.setattr(cli, "run_feeds", fake_run_feeds)
@@ -487,3 +491,24 @@ def test_doctor_spells_out_an_archive_that_never_expires(
 
     assert cli.main(["doctor"]) == 0
     assert "kept indefinitely" in capsys.readouterr().out
+
+
+def test_refresh_images_is_threaded_through(monkeypatch, capsys):
+    captured = {}
+
+    def fake_refresh(config, *, dry_run=False):
+        captured.update(config=config, dry_run=dry_run)
+        return 2
+
+    monkeypatch.setattr(cli, "refresh_group_images", fake_refresh)
+
+    assert cli.main(["refresh-images", "--config", "f.json", "--dry-run"]) == 0
+    assert captured == {"config": "f.json", "dry_run": True}
+    assert "2 group image(s) would be updated" in capsys.readouterr().out
+
+
+def test_run_refresh_images_is_threaded_through(monkeypatch):
+    captured = _capture_run_feeds(monkeypatch)
+
+    assert cli.main(["run", "--refresh-images"]) == 0
+    assert captured["refresh_images"] is True

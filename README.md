@@ -438,10 +438,15 @@ Created group 'Podcast drops' for this feed.
 
 A created group holds **only you** and is announcement-only, so it stays a feed
 rather than becoming a chat. It also takes the feed's own identity: the channel
-artwork (`<itunes:image>` for a podcast, the site's logo for a blog) as its
-picture, and the channel's description as its group description. Both are
-channel-level — an episode's own image and notes stay on the message, where they
-belong. Invite people from Signal on your phone; rssignal never adds anyone.
+artwork (`<itunes:image>` for a podcast, the site's logo for a blog, the channel's
+avatar for YouTube) as its picture, and the channel's description as its group
+description. Both are channel-level — an episode's own image and notes stay on the
+message, where they belong. Invite people from Signal on your phone; rssignal never
+adds anyone.
+
+YouTube's feed is the one that carries no artwork, so for a YouTube feed rssignal
+asks yt-dlp for the channel's avatar instead — one extra call, once, when the
+group is created.
 
 It also starts with **disappearing messages set to one week**
 (`GROUP_EXPIRATION_SECONDS`). A feed group is a stream, not an archive: left
@@ -454,8 +459,9 @@ behind expire along with everything else. Note that the episodes go too, audio
 included, so if a feed group doubles as your listening queue, turn it off.
 
 Those settings are applied **only when rssignal creates the group.** A group you
-already had is used exactly as it is — rssignal will not restyle a group you made
-yourself, or change its expiry. To set them yourself:
+already had is used exactly as it is — rssignal will not change its description or
+its expiry. (The one exception is the picture, which it
+[keeps current](#keeping-group-pictures-current).) To set them yourself:
 
 ```python
 from rssignal import update_group
@@ -477,6 +483,48 @@ exits 0 and the group simply has no image:
 
 Long feed descriptions are trimmed to 480 characters on a word boundary. If
 setting either fails you get a warning on stderr and still keep the group.
+
+#### Keeping group pictures current
+
+Podcasts rebrand and channels change their avatar, so every so often a run also
+fetches each feed's artwork again and puts it on the feed's group. It does this
+by chance: one run in 450, which at fifteen runs a day is **about once a month**.
+A dice roll needs no state kept anywhere, and a run that misses its turn simply
+leaves it to one of the next few hundred. It happens after the run has sent
+everything, so it never holds an episode up, and never on a `--dry-run` or with
+`--to`.
+
+Changing a group's picture is not silent: everyone in the group sees "changed the
+group picture". So rssignal remembers what it last put on each group (by content,
+in the cache) and uploads only when the artwork is actually different. That means
+a picture you set by hand survives until the source's artwork changes. The very
+first refresh has nothing remembered yet, so it sets every group's picture once;
+that is also what gives a YouTube group created before rssignal knew how to fetch
+channel avatars its picture.
+
+Only groups that already exist are touched. A feed whose source has no artwork
+leaves its group's picture alone. A feed whose source is down, or whose image
+won't download, is reported and skipped, and it doesn't stop the others.
+
+To change how often it runs, set how many runs there are between refreshes on
+average, or `0` to turn it off:
+
+```bash
+RSSIGNAL_ARTWORK_REFRESH_ONE_IN=90     # at 3 runs a day, about once a month
+```
+
+The Home Assistant add-on sets this from its `schedule`: 30 times the number of
+run times, so once a month whatever the schedule is.
+
+To refresh right now:
+
+```bash
+rssignal refresh-images --dry-run   # which groups would change
+rssignal refresh-images
+rssignal run --refresh-images       # or as part of a run, after sending
+```
+
+The add-on does the last one whenever it starts with `on_start: run`.
 
 > **Note:** deleting a group *chat* in the Signal app does not leave the group —
 > it only removes the conversation from your list. rssignal still sees it and will
@@ -1112,8 +1160,9 @@ costs nothing.
 
 **Answers that can't change are remembered.** An ARTE programme's air date, the
 channel a YouTube `@handle` names, when a given video went up, the order a
-channel's uploads come in, and the ETag a feed last handed out are kept in a cache
-file, so a run stops re-deriving yesterday's answer:
+channel's uploads come in, the ETag a feed last handed out, and the picture last
+put on each group are kept in a cache file, so a run stops re-deriving
+yesterday's answer:
 
 ```
 ~/.cache/rssignal/cache.json     # or $RSSIGNAL_CACHE

@@ -1069,3 +1069,80 @@ def test_a_feed_that_is_not_youtube_has_no_listing_to_fall_back_on(monkeypatch):
 
     with pytest.raises(SourceBlocked):
         feeds.parse_feed(feeds.FeedConfig(url="https://waitbutwhy.com/feed", name="W"))
+
+
+# --- the channel's picture -------------------------------------------------
+
+AVATAR = "https://yt3.googleusercontent.com/avatar=s0"
+CHANNEL_THUMBNAILS = [
+    {"id": "0", "url": "https://yt3/banner-1060", "width": 1060, "height": 175},
+    {"id": "banner_uncropped", "url": "https://yt3/banner=s0"},
+    {"id": "7", "url": "https://yt3/avatar-900", "width": 900, "height": 900},
+    {"id": "avatar_uncropped", "url": AVATAR},
+]
+
+
+def _patch_channel(monkeypatch, thumbnails=CHANNEL_THUMBNAILS):
+    asked = []
+
+    def fake_json(args, *, timeout):
+        asked.append(args)
+        return {"id": "UCabc", "thumbnails": thumbnails}
+
+    monkeypatch.setattr(youtube, "_ytdlp_json", fake_json)
+    return asked
+
+
+def test_channel_image_is_the_uncropped_avatar(monkeypatch):
+    asked = _patch_channel(monkeypatch)
+
+    url = youtube.channel_image("https://www.youtube.com/channel/UCabc")
+
+    assert url == AVATAR
+    # No videos: the channel's own fields are all that is wanted.
+    assert asked == [
+        [
+            "--flat-playlist",
+            "--playlist-items",
+            "0",
+            "https://www.youtube.com/channel/UCabc/videos",
+        ]
+    ]
+
+
+def test_channel_image_reads_the_channel_out_of_a_feed_url(monkeypatch):
+    asked = _patch_channel(monkeypatch)
+
+    youtube.channel_image(youtube.YOUTUBE_FEED.format(channel_id="UCabc"))
+
+    assert asked[0][-1] == "https://www.youtube.com/channel/UCabc/videos"
+
+
+def test_channel_image_falls_back_to_the_largest_square(monkeypatch):
+    _patch_channel(
+        monkeypatch,
+        [t for t in CHANNEL_THUMBNAILS if t["id"] != "avatar_uncropped"]
+        + [{"id": "8", "url": "https://yt3/avatar-88", "width": 88, "height": 88}],
+    )
+
+    assert youtube.channel_image("https://www.youtube.com/channel/UCabc") == (
+        "https://yt3/avatar-900"
+    )
+
+
+def test_channel_image_without_an_avatar_raises(monkeypatch):
+    _patch_channel(monkeypatch, CHANNEL_THUMBNAILS[:2])
+
+    with pytest.raises(FeedError, match="no picture"):
+        youtube.channel_image("https://www.youtube.com/channel/UCabc")
+
+
+@pytest.mark.parametrize(
+    "url", ["https://a/feed.xml", "https://www.youtube.com/watch?v=BFcjfKZ0BeI", None]
+)
+def test_channel_image_ignores_anything_but_a_channel(monkeypatch, url):
+    monkeypatch.setattr(
+        youtube, "_ytdlp_json", lambda *a, **k: pytest.fail("not a channel")
+    )
+
+    assert youtube.channel_image(url) is None

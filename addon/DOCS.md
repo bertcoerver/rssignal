@@ -139,6 +139,13 @@ every-other-day one.
 Running more often is harmless — nothing is ever sent twice, and a run with
 nothing to do takes a few seconds — but there is little to gain.
 
+About once a month a run also refreshes every feed group's picture from its
+source's artwork. That happens by chance, on one run in N, and the add-on works
+N out from the schedule (30 × the number of times), so the rate stays about
+monthly however many times you list. Starting the add-on with `on_start: run`
+refreshes them straight away. See
+[Keeping group pictures current](../README.md#keeping-group-pictures-current).
+
 Changing the schedule takes effect when the add-on restarts.
 
 ## The media archive
@@ -216,7 +223,7 @@ the log, under `Checking the install...`.
 |---|---|
 | `wait` | Nothing; sleeps until the next scheduled slot. The normal setting. |
 | `dry-run` | Fetches every feed, reports what it would send, sends nothing. |
-| `run` | A real run, immediately. |
+| `run` | A real run, immediately, which also refreshes every group's picture. |
 
 Set it back to `wait` afterwards, or every restart will fire a run.
 

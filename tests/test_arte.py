@@ -558,3 +558,19 @@ def test_variant_estimate_includes_margin():
     variant = Variant(index=0, bandwidth=8000, width=640, height=360, codecs="avc1")
     # 8000 bps over 100s is 100_000 bytes, plus the 10% margin.
     assert variant.estimated_bytes(100) == 110_000
+
+
+def test_collection_image_is_the_show_artwork_without_dating_anything(monkeypatch):
+    seen = _patch_collection(monkeypatch)
+
+    assert arte.collection_image(COLLECTION_URL) == "https://img/show.jpg"
+    assert len(seen) == 1 and "/playlist/" in seen[0]
+
+
+def test_collection_image_without_one_raises(monkeypatch):
+    playlist = json.loads(PLAYLIST)
+    playlist["data"]["attributes"]["metadata"]["images"] = []
+    _patch_collection(monkeypatch, playlist=json.dumps(playlist))
+
+    with pytest.raises(FeedError, match="no image"):
+        arte.collection_image(COLLECTION_URL)

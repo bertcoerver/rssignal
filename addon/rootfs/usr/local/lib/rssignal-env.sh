@@ -60,6 +60,13 @@ export RSSIGNAL_MEDIA_DIR="/media/rssignal"
 RSSIGNAL_MEDIA_KEEP_DAYS="$(bashio::config 'media_keep_days')"
 export RSSIGNAL_MEDIA_KEEP_DAYS
 
+# A run refreshes every feed group's picture on one run in N, at random (see
+# rssignal.artwork). N is only "about once a month" for a given number of runs
+# a day, and the schedule says how many that is — so it is worked out here
+# rather than left at the default, which assumes fifteen.
+runs_per_day="$(jq -r '.schedule[]? // empty' /data/options.json | grep -c . || true)"
+export RSSIGNAL_ARTWORK_REFRESH_ONE_IN="$(( ${runs_per_day:-0} * 30 ))"
+
 # feeds.json lives on the host at /addon_configs/<slug>/, so it can be edited
 # with the File Editor or over Samba without rebuilding anything.
 export RSSIGNAL_CONFIG="/config/feeds.json"

@@ -680,6 +680,144 @@ def test_run_creates_the_group_without_an_image_when_the_download_fails(
     assert "group image skipped" in capsys.readouterr().err
 
 
+def test_run_gives_a_youtube_group_its_channel_picture(monkeypatch):
+    # YouTube's Atom feed has no artwork, so the channel is asked instead.
+    cfg = FeedConfig(url="https://www.youtube.com/@chan", name="Chan")
+    calls = _patch_feeds(monkeypatch, [cfg], {cfg.url: [_POST]}, groups=[])
+    _capture_sends(monkeypatch)
+    downloaded = _fake_downloads(monkeypatch)
+    asked = []
+    monkeypatch.setattr(
+        run, "source_image", lambda url: asked.append(url) or "https://yt3/avatar.jpg"
+    )
+
+    run_feeds("feeds.json")
+
+    assert asked == ["https://www.youtube.com/@chan"]
+    assert downloaded == ["https://yt3/avatar.jpg"]
+    assert calls["created"][0]["avatar"] == "/tmp/fake-avatar.jpg"
+
+
+def test_run_prefers_the_feed_artwork_to_asking_the_source(monkeypatch):
+    _patch_feeds(
+        monkeypatch, [_blog()], {"https://a": [_POST]}, image="https://a/show.jpg", groups=[]
+    )
+    _capture_sends(monkeypatch)
+    _fake_downloads(monkeypatch)
+    monkeypatch.setattr(run, "source_image", lambda url: pytest.fail("asked"))
+
+    run_feeds("feeds.json")
+
+
+def test_run_creates_a_youtube_group_without_a_picture_it_cannot_get(
+    monkeypatch, capsys
+):
+    cfg = FeedConfig(url="https://www.youtube.com/@chan", name="Chan")
+    calls = _patch_feeds(monkeypatch, [cfg], {cfg.url: [_POST]}, groups=[])
+    _capture_sends(monkeypatch)
+
+    def fail(url):
+        raise FeedError("yt-dlp failed: bot check")
+
+    monkeypatch.setattr(run, "source_image", fail)
+
+    run_feeds("feeds.json")
+
+    assert calls["created"][0]["avatar"] is None
+    assert "[Chan] group image skipped: yt-dlp failed" in capsys.readouterr().err
+
+
+def _patch_refresh(monkeypatch, *, due=True):
+    refreshed = []
+    monkeypatch.setattr(run.artwork, "refresh_due", lambda: due)
+    monkeypatch.setattr(
+        run.artwork,
+        "refresh",
+        lambda feeds, groups, **kw: refreshed.append(
+            ([f.name for f in feeds], [g.name for g in groups])
+        )
+        or 1,
+    )
+    return refreshed
+
+
+def test_run_refreshes_group_images_when_the_dice_say_so(monkeypatch):
+    _patch_feeds(monkeypatch, [_blog()], {"https://a": [_POST]})
+    _capture_sends(monkeypatch)
+    refreshed = _patch_refresh(monkeypatch)
+
+    run_feeds("feeds.json")
+
+    assert refreshed == [(["Blog"], ["Blog"])]
+
+
+def test_run_refresh_images_refreshes_whatever_the_dice_say(monkeypatch):
+    _patch_feeds(monkeypatch, [_blog()], {"https://a": [_POST]})
+    _capture_sends(monkeypatch)
+    refreshed = _patch_refresh(monkeypatch, due=False)
+
+    run_feeds("feeds.json", refresh_images=True)
+
+    assert refreshed == [(["Blog"], ["Blog"])]
+
+
+@pytest.mark.parametrize("kwargs", [{"dry_run": True}, {"to": "+31600000000"}])
+def test_run_refresh_images_still_changes_nothing_dry_or_with_to(monkeypatch, kwargs):
+    _patch_feeds(monkeypatch, [_blog()], {"https://a": [_POST]})
+    _capture_sends(monkeypatch)
+    refreshed = _patch_refresh(monkeypatch)
+
+    run_feeds("feeds.json", refresh_images=True, **kwargs)
+
+    assert refreshed == []
+
+
+def test_run_refreshes_nothing_on_most_runs(monkeypatch):
+    _patch_feeds(monkeypatch, [_blog()], {"https://a": [_POST]})
+    _capture_sends(monkeypatch)
+    refreshed = _patch_refresh(monkeypatch, due=False)
+
+    run_feeds("feeds.json")
+
+    assert refreshed == []
+
+
+def test_run_refresh_includes_a_group_created_this_run(monkeypatch):
+    _patch_feeds(monkeypatch, [_blog()], {"https://a": [_POST]}, groups=[])
+    _capture_sends(monkeypatch)
+    refreshed = _patch_refresh(monkeypatch)
+
+    run_feeds("feeds.json")
+
+    assert refreshed == [(["Blog"], ["Blog"])]
+
+
+@pytest.mark.parametrize("kwargs", [{"dry_run": True}, {"to": "+31600000000"}])
+def test_run_never_refreshes_on_a_dry_run_or_with_to(monkeypatch, kwargs):
+    _patch_feeds(monkeypatch, [_blog()], {"https://a": [_POST]})
+    _capture_sends(monkeypatch)
+    refreshed = _patch_refresh(monkeypatch)
+
+    run_feeds("feeds.json", **kwargs)
+
+    assert refreshed == []
+
+
+def test_a_failed_refresh_does_not_fail_the_run(monkeypatch, capsys):
+    _patch_feeds(monkeypatch, [_blog()], {"https://a": [_POST]})
+    sends = _capture_sends(monkeypatch)
+    monkeypatch.setattr(run.artwork, "refresh_due", lambda: True)
+
+    def boom(feeds, groups, **kw):
+        raise SignalError("listGroups fell over")
+
+    monkeypatch.setattr(run.artwork, "refresh", boom)
+
+    assert run_feeds("feeds.json") == 1
+    assert len(sends) == 1
+    assert "group image refresh failed: listGroups fell over" in capsys.readouterr().err
+
+
 def test_run_drains_the_queue_before_reading_the_group_list(monkeypatch):
     # listGroups reads local state on a linked device. Without a receive first,
     # a group you made on your phone is invisible and a group you *left* still

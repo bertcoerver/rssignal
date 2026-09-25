@@ -274,6 +274,66 @@ def youtube_feed_url(url: str | None) -> str | None:
     return YOUTUBE_FEED.format(channel_id=channel_id)
 
 
+def channel_image(url: str | None) -> str | None:
+    """The channel's own picture, for a YouTube channel page or feed url.
+
+    The Atom feed describes the videos and not the channel — it carries no
+    artwork of its own — so a group named after a YouTube feed would otherwise
+    start out with no picture at all. yt-dlp's listing of the channel does carry
+    it, beside the banners, and asking that listing for no videos at all keeps
+    this to one small request.
+
+    ``None`` for a url that isn't a YouTube channel. Raises
+    :class:`~rssignal.feeds.FeedError` if the lookup fails, or if the channel
+    turns out to have no picture.
+    """
+    if not is_youtube_url(url):
+        return None
+    assert url is not None
+    feed = FEED_CHANNEL_RE.search(url)
+    if feed:
+        channel_id = feed["channel_id"]
+    else:
+        page = YOUTUBE_CHANNEL_RE.search(url)
+        if not page:
+            return None
+        channel_id = page["channel_id"] or _channel_id(url)
+
+    info = _ytdlp_json(
+        [
+            "--flat-playlist",
+            "--playlist-items",
+            "0",
+            YOUTUBE_UPLOADS.format(channel_id=channel_id),
+        ],
+        timeout=YTDLP_QUERY_TIMEOUT,
+    )
+    avatar = _avatar(info.get("thumbnails") or [])
+    if avatar is None:
+        raise FeedError(f"YouTube reported no picture for channel {channel_id}")
+    return avatar
+
+
+def _avatar(thumbnails: list) -> str | None:
+    """Pick the channel's avatar out of a listing's thumbnails.
+
+    The listing mixes the avatar in with half a dozen crops of the banner. yt-dlp
+    names the full-size avatar ``avatar_uncropped``; failing that, the avatar is
+    the largest square one, since every banner crop is several times wider than
+    it is tall.
+    """
+    candidates = [t for t in thumbnails if isinstance(t, dict) and t.get("url")]
+    for thumb in candidates:
+        if thumb.get("id") == "avatar_uncropped":
+            return str(thumb["url"])
+    square = [
+        t for t in candidates if t.get("width") and t.get("width") == t.get("height")
+    ]
+    if not square:
+        return None
+    return str(max(square, key=lambda t: t["width"])["url"])
+
+
 def with_durations(feed_url: str, items: list[FeedItem]) -> list[FeedItem]:
     """Return ``items`` with ``duration_seconds`` filled in, if they are YouTube's.
 

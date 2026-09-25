@@ -206,6 +206,23 @@ def channel_feed_url(url: str) -> str | None:
     return youtube_feed_url(url)
 
 
+def source_image(url: str) -> str | None:
+    """The artwork a video source shows for the channel or show ``url`` names.
+
+    ``None`` means "not one of those" and the url's feed should say instead.
+    YouTube's feed has no artwork at all, which is the case this is for; ARTE's
+    collection already carries it, but this reads it without dating a dozen
+    episodes to get there. Raises :class:`~rssignal.feeds.FeedError` for a
+    source that should have a picture and couldn't produce one.
+    """
+    from .arte import arte_collection_id, collection_image
+    from .youtube import channel_image
+
+    if arte_collection_id(url):
+        return collection_image(url)
+    return channel_image(url)
+
+
 def listed_items(feed_url: str, *, feed_name: str = "") -> list[FeedItem] | None:
     """The items a channel's feed would have held, read without the feed.
 

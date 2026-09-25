@@ -553,6 +553,11 @@ def _read(url: str, *, conditional: bool = True) -> feedparser.FeedParserDict:
     back catalogue years behind the newest item, and "nothing new" is both true
     and beside the point. It is not the saving it looks like either — a paced
     feed is only fetched at all on the runs where an episode is actually due.
+
+    It also leaves the remembered validators alone. A read that isn't the run's
+    own — :func:`feed_image` looking for a picture — must not hand the next run
+    an ETag for a body whose items it never saw, or that run would be told
+    "nothing new" about them.
     """
     known = (cache.get(_HTTP_NS, url) or {}) if conditional else {}
     # Passed only when there is something to pass, so a feed nobody has a
@@ -572,7 +577,7 @@ def _read(url: str, *, conditional: bool = True) -> feedparser.FeedParserDict:
 
     etag = getattr(parsed, "etag", None)
     modified = getattr(parsed, "modified", None)
-    if etag or modified:
+    if conditional and (etag or modified):
         cache.put(_HTTP_NS, url, {"etag": etag, "modified": modified})
 
     if getattr(parsed, "bozo", False) and not parsed.entries:
@@ -716,6 +721,32 @@ def parse_feed(cfg: FeedConfig) -> ParsedFeed:
         image_url=image_url,
         description=description,
     )
+
+
+def feed_image(cfg: FeedConfig) -> str | None:
+    """The artwork ``cfg``'s source shows for itself right now, or ``None``.
+
+    What :func:`parse_feed` puts in :attr:`ParsedFeed.image_url`, without the
+    rest of the work — no items built, no durations looked up, no back catalogue
+    walked — plus the one thing it can't do: a YouTube channel's picture, which
+    its feed doesn't carry. The feed is read unconditionally, because one that
+    hasn't changed since the last run would otherwise answer 304 and say nothing
+    at all.
+
+    Raises :class:`SourceBlocked` or :class:`FeedError` if the source can't be
+    read.
+    """
+    from .video import check_source_available, source_image
+
+    check_source_available(cfg.url)
+    image = source_image(cfg.url)
+    if image is not None:
+        return image
+
+    parsed = retrying(lambda: _read(cfg.url, conditional=False))
+    channel = getattr(parsed, "feed", None) or {}
+    cget = channel.get if hasattr(channel, "get") else lambda k, d=None: getattr(channel, k, d)
+    return _href(cget("image"))
 
 
 def _listed_instead(cfg: FeedConfig, failure: FeedError) -> list[FeedItem]:

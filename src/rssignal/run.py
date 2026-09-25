@@ -60,7 +60,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterator
 
-from . import archive, cache, pending, timing
+from . import archive, artwork, cache, pending, timing
 from .download import download_temp
 from .episodic import allowance, next_release
 from .errorlog import log_exception, log_line
@@ -98,6 +98,7 @@ from .video import (
     VideoTooShort,
     is_video_item,
     resolve_video,
+    source_image,
     video_temp,
 )
 from .watermark import (
@@ -224,19 +225,28 @@ class _GroupResolver:
         """Return the group called ``name``, or ``None`` if there isn't one."""
         return match_group(self._listing(), name)
 
-    def resolve(self, name: str, parsed: ParsedFeed) -> SignalGroup:
-        """Return the group called ``name``, creating it if it doesn't exist.
+    def groups(self) -> list[SignalGroup]:
+        """Every group, including any this run created."""
+        return self._listing()
+
+    def resolve(self, cfg: FeedConfig, parsed: ParsedFeed) -> SignalGroup:
+        """Return the group called ``cfg.name``, creating it if it doesn't exist.
 
         A new group holds only this account, is announcement-only (it exists to
         receive a feed, not to be a chat), and takes the feed's own artwork and
-        blurb as its picture and description.
+        blurb as its picture and description. A feed with no artwork of its own
+        — YouTube's — gets its channel's picture instead; see
+        :func:`_group_image`.
         """
+        name = cfg.name
         group = self.find(name)
         if group is not None:
             return group
 
         with ExitStack() as stack:
-            avatar = _local_image(parsed.image_url, stack, name, what="group image")
+            avatar = _local_image(
+                _group_image(cfg, parsed), stack, name, what="group image"
+            )
             group = create_group(
                 name,
                 description=parsed.description or None,
@@ -251,12 +261,30 @@ class _GroupResolver:
         return group
 
 
+def _group_image(cfg: FeedConfig, parsed: ParsedFeed) -> str | None:
+    """The url of the picture a new group for ``cfg`` should have, if any.
+
+    The feed's own artwork when it has some. A YouTube feed never does — the
+    Atom feed describes the videos, not the channel — so the channel is asked
+    for its picture instead. That costs a yt-dlp launch, which is fine for
+    something that happens once per feed, and a failure costs only the picture.
+    """
+    if parsed.image_url:
+        return parsed.image_url
+    try:
+        return source_image(cfg.url)
+    except FeedError as exc:
+        print(f"[{cfg.name}] group image skipped: {exc}", file=sys.stderr)
+        return None
+
+
 def run_feeds(
     config_path: str = "feeds.json",
     *,
     dry_run: bool = False,
     to: str | None = None,
     since: datetime | None = None,
+    refresh_images: bool = False,
 ) -> int:
     """Process every feed in ``config_path`` and send whatever is new.
 
@@ -264,7 +292,9 @@ def run_feeds(
     first send if it doesn't exist. ``to`` overrides that for every feed at once
     and touches no group — the safe way to try a real send against your own
     number. ``since`` overrides every stored watermark, for replaying a stretch
-    of a feed by hand.
+    of a feed by hand. ``refresh_images`` refreshes every group's picture after
+    sending, rather than leaving it to chance (see :mod:`rssignal.artwork`); like
+    the chance, it does nothing on a dry run or with ``to``.
 
     Returns the number of items sent (or, in ``dry_run`` mode, that would be
     sent). With ``dry_run`` set nothing is sent, downloaded, created, or
@@ -287,7 +317,13 @@ def run_feeds(
     with ExitStack() as outer:
         if not dry_run:
             outer.enter_context(single_run())
-        return _locked_run(config_path, dry_run=dry_run, to=to, since=since)
+        return _locked_run(
+            config_path,
+            dry_run=dry_run,
+            to=to,
+            since=since,
+            refresh_images=refresh_images,
+        )
 
 
 def _locked_run(
@@ -296,6 +332,7 @@ def _locked_run(
     dry_run: bool,
     to: str | None,
     since: datetime | None,
+    refresh_images: bool = False,
 ) -> int:
     """The body of :func:`run_feeds`, with the run lock already held."""
     feeds = load_feeds(config_path)
@@ -320,6 +357,15 @@ def _locked_run(
             sent = _run_prepared(
                 feeds, resolver, dry_run=dry_run, to=to, since=since
             )
+            # After sending, so it never holds an episode up, and inside the
+            # daemon, so the uploads don't each pay for a JVM. --to touches no
+            # group and a dry run changes nothing, so neither rolls for it.
+            if (
+                not dry_run
+                and to is None
+                and (refresh_images or artwork.refresh_due())
+            ):
+                _refresh_artwork(feeds, resolver)
     except BaseException as exc:
         # Including KeyboardInterrupt and SystemExit: a run stopped by hand or
         # by a scheduler shutting it down is exactly the case this line exists
@@ -342,6 +388,47 @@ def _locked_run(
         f"{_sleep_note(started, started_wall, sent)}"
     )
     return sent
+
+
+def _refresh_artwork(feeds: list[FeedConfig], resolver: _GroupResolver) -> None:
+    """The occasional group picture refresh, which must never fail a run.
+
+    Everything that could go wrong for one feed is already contained by
+    :func:`~rssignal.artwork.refresh`; this is for what's left — the group
+    listing itself failing — which is still no reason to report a run that sent
+    its episodes as broken.
+    """
+    try:
+        changed = artwork.refresh(feeds, resolver.groups())
+    except Exception as exc:
+        print(f"group image refresh failed: {exc}", file=sys.stderr)
+        log_exception("group image refresh", exc)
+        return
+    cache.save()
+    log_line(f"group images refreshed: {changed} updated")
+
+
+def refresh_group_images(config_path: str = "feeds.json", *, dry_run: bool = False) -> int:
+    """Refresh every feed group's picture now, rather than when the dice say.
+
+    What a run does on its own about once a month (see :mod:`rssignal.artwork`),
+    on demand. Returns how many groups got a new picture — or, with ``dry_run``,
+    how many would have; a dry run downloads the images to compare them but
+    changes nothing.
+
+    Takes the run lock, like a run: both talk to the same signal-cli account, and
+    a second signal-cli can't open an account the first one holds.
+    """
+    feeds = load_feeds(config_path)
+    socket.setdefaulttimeout(FEED_SOCKET_TIMEOUT)
+    with ExitStack() as outer:
+        if not dry_run:
+            outer.enter_context(single_run())
+        with signal_daemon():
+            resolver = _GroupResolver()
+            changed = artwork.refresh(feeds, resolver.groups(), dry_run=dry_run)
+    cache.save()
+    return changed
 
 
 # How far the two clocks have to drift apart before the gap is worth reporting.
@@ -741,7 +828,7 @@ def _send_prepared(
     else:
         # The one place a group is created, and only now that there is something
         # to put in it: a typo in a feed's name can't leave a stray group behind.
-        group = group or resolver.resolve(cfg.name, parsed)
+        group = group or resolver.resolve(cfg, parsed)
         recipient = group.recipient
 
     # due is oldest-first: each item's marker goes up, then the item itself, so

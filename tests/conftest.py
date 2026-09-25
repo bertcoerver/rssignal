@@ -10,7 +10,17 @@ import tempfile
 
 import pytest
 
-from rssignal import archive, cache, config, download, feeds, pending, run, signal_cli
+from rssignal import (
+    archive,
+    artwork,
+    cache,
+    config,
+    download,
+    feeds,
+    pending,
+    run,
+    signal_cli,
+)
 from rssignal.errorlog import DEFAULT_LOG_PATH
 
 
@@ -65,6 +75,18 @@ def no_signal_daemon(monkeypatch):
     build a fake one and turn this off for themselves.
     """
     monkeypatch.setenv(signal_cli.DAEMON_ENV, "0")
+
+
+@pytest.fixture(autouse=True)
+def no_artwork_dice(monkeypatch):
+    """Never let a run roll for a group image refresh on its own.
+
+    :func:`rssignal.artwork.refresh_due` is a real dice roll, one in several
+    hundred — which across a suite that calls ``run_feeds`` hundreds of times
+    means a test that fails now and then for no reason anyone can reproduce.
+    Tests about the refresh turn it back on.
+    """
+    monkeypatch.setenv(artwork.REFRESH_ONE_IN_ENV, "0")
 
 
 @pytest.fixture(autouse=True)

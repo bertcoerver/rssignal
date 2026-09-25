@@ -92,14 +92,19 @@ done || true
 # first experience when the next slot may be twelve hours away — and without a
 # shell there is no other way to make a run happen. `dry-run` fetches every
 # feed and sends nothing; `run` is the real thing.
+#
+# `run` also refreshes every group's picture, which a scheduled run only does
+# at random about once a month. Restarting the add-on is the moment someone is
+# watching — after an update, or after changing a feed — and the one way to ask
+# for a refresh on a host with no shell to type `rssignal refresh-images` into.
 case "$(bashio::config 'on_start')" in
     dry-run)
         bashio::log.info "on_start: dry run (fetches everything, sends nothing)"
         rssignal-run --dry-run || true
         ;;
     run)
-        bashio::log.info "on_start: running now"
-        rssignal-run || true
+        bashio::log.info "on_start: running now, and refreshing group pictures"
+        rssignal-run --refresh-images || true
         ;;
 esac
 
