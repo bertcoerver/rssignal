@@ -583,9 +583,13 @@ def _read(url: str, *, conditional: bool = True) -> feedparser.FeedParserDict:
             # feed's place. A DNS filter's block page, a captive portal, a
             # sign-in wall. The parse error underneath it is real and completely
             # uninformative: it describes the first stray angle bracket in a
-            # page of HTML, and says nothing about why the page is there.
+            # page of HTML, and says nothing about why the page is there. The
+            # status does say something — a 404 or a 500 is the source's own
+            # error page, not a filter's — so it goes in the message.
+            status = getattr(parsed, "status", None)
+            answer = f"HTTP {status} {served}" if status else served
             raise SourceBlocked(
-                f"{url} answered with {served} rather than a feed — a block "
+                f"{url} answered with {answer} rather than a feed — a block "
                 "page, a captive portal or a sign-in wall standing in front of "
                 "the source, not a broken feed. Skipping until it lifts."
             ) from (exc if isinstance(exc, BaseException) else None)
@@ -645,7 +649,9 @@ def parse_feed(cfg: FeedConfig) -> ParsedFeed:
     See :func:`~rssignal.video.with_archive`.
 
     Raises :class:`SourceBlocked` before doing any of that, if the source turns
-    out to be one this machine currently can't reach at all.
+    out to be one this machine currently can't reach at all. A YouTube feed that
+    is reachable but not answering with a feed is read through yt-dlp instead —
+    see :func:`~rssignal.video.listed_items`.
     """
     # Imported here, not at the top: rssignal.video builds FeedItems and so
     # imports this module. Deferring it keeps that one-way and leaves feeds.py
@@ -668,25 +674,35 @@ def parse_feed(cfg: FeedConfig) -> ParsedFeed:
     if feed_url:
         cfg = replace(cfg, url=feed_url)
 
-    with timing.step("feedparser", cfg.name or cfg.url):
-        parsed = retrying(lambda: _read(cfg.url, conditional=cfg.episodic is None))
+    try:
+        with timing.step("feedparser", cfg.name or cfg.url):
+            parsed = retrying(
+                lambda: _read(cfg.url, conditional=cfg.episodic is None)
+            )
+    except FeedError as exc:
+        # A feed a source can list some other way is worth that other way: see
+        # :func:`~rssignal.video.listed_items`. Anything else fails as it did.
+        items = _listed_instead(cfg, exc)
+        image_url, description = None, ""
+    else:
+        if getattr(parsed, "status", None) == 304:
+            # Nothing has changed since the last run, so there is nothing to
+            # build and — the part worth the early return — nothing to look
+            # durations up for either, which is a yt-dlp launch this feed now
+            # never pays.
+            return ParsedFeed(items=[], image_url=None, description="")
 
-    if getattr(parsed, "status", None) == 304:
-        # Nothing has changed since the last run, so there is nothing to build
-        # and — the part worth the early return — nothing to look durations up
-        # for either, which is a yt-dlp launch this feed now never pays.
-        return ParsedFeed(items=[], image_url=None, description="")
+        channel = getattr(parsed, "feed", None) or {}
+        cget = channel.get if hasattr(channel, "get") else lambda k, d=None: getattr(channel, k, d)
 
-    channel = getattr(parsed, "feed", None) or {}
-    cget = channel.get if hasattr(channel, "get") else lambda k, d=None: getattr(channel, k, d)
-
-    # "summary" is the channel's <description>; "subtitle" is the shorter
-    # <itunes:subtitle>, which some feeds fill in instead.
-    description = strip_html(cget("summary") or cget("subtitle") or "")
+        # "summary" is the channel's <description>; "subtitle" is the shorter
+        # <itunes:subtitle>, which some feeds fill in instead.
+        description = strip_html(cget("summary") or cget("subtitle") or "")
+        image_url = _href(cget("image"))
+        items = [_build_feed_item(entry, cfg.name) for entry in parsed.entries]
 
     # Durations come before extracts so a rule can read one, and after the items
     # exist because they are looked up per feed, not per entry.
-    items = [_build_feed_item(entry, cfg.name) for entry in parsed.entries]
     items = annotate_durations(cfg.url, items)
 
     # The back catalogue, for an episodic feed only, and after durations because
@@ -697,9 +713,29 @@ def parse_feed(cfg: FeedConfig) -> ParsedFeed:
 
     return ParsedFeed(
         items=[apply_extracts(item, cfg.extract) for item in items],
-        image_url=_href(cget("image")),
+        image_url=image_url,
         description=description,
     )
+
+
+def _listed_instead(cfg: FeedConfig, failure: FeedError) -> list[FeedItem]:
+    """The items ``cfg``'s source lists without its feed, or ``failure`` raised.
+
+    Re-raised as the same kind of error it was, so a feed that answered with a
+    block page and couldn't be listed either is still a skip rather than a
+    failure — with the reason the listing gave added to it.
+    """
+    from .video import listed_items
+
+    try:
+        items = listed_items(cfg.url, feed_name=cfg.name)
+    except FeedError as exc:
+        raise type(failure)(
+            f"{failure}\nListing it through yt-dlp instead failed too: {exc}"
+        ) from failure
+    if items is None:
+        raise failure
+    return items
 
 
 def _clean_url(url: object) -> str | None:

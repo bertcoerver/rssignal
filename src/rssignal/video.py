@@ -206,6 +206,19 @@ def channel_feed_url(url: str) -> str | None:
     return youtube_feed_url(url)
 
 
+def listed_items(feed_url: str, *, feed_name: str = "") -> list[FeedItem] | None:
+    """The items a channel's feed would have held, read without the feed.
+
+    For when that feed is the one part of a source that isn't answering. ``None``
+    means ``feed_url`` has no other way in and its failure stands; raises
+    :class:`~rssignal.feeds.FeedError` if there was one and it failed too. See
+    :func:`~rssignal.youtube.latest_items`.
+    """
+    from .youtube import latest_items
+
+    return latest_items(feed_url, feed_name=feed_name)
+
+
 def with_archive(
     feed_url: str, items: list[FeedItem], *, feed_name: str = ""
 ) -> list[FeedItem]:

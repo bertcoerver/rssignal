@@ -962,3 +962,110 @@ def test_distinct_leaves_an_ordinary_gap_alone():
     when = datetime(2014, 5, 12, 3, 30, 1, tzinfo=timezone.utc)
     assert youtube._distinct(when, None) is when
     assert youtube._distinct(when, when - timedelta(days=1)) is when
+
+
+# --- the listing that stands in for a feed that isn't answering -------------
+
+
+def _feed_answers_html(monkeypatch, status=404):
+    """The feed endpoint's own outage: YouTube is up, the feed is an error page."""
+    fake = type("Parsed", (), {})()
+    fake.bozo = True
+    fake.bozo_exception = "not well-formed (invalid token)"
+    fake.entries = []
+    fake.status = status
+    fake.headers = {"content-type": "text/html; charset=utf-8"}
+    monkeypatch.setattr(feeds.feedparser, "parse", lambda url, **kwargs: fake)
+    monkeypatch.setattr(download, "reachable", lambda url, **kwargs: True)
+
+
+def _channel_cfg(**extra):
+    return feeds.FeedConfig(
+        url=f"https://www.youtube.com/channel/{ARCHIVE_CHANNEL}", name="Show", **extra
+    )
+
+
+def test_a_feed_answering_html_is_read_through_the_listing_instead(monkeypatch):
+    _feed_answers_html(monkeypatch)
+    asked = _patch_archive(monkeypatch)
+
+    parsed = feeds.parse_feed(_channel_cfg())
+
+    assert [i.title for i in parsed.items] == [f"Title vid{n:08d}" for n in range(1, 6)]
+    assert [i.published.timestamp() for i in parsed.items] == sorted(DATES.values())
+    assert parsed.items[0].extra["id"] == "yt:video:vid00000001"
+    assert parsed.items[0].extra["duration_seconds"] == "1800"
+    # One listing, one date each — and no second listing for the durations,
+    # which the first one already carried.
+    assert asked.count("listing") == 1
+    assert len(asked) == 1 + len(CATALOGUE)
+
+
+def test_the_listing_asks_for_the_newest_fifteen_of_the_uploads_playlist(monkeypatch):
+    _feed_answers_html(monkeypatch)
+    seen = {}
+
+    def fake_json(args, *, timeout):
+        seen["args"] = args
+        return {"entries": []}
+
+    monkeypatch.setattr(youtube, "_ytdlp_json", fake_json)
+    with pytest.raises(SourceBlocked):  # a listing of nothing is not believed
+        feeds.parse_feed(_channel_cfg())
+
+    assert seen["args"][-1] == f"https://www.youtube.com/playlist?list=UU{ARCHIVE_CHANNEL[2:]}"
+    assert "1:15" in seen["args"]
+
+
+def test_the_listing_dates_each_video_only_once(monkeypatch):
+    """Dates are kept for good, so a run on the listing costs only new videos."""
+    _feed_answers_html(monkeypatch)
+    _patch_archive(monkeypatch)
+    first = feeds.parse_feed(_channel_cfg()).items
+
+    asked = _patch_archive(monkeypatch)
+    second = feeds.parse_feed(_channel_cfg()).items
+
+    assert asked == ["listing"]
+    assert [i.published for i in first] == [i.published for i in second]
+
+
+def test_the_listing_stops_where_it_could_not_ask(monkeypatch, capsys):
+    """The frontier rule: nothing newer than a video that may be dated next run."""
+    _feed_answers_html(monkeypatch)
+    _patch_archive(monkeypatch)
+    real_run = youtube._run_ytdlp
+
+    def refuse_the_third(args, *, timeout):
+        if args[-1].endswith("vid00000003"):
+            raise FeedError("yt-dlp failed: Sign in to confirm you're not a bot")
+        return real_run(args, timeout=timeout)
+
+    monkeypatch.setattr(youtube, "_run_ytdlp", refuse_the_third)
+
+    items = feeds.parse_feed(_channel_cfg()).items
+
+    assert [i.title for i in items] == ["Title vid00000001", "Title vid00000002"]
+    assert "vid00000003" in capsys.readouterr().err
+
+
+def test_a_listing_that_fails_too_leaves_the_feed_skipped(monkeypatch):
+    _feed_answers_html(monkeypatch, status=500)
+    _patch_archive(monkeypatch, listing_error="yt-dlp failed: HTTP Error 429")
+
+    with pytest.raises(SourceBlocked) as caught:
+        feeds.parse_feed(_channel_cfg())
+
+    message = str(caught.value)
+    assert "HTTP 500 text/html" in message
+    assert "HTTP Error 429" in message
+
+
+def test_a_feed_that_is_not_youtube_has_no_listing_to_fall_back_on(monkeypatch):
+    _feed_answers_html(monkeypatch)
+    monkeypatch.setattr(
+        youtube, "_ytdlp_json", lambda *a, **k: pytest.fail("not a YouTube feed")
+    )
+
+    with pytest.raises(SourceBlocked):
+        feeds.parse_feed(feeds.FeedConfig(url="https://waitbutwhy.com/feed", name="W"))

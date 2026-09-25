@@ -233,6 +233,15 @@ work on it. A `/channel/UC…` url is rewritten on the spot; the `@handle`, `/c/
 That feed carries the **last 15 uploads**, which is plenty to follow a channel and
 no use for backfilling one.
 
+The feed endpoint also has outages of its own, answering every channel with an
+HTML error page for hours while the rest of YouTube works fine. When that
+happens rssignal lists the same 15 uploads from the channel's uploads playlist
+through yt-dlp instead, and dates each one. The dates match the feed's to the
+second, so switching over and back neither resends nor skips anything. The first
+such run costs a yt-dlp launch per video (about half a minute a channel); dates
+are kept, so later runs pay only for new uploads. Items read this way have no
+`description`.
+
 The one thing it doesn't say is how long a video is, which is exactly what a
 channel mixing clips with full episodes has to be filtered on — so rssignal asks
 yt-dlp for the channel's listing and puts a `duration_seconds` field on each item.
@@ -950,9 +959,14 @@ rather than a broken feed, and gets the same one-line skip:
 
 ```
 [Last Week Tonight] skipped: https://www.youtube.com/feeds/videos.xml?… answered
-with text/html rather than a feed — a block page, a captive portal or a sign-in
+with HTTP 403 text/html rather than a feed — a block page, a captive portal or a sign-in
 wall standing in front of the source, not a broken feed. Skipping until it lifts.
 ```
+
+The HTTP status is in the message because it tells the two apart: a filter's
+block page tends to come back as a 200 or a 403, and a 404 or a 500 is the
+source's own error page. A YouTube channel feed doesn't get this skip unless the
+[yt-dlp listing](#youtube) that stands in for its feed fails too.
 
 Only HTML is treated this way. A feed served as `text/plain`, or with a content
 type nobody ever configured, gets the benefit of the doubt and the traceback —

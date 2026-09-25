@@ -295,6 +295,9 @@ def with_durations(feed_url: str, items: list[FeedItem]) -> list[FeedItem]:
     match = FEED_CHANNEL_RE.search(feed_url or "")
     if not match or not items:
         return items
+    if all("duration_seconds" in item.extra for item in items):
+        # Built from a listing already (see latest_items), which said.
+        return items
 
     try:
         durations = _channel_durations(match["channel_id"])
@@ -444,6 +447,63 @@ def archive_items(
     return out
 
 
+def latest_items(feed_url: str, *, feed_name: str = "") -> list[FeedItem] | None:
+    """The newest uploads of ``feed_url``'s channel, built without the Atom feed.
+
+    The feed endpoint has an outage all of its own now and then: for hours it
+    answers every channel with an HTML error page while the rest of YouTube —
+    and yt-dlp with it — works fine. Nothing else about the channel has changed,
+    so rather than skip it, this reads the same fifteen uploads off the uploads
+    playlist and dates each one the way :func:`archive_items` does.
+
+    Those dates are the Atom feed's to the second (both are the video's publish
+    time), which is what makes this safe to switch to and back from: a watermark
+    one of them set, the other reads the same way. Nothing is nudged apart with
+    :func:`_distinct` here, for the same reason — the feed doesn't either.
+
+    A date costs a yt-dlp launch the first time and nothing after
+    (:data:`~rssignal.cache.YOUTUBE_PUBLISHED_TTL`), so a run on the listing
+    costs one launch per *new* video, once the channel's latest are known. The
+    items are thinner than the feed's — no description, as with an archive item.
+
+    Dated oldest first, stopping at the first video that can't be asked about:
+    the frontier rule from :func:`archive_items`, and for the same reason. The
+    watermark only moves forward, so a video skipped now while a newer one went
+    out would be behind it by the time it could be dated, and never sent.
+
+    ``None`` for a url that isn't a YouTube channel feed. Raises
+    :class:`~rssignal.feeds.FeedError` if the listing itself can't be read.
+    """
+    match = FEED_CHANNEL_RE.search(feed_url or "")
+    if not match or not is_youtube_url(feed_url):
+        return None
+
+    listed = _list_uploads(match["channel_id"], limit=FEED_VIDEO_COUNT)
+    print(
+        f"{feed_url} is not answering with a feed; read the channel's latest "
+        f"{len(listed)} uploads through yt-dlp instead.",
+        file=sys.stderr,
+    )
+
+    out: list[FeedItem] = []
+    for upload in reversed(listed):  # oldest first, the order it is walked in
+        when = _remembered_date(upload.video_id)
+        if when is None:
+            try:
+                when = _published(upload.video_id)
+            except FeedError as exc:
+                print(
+                    f"Could not read when {upload.video_id} went up: {exc}\n"
+                    "It and anything newer wait for the next run.",
+                    file=sys.stderr,
+                )
+                break
+            if when is None:
+                continue  # not ours to have — see _published
+        out.append(_archive_item(upload, when, feed_name))
+    return out
+
+
 def uploads(channel_id: str) -> list[Upload]:
     """Every video a channel has posted, newest first.
 
@@ -519,14 +579,16 @@ def _cached_uploads(raw: object) -> list[Upload]:
     return out
 
 
-def _list_uploads(channel_id: str) -> list[Upload]:
-    """Ask yt-dlp for the channel's uploads playlist, in full."""
+def _list_uploads(channel_id: str, *, limit: int | None = None) -> list[Upload]:
+    """Ask yt-dlp for the channel's uploads playlist: in full, or its newest ``limit``."""
+    window = ["--playlist-items", f"1:{limit}"] if limit else []
     info = _ytdlp_json(
         [
             "--flat-playlist",
+            *window,
             YOUTUBE_PLAYLIST.format(suffix=channel_id[2:]),
         ],
-        timeout=YTDLP_LISTING_TIMEOUT,
+        timeout=YTDLP_QUERY_TIMEOUT if limit else YTDLP_LISTING_TIMEOUT,
     )
 
     out: list[Upload] = []
