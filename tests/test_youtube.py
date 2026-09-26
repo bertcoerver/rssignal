@@ -307,6 +307,23 @@ def test_resolve_drops_a_rung_for_a_smaller_budget(monkeypatch):
     assert plan.selector == "135+140"
 
 
+def test_resolve_muxes_the_original_language_not_the_smallest_dub(monkeypatch):
+    """A dubbed video lists each language as its own stream, a few bytes apart."""
+    dubs = [
+        {**AUDIO, "format_id": "140-0", "language": "hi", "language_preference": -1,
+         "filesize": AUDIO["filesize"] - 300},
+        {**AUDIO, "format_id": "140-1", "language": "es", "language_preference": -1,
+         "filesize": AUDIO["filesize"] - 100},
+        {**AUDIO, "format_id": "140-2", "language": "en", "language_preference": 10},
+    ]
+    formats = dubs + [f for f in FORMATS if f["format_id"] != "140"]
+    _patch_ytdlp(monkeypatch, info={**INFO, "formats": formats})
+
+    plan = youtube.resolve(_item())
+
+    assert plan.selector == "136+140-2"
+
+
 def test_resolve_falls_back_to_a_progressive_format(monkeypatch):
     """Nothing to mux: no separate H.264 video, no AAC audio, just itag 18."""
     formats = [f for f in FORMATS if f["format_id"] in ("18", "251", "248")]

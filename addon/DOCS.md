@@ -43,7 +43,11 @@ mid-run. A Raspberry Pi has none of those problems.
 4. rssignal appears under **Local add-ons**. Install it.
 
 Later changes to rssignal are: rebuild the wheel, delete the old one from
-`addon/dist/`, copy it over, and **Rebuild** the add-on.
+`addon/dist/`, copy the **whole** `addon/` directory over again, and
+**Rebuild** the add-on. The whole directory, not just the wheel: the scheduler
+and the scripts in `rootfs/` are baked into the image too, and a change to
+rssignal often comes with a change to how the add-on calls it. A new wheel
+under an old `rootfs/` runs the new code the old way.
 
 The first build takes several minutes on a Pi 4: it downloads a JRE, the
 signal-cli distribution, and a matching native libsignal. It does not do any of

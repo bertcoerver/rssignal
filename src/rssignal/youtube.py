@@ -967,10 +967,16 @@ def _pairing(
 
 
 def _smallest_audio(formats: list[dict], duration: float) -> dict | None:
-    """The leanest AAC audio-only stream, which is the one worth muxing.
+    """The leanest AAC audio-only stream in the original language.
 
     Audio is a rounding error next to video here — roughly 2 MB for ten minutes
     against 60 — so the cheapest one buys the most room for picture.
+
+    But only among the original's own renditions. A dubbed video lists every
+    language as a separate stream of near-identical size, so size alone picks a
+    dub at random. yt-dlp ranks them in ``language_preference``: the original
+    highest, then the default track, the dubs below that. A video without dubs
+    has one language, and the ranking changes nothing.
     """
     candidates = [
         fmt
@@ -982,7 +988,18 @@ def _smallest_audio(formats: list[dict], duration: float) -> dict | None:
     ]
     if not candidates:
         return None
-    return min(candidates, key=lambda fmt: _size(fmt, duration) or 0)
+    return min(
+        candidates,
+        key=lambda fmt: (-_language_preference(fmt), _size(fmt, duration) or 0),
+    )
+
+
+def _language_preference(fmt: dict) -> int:
+    """yt-dlp's rank for ``fmt``'s audio language, lowest when it gives none."""
+    try:
+        return int(fmt.get("language_preference"))
+    except (TypeError, ValueError):
+        return -1
 
 
 def _size(fmt: dict, duration: float) -> int | None:
