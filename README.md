@@ -1094,9 +1094,10 @@ evening looks like. So the empty case says which one it was:
 Nothing is lost either way: a feed that fails rolls its watermark back, so those
 items are still queued for the next run rather than skipped over.
 
-See [`examples/run-from-shortcut.sh`](examples/run-from-shortcut.sh) for the
-wrapper that holds a power assertion for the length of a run — and for why it is
-not a complete answer on battery.
+A wrapper can hold a power assertion for the length of a run with
+`caffeinate -dimsw $$`, but it is not a complete answer: `-s`, the flag that
+holds off system sleep, only works on AC power. On battery the run is suspended
+regardless.
 
 ### Running it somewhere that doesn't sleep
 

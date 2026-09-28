@@ -2,8 +2,8 @@
 #
 # One rssignal run, with the environment it needs.
 #
-# This is the container's version of examples/run-from-shortcut.sh, and it is
-# shorter than that script for a good reason: most of what the macOS wrapper
+# This is the container's version of the macOS Shortcut wrapper it replaced,
+# and it is shorter than that script for a good reason: most of what the wrapper
 # does is fight the laptop. `caffeinate -dimsw` to keep the machine awake,
 # `pmset -g batt` to record why it didn't, a guard against iCloud evicting the
 # checkout mid-run — none of that means anything here. A container on a Pi is

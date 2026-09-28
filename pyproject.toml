@@ -9,7 +9,7 @@ description = "An RSS feed reader for Signal."
 readme = "README.md"
 requires-python = ">=3.13"
 authors = [
-    {name = "Bert Coerver", email = "b.coerver@mailbox.org"}
+    {name = "Bert Coerver", email = "bertcoerver@users.noreply.github.com"}
 ]
 license = "MIT"
 classifiers = [
