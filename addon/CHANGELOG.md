@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.0
+
+- Add support for NPO Start series and improve video handling in downloads
+- Add VideoGone exception for expired videos and update documentation
+
 ## Unreleased
 
 - NPO Start series can be followed: point a feed at

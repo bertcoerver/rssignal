@@ -8,7 +8,7 @@
 # only after both images are pushed — Supervisor offers an update the moment it
 # sees a new version here, so bumping it first would offer one it cannot pull.
 name: rssignal
-version: "0.3.0"
+version: "0.4.0"
 slug: rssignal
 image: ghcr.io/bertcoerver/{arch}-rssignal
 description: Forward RSS feeds to Signal, on a machine that never sleeps
