@@ -64,6 +64,15 @@ class VideoTooBig(FeedError):
     """
 
 
+class VideoGone(FeedError):
+    """Raised for a video its source has taken down for good.
+
+    The third permanent answer. An ARTE programme whose rights window has closed
+    does not come back, and one left to retry would hold every later episode of
+    its feed behind it from then on.
+    """
+
+
 @runtime_checkable
 class VideoPlan(Protocol):
     """What a source would download for an item, decided before downloading it.

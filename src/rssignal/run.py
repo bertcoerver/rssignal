@@ -94,6 +94,7 @@ from .signal_cli import (
     update_group,
 )
 from .video import (
+    VideoGone,
     VideoTooBig,
     VideoTooShort,
     is_video_item,
@@ -1007,7 +1008,7 @@ def _handle_item(
             # run can report the resolution and size it would really arrive at.
             try:
                 print(f"    video: {resolve_video(item).describe()}")
-            except (VideoTooShort, VideoTooBig) as exc:
+            except (VideoTooShort, VideoTooBig, VideoGone) as exc:
                 print(f"    nothing sent: {exc}")
                 return False
             except FeedError as exc:
@@ -1026,14 +1027,15 @@ def _handle_item(
         # send this at all" — a Short is not a message.
         try:
             plan = resolve_video(item)
-        except (VideoTooShort, VideoTooBig) as exc:
+        except (VideoTooShort, VideoTooBig, VideoGone) as exc:
             # The watermark has already moved past this item, and stays moved:
             # a Short does not become worth sending by being looked at again
-            # tomorrow, and a two-hour documentary does not fit tomorrow
-            # either. But nothing reaches the group, so this is not a send,
-            # and it goes in the log as well as to stderr — stderr is nowhere
-            # at all under a scheduler, and an item counted as sent that never
-            # arrived is a long evening's worth of wondering why.
+            # tomorrow, a two-hour documentary does not fit tomorrow either, and
+            # an expired programme stays expired. But nothing reaches the group,
+            # so this is not a send, and it goes in the log as well as to
+            # stderr — stderr is nowhere at all under a scheduler, and an item
+            # counted as sent that never arrived is a long evening's worth of
+            # wondering why.
             print(f"[{label}] skipped: {exc}", file=sys.stderr)
             log_line(f"[{label}] skipped: {exc}")
             return False

@@ -5,16 +5,18 @@ served for programme 127395-052-A, so the parsing and quality-picking tests are
 about the format as it actually is rather than as it might be.
 """
 
+import dataclasses
 import json
 import os
 import subprocess
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from rssignal import arte
 from rssignal.arte import Variant, arte_program_id
 from rssignal.feeds import FeedError, FeedItem
-from rssignal.video import video_temp
+from rssignal.video import VideoGone, video_temp
 
 LINK = "https://www.arte.tv/fr/videos/127395-052-A/le-dessous-des-images/"
 MASTER_URL = (
@@ -81,6 +83,16 @@ def _patch_fetch(monkeypatch, *, config=PLAYER_CONFIG, master=MASTER):
 
 def _item(link=LINK):
     return FeedItem(title="La bataille du drapeau", description="d", link=link)
+
+
+def _dated(*, days_ago):
+    """:func:`_item`, published ``days_ago`` days ago (negative: still to come)."""
+    published = (
+        None
+        if days_ago is None
+        else datetime.now(timezone.utc) - timedelta(days=days_ago)
+    )
+    return dataclasses.replace(_item(), published=published)
 
 
 # --- link detection -------------------------------------------------------
@@ -223,6 +235,47 @@ def test_resolve_video_without_streams_raises(monkeypatch):
     _patch_fetch(monkeypatch, config=config)
     with pytest.raises(FeedError, match="No stream available"):
         arte.resolve(_item())
+
+
+def _no_streams(code):
+    """A player config with no streams, and ARTE's reason for it."""
+    return json.dumps(
+        {
+            "data": {
+                "attributes": {
+                    "metadata": {"duration": {"seconds": 730}},
+                    "streams": [],
+                    "error": {"code": code, "title": "Une erreur est survenue"},
+                }
+            }
+        }
+    )
+
+
+def test_a_missing_stream_inside_the_rights_window_is_retried(monkeypatch):
+    # ARTE's answer for 125533-026-A three days after its rights opened.
+    _patch_fetch(monkeypatch, config=_no_streams("ERROR_STREAMS_MISSING"))
+    with pytest.raises(FeedError, match="has no video for it yet") as caught:
+        arte.resolve(_dated(days_ago=3))
+    assert not isinstance(caught.value, VideoGone)
+
+
+def test_expired_rights_on_a_released_programme_are_permanent(monkeypatch):
+    _patch_fetch(monkeypatch, config=_no_streams("ERROR_NO_RIGHTS"))
+    with pytest.raises(VideoGone, match="rights have expired"):
+        arte.resolve(_dated(days_ago=30))
+
+
+@pytest.mark.parametrize("days_ago", [-2, None], ids=["not-out-yet", "undated"])
+def test_no_rights_is_only_permanent_once_the_programme_has_been_out(
+    monkeypatch, days_ago
+):
+    # ARTE answers NO_RIGHTS before a rights window opens as well as after it
+    # closes, and the first of those is a programme still to come.
+    _patch_fetch(monkeypatch, config=_no_streams("ERROR_NO_RIGHTS"))
+    with pytest.raises(FeedError) as caught:
+        arte.resolve(_dated(days_ago=days_ago))
+    assert not isinstance(caught.value, VideoGone)
 
 
 def test_resolve_video_with_unexpected_payload_raises(monkeypatch):

@@ -19,7 +19,7 @@ from rssignal.feeds import (
 )
 from rssignal.run import AlreadyRunning, run_feeds, single_run
 from rssignal.signal_cli import LinkPreview, SignalError, SignalGroup
-from rssignal.video import VideoTooBig, VideoTooShort
+from rssignal.video import VideoGone, VideoTooBig, VideoTooShort
 from rssignal.watermark import format_watermark, read_watermark
 
 NOW = datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc)
@@ -316,6 +316,27 @@ def test_run_too_big_video_is_stepped_over_rather_than_retried(monkeypatch, caps
     assert sends == []
     assert "skipped: even 640x360 is 210 MB" in capsys.readouterr().err
     # Unlike a failure, the watermark stands: retrying would decide the same.
+    assert calls["updated"][-1]["description"] != LONG_AGO
+
+
+def test_run_expired_video_is_stepped_over_and_the_next_one_sent(
+    monkeypatch, capsys
+):
+    """An expired programme must not hold every later episode behind it."""
+    cfg = FeedConfig(url="https://a", name="Arte")
+    gone = FeedItem(title="Expired", description="d", link=ARTE_LINK)
+    after = FeedItem(title="Next week", description="d", link="https://a/text")
+    calls = _patch_feeds(monkeypatch, [cfg], {"https://a": [gone, after]})
+    sends = _capture_sends(monkeypatch)
+    _patch_video(
+        monkeypatch,
+        resolve_fail=VideoGone("125533-026-A is no longer on ARTE: its rights have expired"),
+    )
+
+    assert run_feeds("feeds.json") == 1
+    assert len(sends) == 1
+    assert "Next week" in sends[0]["text"]
+    assert "skipped: 125533-026-A is no longer on ARTE" in capsys.readouterr().err
     assert calls["updated"][-1]["description"] != LONG_AGO
 
 

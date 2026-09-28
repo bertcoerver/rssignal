@@ -45,7 +45,7 @@ from .feeds import (
     apply_extracts,
     strip_html,
 )
-from .video import SIZE_ESTIMATE_MARGIN, VIDEO_MAX_BYTES, VideoTooBig
+from .video import SIZE_ESTIMATE_MARGIN, VIDEO_MAX_BYTES, VideoGone, VideoTooBig
 
 # An ARTE programme page: language, then the programme id. Collection pages
 # (``RC-023176``) are deliberately not matched — they are a listing, not a
@@ -152,18 +152,34 @@ def arte_program_id(link: str | None) -> tuple[str, str] | None:
     return match["program_id"].upper(), match["lang"].lower()
 
 
+class _NoRights(FeedError):
+    """ARTE has no rights to show the programme right now — see :func:`resolve`."""
+
+
 def resolve(item: FeedItem, *, max_bytes: int = VIDEO_MAX_BYTES) -> HlsPlan:
     """Work out which stream and quality ``item``'s video would be fetched at.
 
     Raises :class:`FeedError` if the item is not an ARTE programme, the player
-    api has nothing usable, or every rung is too big to send.
+    api has nothing usable, or every rung is too big to send, and
+    :class:`VideoGone` if its rights have run out.
     """
     found = arte_program_id(item.link)
     if not found:
         raise FeedError(f"Not an ARTE video link: {item.link!r}")
     program_id, lang = found
 
-    master_url, duration = _player_config(program_id, lang)
+    try:
+        master_url, duration = _player_config(program_id, lang)
+    except _NoRights as exc:
+        # ARTE says the same for a programme whose rights have closed and for
+        # one whose rights have not opened yet. Only the first is permanent, and
+        # an item with a date in the past is one that has been out.
+        released = item.published
+        if released is not None and released <= datetime.now(timezone.utc):
+            raise VideoGone(
+                f"{program_id} is no longer on ARTE: its rights have expired"
+            ) from exc
+        raise
     variants = _variants(fetch_text(master_url))
     variant = _pick_variant(variants, duration, max_bytes, program_id)
     return HlsPlan(master_url=master_url, variant=variant, duration=duration)
@@ -190,8 +206,21 @@ def _player_config(program_id: str, lang: str) -> tuple[str, float]:
     streams = attributes.get("streams")
 
     if not streams:
-        # Rights windows expire; a programme past its end date has no stream.
-        raise FeedError(f"No stream available for {program_id} — expired rights?")
+        # ARTE says why in `error.code`, and the two it gives mean opposite
+        # things: NO_RIGHTS is a programme outside its rights window, while
+        # STREAMS_MISSING is one inside it whose video ARTE has not got to yet —
+        # seen on a Dessous des Cartes three days after its rights opened.
+        code = (attributes.get("error") or {}).get("code")
+        if code == "ERROR_NO_RIGHTS":
+            raise _NoRights(f"{program_id} is not on ARTE at the moment ({code})")
+        if code == "ERROR_STREAMS_MISSING":
+            raise FeedError(
+                f"ARTE lists {program_id} but has no video for it yet ({code}); "
+                "trying again next run"
+            )
+        raise FeedError(
+            f"No stream available for {program_id} ({code or 'ARTE gave no reason'})"
+        )
 
     chosen = next(
         (s for s in streams if _version_code(s).startswith("VOF")),

@@ -44,7 +44,8 @@ signal-cli stores its account state in `~/.local/share/signal-cli` by default.
 pip install -e ".[dev]"
 ```
 
-To run it on a Raspberry Pi under Home Assistant OS instead of on a laptop, see
+To run it on a Raspberry Pi under Home Assistant OS instead of on a laptop, add
+this repository to the Add-on Store and install rssignal from there — see
 [`addon/DOCS.md`](addon/DOCS.md).
 
 ## Setup

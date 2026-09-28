@@ -3,11 +3,11 @@
 Runs rssignal on a schedule inside Home Assistant OS, so the feeds keep arriving
 on a machine that is never asleep.
 
-This exists because the alternative was a laptop. rssignal's macOS setup fires
-from an Apple Shortcut three times a day, and about a third of the wrapper
-script is there to fight the machine: `caffeinate` to keep it awake, `pmset` to
-record when that didn't work, a guard against iCloud evicting the checkout
-mid-run. A Raspberry Pi has none of those problems.
+This exists because the alternative was a laptop. rssignal used to fire from an
+Apple Shortcut on a Mac, and about a third of the wrapper script was there to
+fight the machine: `caffeinate` to keep it awake, `pmset` to record when that
+didn't work, a guard against iCloud evicting the checkout mid-run. A Raspberry
+Pi has none of those problems.
 
 ## What you need
 
@@ -17,9 +17,11 @@ mid-run. A Raspberry Pi has none of those problems.
   episodes are then kept for two weeks. That is a standing few GB and on the
   order of 100 GB of writes a year, which an SD card will not enjoy.
 - A phone with Signal, to link the account.
-- A way to get files onto the host: the **Samba share** add-on is the easiest.
-  No SSH add-on is needed — nothing here requires a shell, because on Home
-  Assistant OS there is no longer a way to get one into an add-on.
+- A way to put `feeds.json` on the host: the **File Editor** or **Samba
+  share** add-on. That is the only file you provide; the add-on itself comes
+  from this repository. No SSH add-on is needed — nothing here requires a
+  shell, because on Home Assistant OS there is no longer a way to get one into
+  an add-on.
 
 ## Installing
 
@@ -101,8 +103,8 @@ repository under a different spelling — a trailing `/` or `.git` — it will b
 another one; it is the folder that ends in `_rssignal`.
 
 Use `feeds.example.json` from the repository as a starting point. You can edit
-it later with the File Editor add-on; the next run picks up the change, no
-rebuild needed.
+it later with the File Editor add-on; the next run picks up the change, with
+no restart needed.
 
 ### 2. The account number
 
