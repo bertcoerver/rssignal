@@ -1,0 +1,13 @@
+# The add-on image is built with the repository root as its context (see
+# addon/Dockerfile). Everything is left out except what the Dockerfile copies,
+# so a local .env, feeds.json, log or venv can never end up in a published
+# image, and a change to the tests does not invalidate the build cache.
+*
+!LICENSE
+!README.md
+!pyproject.toml
+!src
+!addon/rootfs
+!addon/scripts
+**/__pycache__
+**/*.egg-info

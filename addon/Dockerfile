@@ -1,6 +1,19 @@
 # syntax=docker/dockerfile:1
+#
+# Built by .github/workflows/addon.yml, with the *repository root* as the build
+# context — not addon/ — so the source in src/ can be copied in directly. Home
+# Assistant never builds this: config.yaml names the published image, and an
+# update is a pull. To build it by hand, from the repository root:
+#
+#   docker build -f addon/Dockerfile .
 ARG BUILD_FROM=ghcr.io/hassio-addons/debian-base:9.4.0
 FROM ${BUILD_FROM}
+
+# The same three the Home Assistant builder passes. BUILD_VERSION is the
+# add-on version from config.yaml; it becomes rssignal's own version too, so
+# `rssignal.__version__` and the version on the add-on page agree.
+ARG BUILD_ARCH=aarch64
+ARG BUILD_VERSION=0.0.0.dev0
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -14,12 +27,6 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ARG SIGNAL_CLI_VERSION="0.14.8"
 ARG LIBSIGNAL_VERSION="0.102.1"
 ARG JAVA_VERSION="25"
-
-# Which rssignal to install, when there is no wheel in `dist/` — see below.
-# Not a plain `rssignal[video]` from PyPI because the media archive this add-on
-# relies on is not in a release yet. Once it is, this can become
-# `rssignal[video]==<version>` and `dist/` can go away.
-ARG RSSIGNAL_SPEC="rssignal[video] @ git+https://github.com/bertcoerver/rssignal@main"
 
 # Prepend, never replace. The base image's own s6 services run with this PATH
 # too, and one of them ends in `dpkg-reconfigure`, which lives in /usr/sbin —
@@ -41,7 +48,6 @@ RUN apt-get update \
         ca-certificates \
         curl \
         ffmpeg \
-        git \
         python3 \
         python3-venv \
         # `rssignal link` renders the sgnl:// linking URI as a scannable QR
@@ -69,46 +75,28 @@ RUN set -eux; \
     rm /tmp/jre.tar.gz; \
     java -version
 
-COPY scripts/install-signal-cli.sh /usr/local/bin/install-signal-cli
+COPY addon/scripts/install-signal-cli.sh /usr/local/bin/install-signal-cli
 RUN chmod +x /usr/local/bin/install-signal-cli \
     && SIGNAL_CLI_VERSION="${SIGNAL_CLI_VERSION}" \
        LIBSIGNAL_VERSION="${LIBSIGNAL_VERSION}" \
        install-signal-cli
 
-# A wheel built from the working copy, if there is one. The build context is
-# only this directory — Docker cannot reach `../src` — so the source has to be
-# handed over as a file. `dist/` always exists (it holds a `.keep`) because a
-# COPY of a missing path fails the build.
-COPY dist/ /tmp/wheels/
-
-# rssignal and yt-dlp in their own venv. Prefer the local wheel: it is the only
-# route that works for a repository that is private, or that has commits not
-# pushed yet — which is most of the time while this is being worked on. Falling
-# back to RSSIGNAL_SPEC keeps a clean checkout buildable on its own.
-#
-# `git` is needed at this point for the fallback, since setuptools-scm reads the
-# tags for the version; it is dropped again below.
+# rssignal and yt-dlp in their own venv, from the source in this checkout — the
+# commit the release workflow is building, and nothing fetched from elsewhere.
+# There is no .git in the context (see .dockerignore), so setuptools-scm cannot
+# read a version from the tags and is told it instead.
+COPY pyproject.toml README.md LICENSE /tmp/rssignal/
+COPY src /tmp/rssignal/src
 RUN set -eux; \
     python3 -m venv /opt/venv; \
     /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
-    wheel="$(find /tmp/wheels -maxdepth 1 -name 'rssignal-*.whl' | sort | tail -n 1)"; \
-    if [ -n "${wheel}" ]; then \
-        echo "installing ${wheel}"; \
-        /opt/venv/bin/pip install --no-cache-dir "${wheel}[video]"; \
-    else \
-        echo "no wheel in dist/, installing ${RSSIGNAL_SPEC}"; \
-        /opt/venv/bin/pip install --no-cache-dir "${RSSIGNAL_SPEC}"; \
-    fi; \
-    rm -rf /tmp/wheels; \
+    SETUPTOOLS_SCM_PRETEND_VERSION="${BUILD_VERSION}" \
+        /opt/venv/bin/pip install --no-cache-dir "/tmp/rssignal[video]"; \
+    rm -rf /tmp/rssignal; \
     ln -sf /opt/venv/bin/rssignal /usr/local/bin/rssignal; \
     rssignal --help > /dev/null
 
-# git was only needed for the pip install above; it is a large surface to leave
-# in an image whose whole job is to talk to two APIs and a chat server.
-RUN apt-get purge -y --auto-remove git \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY rootfs /
+COPY addon/rootfs /
 
 # s6 runs these; the build should not depend on the file mode surviving a copy
 # through git, Samba and a Windows checkout.
@@ -122,4 +110,6 @@ LABEL \
     io.hass.name="rssignal" \
     io.hass.description="Forward RSS feeds to Signal" \
     io.hass.type="addon" \
-    io.hass.arch="aarch64|amd64"
+    io.hass.arch="${BUILD_ARCH}" \
+    io.hass.version="${BUILD_VERSION}" \
+    org.opencontainers.image.source="https://github.com/bertcoerver/rssignal"

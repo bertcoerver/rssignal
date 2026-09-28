@@ -23,39 +23,68 @@ mid-run. A Raspberry Pi has none of those problems.
 
 ## Installing
 
-1. On your own machine, build a wheel into the add-on's build context:
+1. **Settings → Add-ons → Add-on Store → ⋮ → Repositories**, and add:
 
-   ```sh
-   python3 -m build --wheel --outdir addon/dist .
+   ```
+   https://github.com/bertcoerver/rssignal
    ```
 
-   This is how the code gets in. A Docker build can only read files inside the
-   folder it is given, so it cannot reach `src/` from `addon/` — the wheel is
-   the hand-over. If `addon/dist/` has no wheel in it the build falls back to
-   `pip install` from GitHub, which needs the repository to be public **and**
-   to have the commit you want on `main`; while this is private, build the
-   wheel. Rebuild it whenever you change rssignal itself.
+2. rssignal appears in the store under its own heading. Install it.
 
-2. Copy the `addon/` directory of this repository to `/addons/rssignal` on the
-   Home Assistant host (over Samba, or with `git clone` from the SSH add-on —
-   but a clone will not bring the wheel, which is not in git).
-3. **Settings → Add-ons → Add-on Store → ⋮ → Check for updates.**
-4. rssignal appears under **Local add-ons**. Install it.
+Nothing is built on the host. GitHub Actions builds the image for each
+architecture and publishes it to `ghcr.io`, and installing is a download.
 
-Later changes to rssignal are: rebuild the wheel, delete the old one from
-`addon/dist/`, copy the **whole** `addon/` directory over again, and
-**Rebuild** the add-on. The whole directory, not just the wheel: the scheduler
-and the scripts in `rootfs/` are baked into the image too, and a change to
-rssignal often comes with a change to how the add-on calls it. A new wheel
-under an old `rootfs/` runs the new code the old way.
+## Updating
 
-The first build takes several minutes on a Pi 4: it downloads a JRE, the
-signal-cli distribution, and a matching native libsignal. It does not do any of
-that again unless you change a version.
+When a new version is out, Home Assistant says so — on the add-on's page and
+under **Settings → Updates** — with this repository's `CHANGELOG.md` beside it.
+Click **Update**. Everything in `/data`, including the linked device, carries
+over.
+
+Supervisor looks for new versions on its own every few hours;
+**Add-on Store → ⋮ → Check for updates** looks now.
+
+### Publishing a new version
+
+From a checkout with `gh` logged in, once the change is on `main`:
+
+```sh
+make addon-release VERSION=0.3.1
+```
+
+That starts the **Release add-on** workflow (it can also be started from the
+Actions tab). It runs the tests, builds and pushes both images, and only then
+bumps `version` in `config.yaml`, adds the commits since the last release to
+`CHANGELOG.md`, and tags the commit `addon-v0.3.1`. The order matters:
+Supervisor offers an update the moment it sees a new version, so the images
+have to exist first. Pull afterwards — the workflow commits to `main`.
 
 If the build fails at `install-signal-cli`, read the error — the script is
 explicit about which of the two version numbers is wrong. See
 [The signal-cli problem](#the-signal-cli-problem).
+
+### Moving from the old local add-on
+
+Before this repository was public, the add-on was installed by copying `addon/`
+to `/addons/rssignal` and building it on the host. Home Assistant treats the
+repository version as a *different* add-on — its slug is `a67c9053_rssignal`,
+not `local_rssignal` — so it starts with an empty `/data` and its own config
+folder. Moving over:
+
+1. Install rssignal from the repository as above. Don't start it yet.
+2. Copy `feeds.json` from `/addon_configs/local_rssignal/` to
+   `/addon_configs/a67c9053_rssignal/`, and copy the settings on the
+   **Configuration** tab across.
+3. **Stop** the local add-on, then link the new one — see
+   [Link the Signal account](#3-link-the-signal-account). Nothing is resent: the
+   watermarks live in the group descriptions, not in `/data`.
+4. Start the new one, check the log, then uninstall the local add-on, remove
+   its device under **Signal → Settings → Linked Devices**, and delete
+   `/addons/rssignal`.
+
+What does not carry over is `/data/cache.json`, which costs one slow run, and
+`/data/pending.json`: if a podcast's voice note had failed and was waiting to be
+retried, its preview card may be sent a second time.
 
 ## Setting up
 
@@ -64,8 +93,12 @@ explicit about which of the two version numbers is wrong. See
 Put your `feeds.json` in the add-on's config folder, which the host shows at:
 
 ```
-/addon_configs/local_rssignal/feeds.json
+/addon_configs/a67c9053_rssignal/feeds.json
 ```
+
+The prefix is Home Assistant's hash of the repository URL. If you added the
+repository under a different spelling — a trailing `/` or `.git` — it will be
+another one; it is the folder that ends in `_rssignal`.
 
 Use `feeds.example.json` from the repository as a starting point. You can edit
 it later with the File Editor add-on; the next run picks up the change, no
@@ -204,9 +237,10 @@ together:
    [exquo/signal-libs-build](https://github.com/exquo/signal-libs-build/releases)
    has a `libsignal_v<version>` release. If it does not, wait — do not
    substitute a nearby version. The mismatch is an ABI mismatch.
-4. Rebuild the add-on.
+4. Push, and [publish a new version](#publishing-a-new-version).
 
-The build fails clearly if the two versions disagree.
+The build fails clearly if the two versions disagree, and a failed build
+publishes nothing.
 
 ## Checking on it
 
@@ -248,7 +282,7 @@ backup.
 | `/data/signal-cli` | add-on volume | yes — the device keys |
 | `/data/cache.json`, `/data/pending.json` | add-on volume | yes |
 | `/data/rssignal.log` | add-on volume | yes |
-| `/config/feeds.json` | `/addon_configs/local_rssignal/` | yes |
+| `/config/feeds.json` | `/addon_configs/a67c9053_rssignal/` | yes |
 | `/media/rssignal/` | `/media/rssignal/` | yes |
 
 Of these, only the signal-cli directory and `feeds.json` are irreplaceable. The

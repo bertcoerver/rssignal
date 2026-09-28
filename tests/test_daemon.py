@@ -40,8 +40,13 @@ class FakeRpc:
 
 
 @pytest.fixture
-def running(monkeypatch):
-    """Install a fake daemon as the one in use, and hand it back."""
+def running(monkeypatch, have_binary):
+    """Install a fake daemon as the one in use, and hand it back.
+
+    A send looks for the binary even with a daemon up, to have the one-shot
+    path ready should the daemon die — so without ``have_binary`` these pass
+    only on a machine that happens to have signal-cli installed.
+    """
     fake = FakeRpc()
     monkeypatch.setattr(signal_cli, "_daemon", fake)
     return fake

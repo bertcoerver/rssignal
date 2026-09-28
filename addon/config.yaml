@@ -1,12 +1,16 @@
 # Home Assistant add-on manifest.
 #
-# This is a *local* add-on: the folder is copied to /addons/rssignal on the
-# Home Assistant host and built there, rather than pulled from a registry. That
-# is why there is no `image:` key — its absence is what tells Supervisor to
-# build the Dockerfile next to this file.
+# Installed from this repository (see repository.yaml at the root), and pulled
+# as a ready-made image rather than built on the host: `image:` below is what
+# tells Supervisor so. {arch} becomes aarch64 or amd64.
+#
+# `version` is not edited by hand. The "Release add-on" workflow bumps it, and
+# only after both images are pushed — Supervisor offers an update the moment it
+# sees a new version here, so bumping it first would offer one it cannot pull.
 name: rssignal
 version: "0.2.0"
 slug: rssignal
+image: ghcr.io/bertcoerver/{arch}-rssignal
 description: Forward RSS feeds to Signal, on a machine that never sleeps
 url: https://github.com/bertcoerver/rssignal
 
