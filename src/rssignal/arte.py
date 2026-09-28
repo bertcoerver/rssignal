@@ -16,8 +16,9 @@ manifest is a multi-variant HLS master offering the same programme from ~380x216
 up to 1080p, and Signal refuses an attachment over 100 MB. ffmpeg's HLS demuxer
 has no "biggest that fits" switch, so the master is parsed here, the size of each
 rung is estimated from its advertised average bandwidth times the duration, and
-the largest one expected to fit :data:`~rssignal.video.VIDEO_MAX_BYTES` is handed
-to ffmpeg by program index. Streams are copied, never re-encoded: the rungs
+the choice follows :mod:`rssignal.parts` — the fewest messages of
+:data:`~rssignal.video.VIDEO_MAX_BYTES` any rung fits in, then the sharpest rung
+that fits in that many — and is handed to ffmpeg by program index. Streams are copied, never re-encoded: the rungs
 already exist at sensible bitrates, and re-encoding would trade minutes of cpu
 for nothing.
 
@@ -45,7 +46,8 @@ from .feeds import (
     apply_extracts,
     strip_html,
 )
-from .video import SIZE_ESTIMATE_MARGIN, VIDEO_MAX_BYTES, VideoGone, VideoTooBig
+from .parts import choose, in_parts, too_big
+from .video import SIZE_ESTIMATE_MARGIN, VIDEO_MAX_BYTES, VideoGone
 
 # An ARTE programme page: language, then the programme id. Collection pages
 # (``RC-023176``) are deliberately not matched — they are a listing, not a
@@ -126,6 +128,7 @@ class HlsPlan:
     master_url: str
     variant: Variant
     duration: float
+    parts: int = 1
 
     @property
     def estimated_bytes(self) -> int:
@@ -133,7 +136,7 @@ class HlsPlan:
 
     def describe(self) -> str:
         mb = self.estimated_bytes / (1024 * 1024)
-        return f"{self.variant.resolution}, ~{mb:.0f} MB"
+        return f"{self.variant.resolution}, ~{mb:.0f} MB{in_parts(self.parts)}"
 
     def fetch(self, into: str, *, timeout: float) -> str:
         """Download the chosen rung into directory ``into``, returning its path."""
@@ -181,8 +184,10 @@ def resolve(item: FeedItem, *, max_bytes: int = VIDEO_MAX_BYTES) -> HlsPlan:
             ) from exc
         raise
     variants = _variants(fetch_text(master_url))
-    variant = _pick_variant(variants, duration, max_bytes, program_id)
-    return HlsPlan(master_url=master_url, variant=variant, duration=duration)
+    variant, parts = _pick_variant(variants, duration, max_bytes, program_id)
+    return HlsPlan(
+        master_url=master_url, variant=variant, duration=duration, parts=parts
+    )
 
 
 def _config_attributes(program_id: str, lang: str) -> dict:
@@ -466,21 +471,26 @@ def _attr_resolution(attrs: str) -> tuple[int, int]:
 
 def _pick_variant(
     variants: list[Variant], duration: float, max_bytes: int, program_id: str
-) -> Variant:
-    """Pick the sharpest rung expected to fit ``max_bytes``."""
+) -> tuple[Variant, int]:
+    """Pick ``(rung, parts)``: the fewest ``max_bytes`` parts, then the sharpest."""
     usable = [v for v in variants if not v.codecs.startswith(_H265_CODECS)]
     if not usable:
         usable = variants
 
-    fitting = [v for v in usable if v.estimated_bytes(duration) <= max_bytes]
-    if not fitting:
+    picked = choose(
+        usable,
+        size=lambda v: v.estimated_bytes(duration),
+        rank=lambda v: (v.width * v.height, v.bandwidth),
+        max_bytes=max_bytes,
+    )
+    if picked is None:
         smallest = min(usable, key=lambda v: v.bandwidth)
-        raise VideoTooBig(
-            f"Video {program_id} is too big to send: even {smallest.resolution} "
-            f"is about {smallest.estimated_bytes(duration) / 1024 / 1024:.0f} MB, "
-            f"over the {max_bytes / 1024 / 1024:.0f} MB limit"
+        raise too_big(
+            f"Video {program_id} (even at {smallest.resolution})",
+            smallest.estimated_bytes(duration),
+            max_bytes=max_bytes,
         )
-    return max(fitting, key=lambda v: (v.width * v.height, v.bandwidth))
+    return picked
 
 
 def _run_ffmpeg(

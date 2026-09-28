@@ -1,11 +1,11 @@
 """Fetch the video behind an item that only links to one.
 
 Some feeds are about video but carry none: the item links to a player page and
-the video itself lives behind a streaming manifest or a format catalogue. ARTE
-and YouTube are the two rssignal knows; :mod:`rssignal.arte` and
-:mod:`rssignal.youtube` know how to talk to each, and this module is the front
-door that decides which — so nothing outside has to know how many sources exist
-or which one an item came from.
+the video itself lives behind a streaming manifest or a format catalogue. ARTE,
+YouTube and NPO Start are the three rssignal knows; :mod:`rssignal.arte`,
+:mod:`rssignal.youtube` and :mod:`rssignal.npo` know how to talk to each, and
+this module is the front door that decides which — so nothing outside has to
+know how many sources exist or which one an item came from.
 
 Like :func:`rssignal.feeds.is_audio_item`, that decision is made per item from
 the link, with nothing to configure: an item that looks like an ARTE programme
@@ -21,7 +21,6 @@ at rather than promising "a video".
 
 from __future__ import annotations
 
-import os
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -56,6 +55,10 @@ class VideoTooShort(FeedError):
 
 class VideoTooBig(FeedError):
     """Raised for a video no quality of which fits inside Signal's limit.
+
+    Even split into parts, that is — see :mod:`rssignal.parts`: an item is only
+    this big when its smallest quality needs more than
+    :data:`~rssignal.parts.MAX_PARTS` messages.
 
     The other permanent answer, and told apart from a plain ``FeedError`` for
     the same reason as :class:`VideoTooShort`: a two-hour documentary is not
@@ -96,10 +99,15 @@ def is_video_item(item: FeedItem) -> bool:
     way: per item, from what the item already says, with nothing to configure.
     """
     from .arte import arte_program_id
+    from .npo import npo_episode_slug
     from .youtube import youtube_video_id
 
     link = item.link
-    return arte_program_id(link) is not None or youtube_video_id(link) is not None
+    return (
+        arte_program_id(link) is not None
+        or youtube_video_id(link) is not None
+        or npo_episode_slug(link) is not None
+    )
 
 
 def resolve_video(item: FeedItem, *, max_bytes: int = VIDEO_MAX_BYTES) -> VideoPlan:
@@ -109,12 +117,14 @@ def resolve_video(item: FeedItem, *, max_bytes: int = VIDEO_MAX_BYTES) -> VideoP
     source has nothing usable, or every quality is too big to send, and
     :class:`VideoTooShort` if the video isn't worth sending.
     """
-    from . import arte, youtube
+    from . import arte, npo, youtube
 
     if arte.arte_program_id(item.link):
         return arte.resolve(item, max_bytes=max_bytes)
     if youtube.youtube_video_id(item.link):
         return youtube.resolve(item, max_bytes=max_bytes)
+    if npo.npo_episode_slug(item.link):
+        return npo.resolve(item, max_bytes=max_bytes)
     raise FeedError(f"Not a video link: {item.link!r}")
 
 
@@ -137,24 +147,18 @@ def video_temp(
     succeeded — the same contract as :func:`rssignal.download.download_temp`, so
     callers can hold both on one ``ExitStack``.
 
+    The file is yielded whatever its size. One that came out bigger than its
+    plan promised is not refused here: :func:`rssignal.parts.split_temp` cuts it
+    into as many messages as it needs, which is the same answer it gets for a
+    plan that knew all along it would take more than one.
+
     Raises :class:`~rssignal.feeds.FeedError` if anything along the way fails.
     """
     if plan is None:
         plan = resolve_video(item, max_bytes=max_bytes)
 
     with tempfile.TemporaryDirectory(prefix="rssignal-video-") as into:
-        path = plan.fetch(into, timeout=timeout)
-
-        size = os.path.getsize(path)
-        if size > max_bytes:
-            # The estimate was optimistic. Better to say so than to hand
-            # signal-cli a file Signal will refuse — and the same download would
-            # come out the same size next run, so this is a `VideoTooBig`.
-            raise VideoTooBig(
-                f"Video is {size / 1024 / 1024:.0f} MB, over the "
-                f"{max_bytes / 1024 / 1024:.0f} MB limit"
-            )
-        yield path
+        yield plan.fetch(into, timeout=timeout)
 
 
 def collection_feed(cfg: FeedConfig) -> ParsedFeed | None:
@@ -163,9 +167,12 @@ def collection_feed(cfg: FeedConfig) -> ParsedFeed | None:
     ``None`` means "not one of those" and the url should be parsed as a feed.
     """
     from .arte import arte_collection_id, parse_arte_collection
+    from .npo import npo_series, parse_npo_series
 
     if arte_collection_id(cfg.url):
         return parse_arte_collection(cfg)
+    if npo_series(cfg.url):
+        return parse_npo_series(cfg)
     return None
 
 
@@ -225,10 +232,13 @@ def source_image(url: str) -> str | None:
     source that should have a picture and couldn't produce one.
     """
     from .arte import arte_collection_id, collection_image
+    from .npo import npo_series, series_image
     from .youtube import channel_image
 
     if arte_collection_id(url):
         return collection_image(url)
+    if npo_series(url):
+        return series_image(url)
     return channel_image(url)
 
 

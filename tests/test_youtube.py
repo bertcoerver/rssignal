@@ -307,6 +307,18 @@ def test_resolve_drops_a_rung_for_a_smaller_budget(monkeypatch):
     assert plan.selector == "135+140"
 
 
+def test_resolve_splits_rather_than_skips_when_nothing_fits_whole(monkeypatch):
+    _patch_ytdlp(monkeypatch)
+
+    # 25 MB is under even 360p (29.7 MB with its audio), so two parts — and two
+    # parts' 50 MB is room for 480p (49.7 MB) but not 720p.
+    plan = youtube.resolve(_item(), max_bytes=25_000_000)
+
+    assert plan.selector == "135+140"
+    assert plan.parts == 2
+    assert plan.describe().endswith(", in 2 parts")
+
+
 def test_resolve_muxes_the_original_language_not_the_smallest_dub(monkeypatch):
     """A dubbed video lists each language as its own stream, a few bytes apart."""
     dubs = [

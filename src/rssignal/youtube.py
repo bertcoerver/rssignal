@@ -46,7 +46,8 @@ from urllib.parse import urlparse
 
 from . import cache, timing
 from .feeds import FeedError, FeedItem, SourceBlocked
-from .video import SIZE_ESTIMATE_MARGIN, VIDEO_MAX_BYTES, VideoTooBig, VideoTooShort
+from .parts import choose, in_parts, too_big
+from .video import SIZE_ESTIMATE_MARGIN, VIDEO_MAX_BYTES, VideoTooShort
 
 # A YouTube video, in any of the shapes a feed or a human might write it.
 YOUTUBE_LINK_RE = re.compile(
@@ -193,6 +194,7 @@ class YoutubePlan:
     width: int
     height: int
     estimated_bytes: int
+    parts: int = 1
 
     @property
     def resolution(self) -> str:
@@ -200,7 +202,7 @@ class YoutubePlan:
 
     def describe(self) -> str:
         mb = self.estimated_bytes / (1024 * 1024)
-        return f"{self.resolution}, ~{mb:.0f} MB"
+        return f"{self.resolution}, ~{mb:.0f} MB{in_parts(self.parts)}"
 
     def fetch(self, into: str, *, timeout: float) -> str:
         """Download the chosen formats into ``into``, returning the file's path."""
@@ -894,40 +896,46 @@ def _video_info(url: str) -> dict:
 def _pick(
     formats: list[dict], duration: float, max_bytes: int, url: str, video_id: str
 ) -> YoutubePlan:
-    """Choose the sharpest video (plus audio) expected to fit ``max_bytes``."""
+    """Choose the video (plus audio) to fetch, and how many parts it will be.
+
+    The fewest ``max_bytes`` parts any usable pairing fits in, then the
+    sharpest pairing that fits in that many — see :mod:`rssignal.parts`.
+    """
     audio = _smallest_audio(formats, duration)
 
-    fitting: list[tuple[tuple[int, int], YoutubePlan]] = []
-    smallest: int | None = None
-
+    candidates: list[tuple[tuple[int, int], YoutubePlan]] = []
     for fmt in formats:
         pair = _pairing(fmt, audio, duration)
         if pair is None:
             continue
         selector, size = pair
-        smallest = size if smallest is None else min(smallest, size)
-        if size > max_bytes:
-            continue
-        height = int(fmt.get("height") or 0)
-        width = int(fmt.get("width") or 0)
         plan = YoutubePlan(
             url=url,
             selector=selector,
-            width=width,
-            height=height,
+            width=int(fmt.get("width") or 0),
+            height=int(fmt.get("height") or 0),
             estimated_bytes=size,
         )
-        fitting.append(((height, int(fmt.get("tbr") or 0)), plan))
+        candidates.append(((plan.height, int(fmt.get("tbr") or 0)), plan))
 
-    if not fitting:
-        if smallest is None:
-            raise FeedError(f"No usable format for {video_id}")
-        raise VideoTooBig(
-            f"Video {video_id} is too big to send: the smallest usable format "
-            f"is about {smallest / 1024 / 1024:.0f} MB, over the "
-            f"{max_bytes / 1024 / 1024:.0f} MB limit"
+    if not candidates:
+        raise FeedError(f"No usable format for {video_id}")
+
+    picked = choose(
+        candidates,
+        size=lambda c: c[1].estimated_bytes,
+        rank=lambda c: c[0],
+        max_bytes=max_bytes,
+    )
+    if picked is None:
+        smallest = min(plan.estimated_bytes for _, plan in candidates)
+        raise too_big(
+            f"Video {video_id} (even its smallest usable format)",
+            smallest,
+            max_bytes=max_bytes,
         )
-    return max(fitting, key=lambda pair: pair[0])[1]
+    (_, plan), parts = picked
+    return replace(plan, parts=parts)
 
 
 def _pairing(

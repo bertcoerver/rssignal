@@ -24,6 +24,10 @@
       "published_weekday_contains": ["Tuesday", "Wednesday", "Thursday", "Friday"]
     },
     {
+      "name": "Bureau Buitenland",
+      "url": "https://npo.nl/start/serie/bureau-buitenland/afleveringen"
+    },
+    {
       "name": "Some Series From The Start",
       "url": "https://www.youtube.com/@example",
       "episodic": "2-weekly",

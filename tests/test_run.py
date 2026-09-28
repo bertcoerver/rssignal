@@ -340,17 +340,24 @@ def test_run_expired_video_is_stepped_over_and_the_next_one_sent(
     assert calls["updated"][-1]["description"] != LONG_AGO
 
 
-def test_run_video_bigger_than_estimated_is_stepped_over(monkeypatch, capsys):
-    """The estimate fit and the file didn't — still permanent, still a skip."""
+def test_run_video_too_big_even_split_is_stepped_over(monkeypatch, capsys):
+    """The estimate fit and the file didn't, by more than parts can absorb."""
     cfg = FeedConfig(url="https://a", name="Arte")
     item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
     calls = _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
     sends = _capture_sends(monkeypatch)
-    _patch_video(monkeypatch, fail=VideoTooBig("Video is 104 MB, over the 95 MB limit"))
+    _patch_video(monkeypatch)
+
+    @contextmanager
+    def too_big(path, **kwargs):
+        raise VideoTooBig("File is too big to send: 420 MB is over 4 parts of 95 MB")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(run, "split_temp", too_big)
 
     assert run_feeds("feeds.json") == 0
     assert sends == []
-    assert "skipped: Video is 104 MB" in capsys.readouterr().err
+    assert "skipped: File is too big to send" in capsys.readouterr().err
     assert calls["updated"][-1]["description"] != LONG_AGO
 
 
@@ -2060,3 +2067,190 @@ def test_run_points_tmpdir_at_the_staging_directory(media, monkeypatch):
     # Which is what lets `archive.keep` link instead of copy: downloads land on
     # the same filesystem as the archive they are about to be linked into.
     assert os.environ["TMPDIR"] == str(media / archive.STAGING_NAME)
+
+
+# --- sending in parts -------------------------------------------------------
+#
+# A file over Signal's limit goes out as the fewest parts that each fit (see
+# rssignal.parts). These are about the messages that makes: how many, what each
+# says, and that a retry after a failure half-way sends only what is missing.
+
+
+def _patch_split(monkeypatch, pieces):
+    """Make every download come out as ``pieces``, recording what was split."""
+    split = []
+
+    @contextmanager
+    def fake_split(path, **kwargs):
+        split.append(path)
+        yield list(pieces)
+
+    monkeypatch.setattr(run, "split_temp", fake_split)
+    return split
+
+
+def test_run_sends_a_video_in_parts(monkeypatch):
+    cfg = FeedConfig(url="https://a", name="Arte")
+    item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    sends = _capture_sends(monkeypatch)
+    _patch_video(monkeypatch)
+    split = _patch_split(monkeypatch, ["/tmp/p1.mp4", "/tmp/p2.mp4"])
+
+    assert run_feeds("feeds.json") == 1
+
+    assert split == ["/tmp/fake.mp4"]
+    assert [(s["text"], s["attachments"]) for s in sends] == [
+        (f"Le drapeau\n\nd\n\n{ARTE_LINK}", ["/tmp/p1.mp4"]),
+        ("Le drapeau (2/2)", ["/tmp/p2.mp4"]),
+    ]
+    assert not any(s["voice_note"] for s in sends)
+
+
+def test_run_sends_a_long_episode_as_several_voice_notes(monkeypatch):
+    cfg = FeedConfig(url="https://a", name="Pod")
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
+    sends = _capture_sends(monkeypatch)
+    _fake_downloads(monkeypatch)
+    _patch_split(monkeypatch, ["/tmp/ep.part1.mp3", "/tmp/ep.part2.mp3", "/tmp/ep.part3.mp3"])
+
+    run_feeds("feeds.json")
+
+    # The card on its own, then every part captioned with where it falls.
+    assert sends[0]["preview"] is not None
+    assert sends[0]["attachments"] is None
+    assert [(s["text"], s["attachments"], s["voice_note"]) for s in sends[1:]] == [
+        ("Ep (1/3)", ["/tmp/ep.part1.mp3"], True),
+        ("Ep (2/3)", ["/tmp/ep.part2.mp3"], True),
+        ("Ep (3/3)", ["/tmp/ep.part3.mp3"], True),
+    ]
+
+
+def test_run_sends_parts_without_a_card_as_text_first(monkeypatch):
+    cfg = FeedConfig(url="https://a", name="Pod", link_preview=False)
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
+    sends = _capture_sends(monkeypatch)
+    _fake_downloads(monkeypatch)
+    _patch_split(monkeypatch, ["/tmp/ep.part1.mp3", "/tmp/ep.part2.mp3"])
+
+    run_feeds("feeds.json")
+
+    assert [(s["attachments"], s["voice_note"]) for s in sends] == [
+        (["/tmp/ep.part1.mp3"], True),
+        (["/tmp/ep.part2.mp3"], True),
+    ]
+    assert sends[0]["text"].startswith("Ep")
+    assert sends[1]["text"] == "Ep (2/2)"
+
+
+def test_run_resends_only_the_parts_that_did_not_go_out(monkeypatch, capsys):
+    cfg = FeedConfig(url="https://a", name="Arte")
+    item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
+    calls = _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    _patch_video(monkeypatch)
+    _patch_split(monkeypatch, ["/tmp/p1.mp4", "/tmp/p2.mp4", "/tmp/p3.mp4"])
+    failing = [True]
+    sends = []
+
+    def flaky_send(text, recipient=None, attachments=None, voice_note=False, preview=None):
+        if attachments == ["/tmp/p3.mp4"] and failing[0]:
+            raise SignalError("Connection reset (PushNetworkException)")
+        sends.append(attachments)
+
+    monkeypatch.setattr(run, "send_msg", flaky_send)
+
+    assert run_feeds("feeds.json") == 0
+    assert sends == [["/tmp/p1.mp4"], ["/tmp/p2.mp4"]]
+    # Not sent, so it comes round again.
+    assert calls["updated"][-1]["description"] == LONG_AGO
+
+    failing[0] = False
+    sends.clear()
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    capsys.readouterr()
+
+    assert run_feeds("feeds.json") == 1
+    assert sends == [["/tmp/p3.mp4"]]
+    err = capsys.readouterr().err
+    assert "message 1/3 already sent" in err
+    assert "message 2/3 already sent" in err
+
+
+def test_run_forgets_the_parts_once_all_are_out(monkeypatch):
+    # Replayed with --since, the item goes out whole again rather than as
+    # whatever a stale note says is missing.
+    cfg = FeedConfig(url="https://a", name="Arte")
+    item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    _patch_video(monkeypatch)
+    _patch_split(monkeypatch, ["/tmp/p1.mp4", "/tmp/p2.mp4"])
+    sends = _capture_sends(monkeypatch)
+
+    run_feeds("feeds.json")
+    sends.clear()
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    run_feeds("feeds.json")
+
+    assert [s["attachments"] for s in sends] == [["/tmp/p1.mp4"], ["/tmp/p2.mp4"]]
+
+
+def test_run_archives_the_whole_file_not_its_parts(media, tmp_path, monkeypatch):
+    cfg = FeedConfig(url="https://a", name="Pod")
+    item = FeedItem(
+        title="Ep One",
+        description="notes",
+        enclosure_url="https://a/ep.mp3",
+        published=datetime(2026, 3, 4, tzinfo=timezone.utc),
+    )
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    sends = _capture_sends(monkeypatch)
+    _real_downloads(monkeypatch, tmp_path)
+    pieces = tmp_path / "pieces"
+    pieces.mkdir()
+    for k in (1, 2):
+        (pieces / f"ep.part{k}.mp3").write_bytes(b"half")
+    _patch_split(monkeypatch, [str(pieces / "ep.part1.mp3"), str(pieces / "ep.part2.mp3")])
+
+    assert run_feeds("feeds.json") == 1
+
+    # Sent as its two parts…
+    assert [len(s["attachments"]) for s in sends] == [1, 1]
+    # …and kept as the one file it was.
+    assert _archived(media) == [os.path.join("pod", "2026-03-04-ep-one.mp3")]
+    with open(media / "pod" / "2026-03-04-ep-one.mp3", "rb") as fh:
+        assert fh.read() == b"the-bytes-of-https://a/ep.mp3"
+
+
+def test_run_steps_over_an_episode_too_big_even_in_parts(monkeypatch, capsys):
+    cfg = FeedConfig(url="https://a", name="Pod")
+    calls = _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
+    sends = _capture_sends(monkeypatch)
+    _fake_downloads(monkeypatch)
+
+    @contextmanager
+    def too_big(path, **kwargs):
+        raise VideoTooBig("File is too big to send: 500 MB is over 4 parts of 95 MB")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(run, "split_temp", too_big)
+
+    assert run_feeds("feeds.json") == 0
+    assert sends == []
+    assert "skipped: File is too big" in capsys.readouterr().err
+    assert calls["updated"][-1]["description"] != LONG_AGO
+
+
+def test_run_dry_run_reports_the_parts(monkeypatch, capsys):
+    cfg = FeedConfig(url="https://a", name="Arte")
+    item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+
+    class InParts(_FakePlan):
+        def describe(self):
+            return "360p, ~105 MB, in 2 parts"
+
+    monkeypatch.setattr(run, "resolve_video", lambda item: InParts())
+
+    run_feeds("feeds.json", dry_run=True)
+
+    assert "video: 360p, ~105 MB, in 2 parts" in capsys.readouterr().out

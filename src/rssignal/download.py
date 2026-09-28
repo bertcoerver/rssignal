@@ -53,12 +53,15 @@ def _suffix_for(url: str, default: str = ".mp3") -> str:
     return default
 
 
-def fetch_text(url: str, *, timeout: float = 30) -> str:
+def fetch_text(
+    url: str, *, timeout: float = 30, headers: dict[str, str] | None = None
+) -> str:
     """Fetch ``url`` and return its body decoded as UTF-8.
 
     For the small text resources that describe media rather than being it — an
     API response, an HLS playlist. Anything big enough to be worth streaming to
-    disk wants :func:`download_temp` instead.
+    disk wants :func:`download_temp` instead. ``headers`` are sent with the
+    request, for a site that wants to be asked in a particular way.
 
     Raises :class:`FeedError` if the fetch fails, so callers can treat a dead
     endpoint the same way they treat a dead feed. A fetch that fails for a
@@ -67,7 +70,7 @@ def fetch_text(url: str, *, timeout: float = 30) -> str:
 
     def once() -> str:
         try:
-            with urlopen(url, timeout=timeout) as response:
+            with urlopen(Request(url, headers=headers or {}), timeout=timeout) as response:
                 return response.read().decode("utf-8", errors="replace")
         except (URLError, OSError, ValueError) as exc:
             raise FeedError(f"Could not fetch {url!r}: {exc}") from exc

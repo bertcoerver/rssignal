@@ -1,10 +1,15 @@
-"""The half of a two-message item that has not gone out yet.
+"""The part of a several-message item that has not gone out yet.
 
 An episode with a preview card is two Signal messages, not one: Signal drops the
 card from any message carrying an attachment, so the text and its card go first
 and the voice note follows on its own (see :func:`rssignal.run._handle_item`).
-That is one item and two chances to fail, and the gap between them is the only
-place in a run where "sent" is neither true nor false.
+A file too big for one message is several more (see :mod:`rssignal.parts`).
+That is one item and several chances to fail, and the gaps between them are the
+only places in a run where "sent" is neither true nor false.
+
+Each message but the last is noted as it lands — the first under the item's own
+key, the rest under that key plus their position — and a later run skips the
+ones it finds noted (see :func:`rssignal.run._send_all`).
 
 What used to happen there: the card arrived, the voice note didn't, the item's
 watermark was rolled back so the episode wasn't lost — and the next run sent the

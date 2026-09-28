@@ -158,8 +158,9 @@ def test_pick_variant_takes_sharpest_that_fits():
 
     # Over 641s, with the margin applied: 360p is ~63 MB and fits the 95 MB
     # budget, 432p is ~98 MB and doesn't.
-    picked = arte._pick_variant(variants, DURATION, arte.VIDEO_MAX_BYTES, "id")
+    picked, parts = arte._pick_variant(variants, DURATION, arte.VIDEO_MAX_BYTES, "id")
     assert picked.resolution == "640x360"
+    assert parts == 1
     # Not the first rung in the playlist — the index has to come from the
     # chosen variant, not from the order the rungs happen to appear in.
     assert picked.index == 3
@@ -168,17 +169,36 @@ def test_pick_variant_takes_sharpest_that_fits():
 def test_pick_variant_drops_to_a_lower_rung_when_longer():
     variants = arte._variants(MASTER)
     # Twice as long, so only the smallest rung still fits.
-    picked = arte._pick_variant(variants, DURATION * 2, arte.VIDEO_MAX_BYTES, "id")
+    picked, parts = arte._pick_variant(variants, DURATION * 2, arte.VIDEO_MAX_BYTES, "id")
     assert picked.resolution == "384x216"
+    assert parts == 1
 
 
 def test_pick_variant_never_picks_h265():
     variants = arte._variants(MASTER)
     # A budget big enough for everything: the 1080p h264 must win over the
     # h265 rung of the same resolution.
-    picked = arte._pick_variant(variants, DURATION, 10**9, "id")
+    picked, _ = arte._pick_variant(variants, DURATION, 10**9, "id")
     assert picked.resolution == "1920x1080"
     assert picked.codecs.startswith("avc1")
+
+
+def test_pick_variant_splits_rather_than_skips_when_nothing_fits_whole():
+    variants = arte._variants(MASTER)
+    # Three times as long: even 216p (~112 MB) needs two parts, and 360p
+    # (~199 MB) doesn't fit in two, so two parts of 216p it is — not three
+    # parts of something sharper.
+    picked, parts = arte._pick_variant(variants, DURATION * 3, arte.VIDEO_MAX_BYTES, "id")
+    assert parts == 2
+    assert picked.resolution == "384x216"
+
+
+def test_pick_variant_takes_the_sharpest_rung_its_parts_allow():
+    variants = arte._variants(MASTER)
+    # Twice as long with a 70 MB budget: 216p (~75 MB) needs two parts, and
+    # two parts' 140 MB is room for 360p (~133 MB) but not 432p (~205 MB).
+    picked, parts = arte._pick_variant(variants, DURATION * 2, 70 * 1024 * 1024, "id")
+    assert (picked.resolution, parts) == ("640x360", 2)
 
 
 def test_pick_variant_raises_when_nothing_fits():
@@ -369,14 +389,14 @@ def test_video_temp_empty_output_raises(monkeypatch):
             pass
 
 
-def test_video_temp_oversize_output_raises(monkeypatch):
-    """The estimate can be wrong; the file that lands is what counts."""
+def test_video_temp_hands_an_oversize_output_on_for_splitting(monkeypatch):
+    """The estimate can be wrong; the file that lands is cut up, not refused."""
     _patch_fetch(monkeypatch)
     _patch_ffmpeg(monkeypatch, payload=b"x" * 2048)
+    plan = arte.resolve(_item())
 
-    with pytest.raises(FeedError, match="over the"):
-        with video_temp(_item(), max_bytes=1024):
-            pass
+    with video_temp(_item(), plan=plan, max_bytes=1024) as path:
+        assert os.path.getsize(path) == 2048
 
 
 def test_video_temp_timeout_raises(monkeypatch):

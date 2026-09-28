@@ -23,7 +23,8 @@ command-line tool, so messages come from your own linked Signal account.
   brew install qrencode
   ```
 - Optional, only for feeds whose items link to a video (see
-  [video items](#video-items)):
+  [video items](#video-items)), and for podcast episodes too big for one Signal
+  message (see [splitting](#quality-and-splitting-what-doesnt-fit)):
   ```bash
   brew install ffmpeg
   ```
@@ -152,7 +153,7 @@ Each feed entry supports:
 
 | Key                 | Required | Description                                                            |
 | ------------------- | -------- | ---------------------------------------------------------------------- |
-| `url`               | yes      | The RSS/Atom feed URL, or an ARTE collection page, or a YouTube channel. See [video items](#video-items). |
+| `url`               | yes      | The RSS/Atom feed URL, or an ARTE collection page, an NPO Start series, or a YouTube channel. See [video items](#video-items). |
 | `name`              | yes      | The Signal group this feed sends to. Also `{feed_name}` in templates.  |
 | `message_template`  | no       | Message text with `{field}` placeholders. Omit for the built-in layout. |
 | `extract`           | no       | Define new fields by regex against existing ones. See below.           |
@@ -181,13 +182,14 @@ about the card, `link_preview` overrides it either way.
 ### Video items
 
 Some feeds are about video but carry none: the item links to a player page and the
-video lives somewhere else entirely. rssignal recognises two kinds of link and
+video lives somewhere else entirely. rssignal recognises three kinds of link and
 attaches the video to the message — **ARTE** programmes
-(`https://www.arte.tv/<lang>/videos/<programme-id>/…`) and **YouTube** videos
+(`https://www.arte.tv/<lang>/videos/<programme-id>/…`), **NPO Start** episodes
+(`https://npo.nl/start/afspelen/<episode>`) and **YouTube** videos
 (`watch?v=…`, `youtu.be/…`, `/shorts/…`). Nothing to configure; the link in the
 item is enough.
 
-Both can also be followed without finding a feed first.
+All three can also be followed without finding a feed first.
 
 #### ARTE
 
@@ -213,6 +215,47 @@ rssignal looks up the newest dozen individually and leaves the rest undated, so
 they are never sent. That is deliberate — a new group shouldn't open with a hundred
 videos — and it costs a handful of small requests per run rather than one per
 episode.
+
+#### NPO Start (via Downloadgemist)
+
+NPO publishes no RSS for its television either. Point `url` at a series:
+
+```json
+{
+  "name": "Bureau Buitenland",
+  "url": "https://npo.nl/start/serie/bureau-buitenland/afleveringen"
+}
+```
+
+The episodes come from the series page itself, which carries each one's title,
+synopsis, artwork, length and first broadcast — one request per run, to npo.nl.
+That url follows the **newest season**: when season 3 starts, the feed moves on
+with it. To stay on one season, name it:
+`…/bureau-buitenland/afleveringen/seizoen-2`.
+
+The video is fetched through [downloadgemist.nl](https://downloadgemist.nl), which
+knows how to get it out of NPO's player. It is a free, hobby-run site, so rssignal
+asks it for as little as it can:
+
+- **Only for a new episode.** Following the series never touches Downloadgemist;
+  sending an episode costs a handful of small requests and one download.
+- **The site's own pause.** Its page makes you wait as long as an episode lasts
+  before the next download, and so does rssignal — a second new episode waits for
+  a later run rather than going straight after the first.
+- **Backing off.** An episode that fails is left alone for an hour, then two, then
+  four, up to a day, without a single request in between. One that has failed for
+  three days is given up on, so it can't hold its feed's later episodes back.
+- **Dry runs only look.** `--dry-run` asks what qualities there are, which is how
+  it can tell you the size — never for the file itself.
+
+A 25-minute episode is about 105 MB at the lowest quality on offer, which is over
+Signal's limit, so it arrives [in two parts](#quality-and-splitting-what-doesnt-fit):
+
+```bash
+rssignal run --dry-run
+# [Bureau Buitenland] -> group:Bureau Buitenland=: 26.000 sancties tegen Rusland, …
+#     video: 360p, ~105 MB, in 2 parts
+```
 
 #### YouTube
 
@@ -301,19 +344,31 @@ Use a throwaway Google account rather than your own: the cookies are a live
 session, so the file is a credential — keep it out of the repo, and expect to
 refresh it every few months when the session expires.
 
-#### Quality, and what happens when it doesn't fit
+#### Quality, and splitting what doesn't fit
 
-This needs **ffmpeg** on your PATH (`brew install ffmpeg`). Only video feeds do, so
-it stays optional — `rssignal doctor` reports whether it and yt-dlp are there
-without failing.
+This needs **ffmpeg** on your PATH (`brew install ffmpeg`). Only video feeds, and
+podcasts with very long episodes, do — so it stays optional, and `rssignal doctor`
+reports whether it and yt-dlp are there without failing.
 
-Both sources offer the same video at several qualities and Signal refuses an
-attachment over 100 MB, so rssignal picks the sharpest one it expects to fit,
-from the reported file sizes where there are any and from bitrate times duration
-where there aren't. A ten-minute ARTE episode typically arrives at 640x360, a
-ten-minute YouTube video at 720p, and a long one a rung or two lower. Streams are
-copied, never re-encoded, so this costs bandwidth and seconds rather than minutes
-of CPU. Check what an item would arrive at before sending anything:
+Every source offers the same video at several qualities, and Signal refuses an
+attachment over 100 MB. rssignal's rule, for every source:
+
+> **The fewest messages possible, then the best quality that fits in that many.**
+
+So a video that fits one message arrives as one, at the sharpest quality that
+fits — a ten-minute ARTE episode typically at 640x360, a ten-minute YouTube video
+at 720p. One whose smallest quality is, say, 105 MB goes out in two parts, and
+within those two parts' 190 MB it goes up to the sharpest quality that still fits —
+not three parts at 1080p. Sizes come from the reported file sizes where there are
+any and from bitrate times duration where there aren't; how many parts a file
+really becomes is decided once it has downloaded, from its actual size, so an
+estimate that ran low costs a part rather than the episode.
+
+Nothing is re-encoded. Streams are copied, and splitting is a copy too, cut at
+equal lengths on the nearest keyframe — seconds of work, not the half hour a
+Raspberry Pi would spend re-encoding. Each part after the first is captioned with
+where it falls, `Title (2/3)`. Check what an item would arrive at before sending
+anything:
 
 ```bash
 rssignal run --dry-run
@@ -321,19 +376,26 @@ rssignal run --dry-run
 #     video: 640x360, ~63 MB
 ```
 
+Podcasts follow the same rule with nothing to choose: an episode over 95 MB is
+cut into as many voice notes as it needs, after the preview card.
+
 If the video can't be had — expired rights, ffmpeg or yt-dlp missing, YouTube
 asking for a login — nothing goes out at all. A video item is its video, so the run
 reports the failure and leaves the item where it is: the watermark rolls back, the
 pace clock with it, and the next run tries the same item again. A feed whose source
 stays broken therefore stays put rather than quietly filling the group with links.
+A failure *between* parts is the same, except that the next run sends only the
+parts that didn't arrive.
 
-The exception is a video too long for any quality to fit, which is the one failure
-that won't read differently tomorrow. That one is stepped over like a Short —
-nothing sent, watermark and all — so it doesn't block the items behind it. Expect
-it for anything much over half an hour: 95 MB is 95 MB.
+The exception is something too big even for four parts (about 380 MB), which is
+the one failure that won't read differently tomorrow. That one is stepped over like
+a Short — nothing sent, watermark and all — so it doesn't block the items behind
+it.
 
-Unlike a voice note, a video goes out as a single message: these items get no
-preview card by default, so there's nothing for the attachment to displace.
+Unlike a voice note, a video that fits one message goes out as a single message:
+these items get no preview card by default, so there's nothing for the attachment
+to displace. The [media archive](addon/DOCS.md#the-media-archive), when it is on,
+keeps the whole file rather than its parts.
 
 ### Episodic feeds
 

@@ -22,10 +22,16 @@ reports the failure, the watermark and the pace clock roll back together, and
 the next run tries the same item again rather than leaving a bare link behind as
 the only trace of it.
 
+Media too big for one Signal message — video or audio — goes out as the fewest
+parts that each fit, one message per part (see :mod:`rssignal.parts`); every
+part after the first is captioned ``Title (k/N)``. More messages are more places
+to be interrupted, and :mod:`rssignal.pending` finishes an item that was, rather
+than repeating what already arrived.
+
 Two answers are permanent, and those do send nothing and stay sent-nothing,
 watermark and all, so they are not reconsidered every run: a video too short to
-be worth a message (a YouTube Short) and one no quality of which fits inside
-Signal's size limit.
+be worth a message (a YouTube Short) and one too big even split into
+:data:`~rssignal.parts.MAX_PARTS` parts.
 
 Each feed sends to a Signal group named after it, created on the first send if it
 doesn't exist yet — see :class:`_GroupResolver`.
@@ -62,6 +68,7 @@ from typing import Iterator
 
 from . import archive, artwork, cache, pending, timing
 from .download import download_temp
+from .parts import split_temp
 from .episodic import allowance, next_release
 from .errorlog import log_exception, log_line
 from .feeds import (
@@ -1046,17 +1053,24 @@ def _handle_item(
         # the same item again.
 
     with ExitStack() as stack:
-        attachments = None
+        # The whole file, as downloaded: what the archive keeps.
+        full = None
         if is_podcast:
-            attachments = [stack.enter_context(download_temp(item.enclosure_url))]
+            full = stack.enter_context(download_temp(item.enclosure_url))
         elif is_video:
+            full = stack.enter_context(video_temp(item, plan=plan))
+
+        # What Signal gets: the file itself, or — when it is over the limit — as
+        # few parts as will each fit. See :mod:`rssignal.parts`.
+        pieces: list[str] = []
+        if full is not None:
             try:
-                attachments = [stack.enter_context(video_temp(item, plan=plan))]
+                pieces = stack.enter_context(split_temp(full))
             except VideoTooBig as exc:
-                # The estimate was optimistic and the file that arrived is over
-                # the limit — which it would be again next run. Same answer as a
-                # video that never had a fitting quality: nothing goes out, and
-                # the item isn't reconsidered.
+                # Too big for even the most parts rssignal will send — which it
+                # would be again next run. Same answer as a video that never had
+                # a fitting quality: nothing goes out, and the item isn't
+                # reconsidered.
                 print(f"[{label}] skipped: {exc}", file=sys.stderr)
                 log_line(f"[{label}] skipped: {exc}")
                 return False
@@ -1070,59 +1084,132 @@ def _handle_item(
                 image=_local_image(card["image_url"], stack, label),
             )
 
-        if attachments and preview:
-            # Signal drops the preview card when the same message carries an
-            # attachment, so the card and the audio go out separately: the text
-            # and card first, then the voice note on its own.
-            #
-            # Two messages is two chances to fail, and a failure between them is
-            # the one moment in a run where an item is neither sent nor unsent.
-            # The card is noted as owed the instant it lands, so if the voice
-            # note never follows — the watermark rolls back and the item comes
-            # round again — this run sends what is actually missing instead of
-            # posting a second copy of the card. See :mod:`rssignal.pending`.
-            key = pending.item_key(recipient, item)
-            if not pending.owed(key):
-                send_msg(text, recipient=recipient, preview=preview)
-                pending.remember(key)
-            else:
-                print(
-                    f"[{label}] {item.title!r}: card already sent, sending only "
-                    "the voice note.",
-                    file=sys.stderr,
-                )
-            send_msg(
-                # The title, not an empty body. A chat-list row shows the
-                # message's own text, falling back to a bare "Voice Message"
-                # when there is none — and the voice note is the last message
-                # in the group, so that fallback is what the list would show
-                # for the whole feed. The title is repeated from the card
-                # above it, which is a small price for a legible chat list.
-                item.title,
-                recipient=recipient,
-                attachments=attachments,
-                voice_note=True,
-            )
-            pending.forget(key)
-        else:
-            send_msg(
-                text,
-                recipient=recipient,
-                attachments=attachments,
-                voice_note=is_podcast,
-                preview=preview,
-            )
+        _send_all(
+            _messages(item, text, pieces, preview, voice_note=is_podcast),
+            recipient=recipient,
+            item=item,
+            label=label,
+        )
 
         # Still inside the ExitStack, because this links the file rather than
         # copying it and the temporary name has to still be there to link from.
         # After the send, not before: an item that failed to go out will come
         # round again next run, and an archive of things nobody received would
         # be a confusing thing to browse. Only the media itself — the preview
-        # image from `_local_image` is furniture, not content.
-        if attachments:
-            for path in attachments:
-                archive.keep(path, feed=label, item=item)
+        # image from `_local_image` is furniture, not content — and the whole of
+        # it, not the parts it was cut into for Signal's sake.
+        if full is not None:
+            archive.keep(full, feed=label, item=item)
     return True
+
+
+@dataclass(frozen=True)
+class _Message:
+    """One Signal message of an item: its body, and what goes with it."""
+
+    text: str
+    attachments: list[str] | None = None
+    voice_note: bool = False
+    preview: LinkPreview | None = None
+
+
+def _messages(
+    item: FeedItem,
+    text: str,
+    pieces: list[str],
+    preview: LinkPreview | None,
+    *,
+    voice_note: bool,
+) -> list[_Message]:
+    """The messages ``item`` goes out as, in order.
+
+    Text alone is one message. Media is one message per piece, and a preview
+    card is a message of its own ahead of them: Signal drops the card from any
+    message carrying an attachment.
+
+    Every piece after the first says which one it is, ``"Title (2/3)"``, so a
+    chat list reads as one episode arriving rather than several. After a card,
+    even the first piece carries the title rather than an empty body: a
+    chat-list row shows the message's own text, falling back to a bare "Voice
+    Message" when there is none — and the last message is what the list shows
+    for the whole feed. The title is repeated from the card above it, which is a
+    small price for a legible chat list.
+    """
+    total = len(pieces)
+    if not pieces:
+        return [_Message(text, voice_note=voice_note, preview=preview)]
+
+    def caption(k: int) -> str:
+        return item.title if total == 1 else f"{item.title} ({k}/{total})"
+
+    rest = [
+        _Message(caption(k), [piece], voice_note)
+        for k, piece in enumerate(pieces, start=1)
+    ]
+    if preview is not None:
+        return [_Message(text, preview=preview), *rest]
+    # No card, so the first piece travels with the text itself.
+    return [_Message(text, [pieces[0]], voice_note), *rest[1:]]
+
+
+def _send_all(
+    messages: list[_Message], *, recipient: str, item: FeedItem, label: str
+) -> None:
+    """Send ``messages`` in order, never sending one twice across retries.
+
+    More than one message is more than one chance to fail, and a failure between
+    them is the one moment in a run where an item is neither sent nor unsent.
+    Each message but the last is noted as sent the instant it lands, so if a
+    later one never follows — the watermark rolls back and the item comes round
+    again — the next run sends only what is actually missing instead of posting
+    a second copy of the rest. See :mod:`rssignal.pending`.
+
+    The first message's note is the item's own key, the one it has always had,
+    so a card owed from before an upgrade is still recognised. The others carry
+    their position and the total: a retry that splits the file differently has
+    different pieces to send, and must not mistake them for the old ones.
+    """
+    if len(messages) == 1:
+        only = messages[0]
+        send_msg(
+            only.text,
+            recipient=recipient,
+            attachments=only.attachments,
+            voice_note=only.voice_note,
+            preview=only.preview,
+        )
+        return
+
+    key = pending.item_key(recipient, item)
+    total = len(messages)
+    keys = [key] + [f"{key}\n{k}/{total}" for k in range(2, total + 1)]
+
+    for k, (message, note) in enumerate(zip(messages, keys), start=1):
+        last = k == total
+        if not last and pending.owed(note):
+            what = (
+                "card"
+                if message.preview and not message.attachments
+                else f"message {k}/{total}"
+            )
+            print(
+                f"[{label}] {item.title!r}: {what} already sent, sending only "
+                "the rest.",
+                file=sys.stderr,
+            )
+            continue
+        send_msg(
+            message.text,
+            recipient=recipient,
+            attachments=message.attachments,
+            voice_note=message.voice_note,
+            preview=message.preview,
+        )
+        if not last:
+            pending.remember(note)
+
+    for note in keys:
+        pending.forget(note)
 
 
 def _local_image(

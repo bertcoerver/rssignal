@@ -127,13 +127,12 @@ def test_video_temp_cleans_up_when_sending_fails():
     assert not os.path.exists(plan.into)
 
 
-def test_video_temp_rejects_a_file_over_the_limit():
-    """The estimate can be wrong; the file that lands is what counts."""
+def test_video_temp_hands_a_file_over_the_limit_on_for_splitting():
+    """Over the limit is rssignal.parts' problem now, not a refusal."""
     plan = FakePlan(payload=b"x" * 2048)
 
-    with pytest.raises(FeedError, match="over the"):
-        with video_temp(_item(), plan=plan, max_bytes=1024):
-            pass
+    with video_temp(_item(), plan=plan, max_bytes=1024) as path:
+        assert os.path.getsize(path) == 2048
 
     assert not os.path.exists(plan.into)
 

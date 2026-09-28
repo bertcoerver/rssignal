@@ -7,6 +7,7 @@ test keeps that from happening whether or not the test cares about logging.
 """
 
 import tempfile
+from contextlib import contextmanager
 
 import pytest
 
@@ -147,3 +148,22 @@ def source_reachable(monkeypatch):
     blocked path override this with ``lambda url, **kw: False``.
     """
     monkeypatch.setattr(download, "reachable", lambda url, **kwargs: True)
+
+
+@pytest.fixture(autouse=True)
+def no_splitting(monkeypatch):
+    """Hand every downloaded file to the send as one piece, unmeasured.
+
+    :func:`rssignal.parts.split_temp` reads the file's size to decide whether to
+    cut it, and most run tests download nothing at all — they hand
+    ``_handle_item`` a made-up path like ``/tmp/fake-ep.mp3``. Splitting is
+    covered in tests/test_parts.py; run tests about it put the real one back
+    with ``monkeypatch.setattr(run, "split_temp", parts.split_temp)`` or a fake
+    of their own.
+    """
+
+    @contextmanager
+    def whole(path, **kwargs):
+        yield [path]
+
+    monkeypatch.setattr(run, "split_temp", whole)
