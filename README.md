@@ -248,8 +248,11 @@ asks it for as little as it can:
 - **Dry runs only look.** `--dry-run` asks what qualities there are, which is how
   it can tell you the size — never for the file itself.
 
-A 25-minute episode is about 105 MB at the lowest quality on offer, which is over
-Signal's limit, so it arrives [in two parts](#quality-and-splitting-what-doesnt-fit):
+A 25-minute episode is about 120 MB at the lowest quality on offer, which is over
+Signal's limit — but 256 kbps of that is sound, so it has its
+[soundtrack slimmed](#quality-and-splitting-what-doesnt-fit) rather than being cut
+in two, and arrives as one message of about 91 MB. The dry run sizes the download
+from the bitrates Downloadgemist lists, before any of that, so it still counts two:
 
 ```bash
 rssignal run --dry-run
@@ -364,11 +367,19 @@ any and from bitrate times duration where there aren't; how many parts a file
 really becomes is decided once it has downloaded, from its actual size, so an
 estimate that ran low costs a part rather than the episode.
 
-Nothing is re-encoded. Streams are copied, and splitting is a copy too, cut at
-equal lengths on the nearest keyframe — seconds of work, not the half hour a
-Raspberry Pi would spend re-encoding. Each part after the first is captioned with
-where it falls, `Title (2/3)`. Check what an item would arrive at before sending
-anything:
+The picture is never re-encoded. Streams are copied, and splitting is a copy too,
+cut at equal lengths on the nearest keyframe — seconds of work, not the half hour
+a Raspberry Pi would spend re-encoding. Each part after the first is captioned
+with where it falls, `Title (2/3)`.
+
+The sound is the one thing that is re-encoded, and only when that alone saves a
+message. Sound is quick to encode where picture is not, and in a lean video it is
+a good share of the file — so a video that landed a little over the limit has its
+soundtrack brought down to 96 kbps AAC, or to 64 if it takes that, and arrives
+whole. One that would need as many messages either way is left exactly as it
+came, and so is every podcast: an episode is its sound.
+
+Check what an item would arrive at before sending anything:
 
 ```bash
 rssignal run --dry-run
@@ -895,6 +906,59 @@ partway is cleared by the next run's expiry pass.
 Only the media itself is kept — the preview card's image is furniture, not
 content. Nothing is archived until after the item has actually been sent, so the
 folder is a record of what arrived rather than of what was attempted.
+
+**A video is filed with its description.** A slug is enough for a file listing
+and not much to look at on a television, so each archived video gets two small
+files beside it, under its own name:
+
+```
+/media/rssignal/le-dessous-des-images/2026-07-23-la-bataille-du-drapeau.mp4
+/media/rssignal/le-dessous-des-images/2026-07-23-la-bataille-du-drapeau.xml
+/media/rssignal/le-dessous-des-images/2026-07-23-la-bataille-du-drapeau.jpg
+```
+
+The `.xml` holds the title, synopsis, date and genres as the source gave them,
+in the format [Infuse](https://support.firecore.com/hc/en-us/articles/4405042929559-Overriding-Artwork-and-Metadata)
+reads for a video it can't look up; the `.jpg` is the episode's own picture.
+Share the folder over SMB, add it to Infuse, and the feed's folder shows each
+episode with its still and its real title instead of a file name. They expire
+together with the video. Audio gets neither: nothing that plays a podcast from
+a folder reads them.
+
+**An episode of a series is filed as one.** A source that says which episode of
+which season an item is — NPO does — gets the layout a media server builds a
+series from, instead of the dated one:
+
+```
+/media/rssignal/bureau-buitenland/tvshow.nfo
+/media/rssignal/bureau-buitenland/poster.jpg
+/media/rssignal/bureau-buitenland/fanart.jpg
+/media/rssignal/bureau-buitenland/Season 02/bureau-buitenland-s02e28.mp4
+/media/rssignal/bureau-buitenland/Season 02/bureau-buitenland-s02e28.nfo
+/media/rssignal/bureau-buitenland/Season 02/bureau-buitenland-s02e28.xml
+/media/rssignal/bureau-buitenland/Season 02/bureau-buitenland-s02e28.jpg
+```
+
+The two `.nfo` files are the Kodi kind, which [Jellyfin](https://jellyfin.org)
+and [Emby](https://emby.media) read: the episode's says its season, number,
+title, synopsis, air date, length, genres and broadcaster, and `tvshow.nfo` names
+and describes the series. Both are marked locked, so the server takes them as
+they are rather than searching online for a series of that name — a daily
+broadcast is in no database, and the nearest match is someone else's programme.
+Point a server's TV library at the folder and the feed appears as a series with
+seasons; Infuse, connected to that server instead of to the share, shows the
+same.
+
+This is the only way to get seasons into Infuse for such a show. On its own it
+builds a series only out of what it finds on TMDB, and its `.xml` has no word
+for a season or an episode — so the number lives in the `.nfo`, and the `.xml`
+is still written for browsing the share directly.
+
+`poster.jpg` and `fanart.jpg` are both the series' own artwork, fetched once.
+That picture is as wide as a television and a poster is meant to be tall, so
+replace `poster.jpg` with a better one if you have it: a picture that is already
+there is never overwritten. An episode sent a second time replaces its file
+rather than gaining a `-2`, which a server would read as another episode.
 
 Unset, none of this happens and nothing changes. The directory is as disposable
 as the cache: rssignal still keeps no local state that decides what gets sent.

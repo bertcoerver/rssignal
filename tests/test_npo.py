@@ -34,6 +34,16 @@ PROGRAMS = [
         "firstBroadcastDate": 1790537400,
         "publishedDateTime": 1790537400,
         "images": [{"url": "https://assets/825.jpg", "role": "default"}],
+        "programKey": "28",
+        "season": {"slug": "seizoen-2", "seasonKey": "2"},
+        "broadcasters": [{"name": "VPRO"}],
+        "genres": [
+            {
+                "name": "Informatief",
+                "type": "primary",
+                "secondaries": [{"name": "Nieuws/actualiteiten"}],
+            }
+        ],
     },
     {
         "title": "China heeft hele andere belangen in de AI-wedloop",
@@ -149,11 +159,19 @@ def test_parse_reads_every_episode_of_the_season(monkeypatch):
     assert first.extra["id"] == "VPWON_1365951"
     assert first.extra["duration_seconds"] == "1540"
     assert first.extra["show_title"] == "Bureau Buitenland"
+    # Its place in the series, and what kind of programme it is: what the
+    # archive needs to file it as one.
+    assert (first.extra["season"], first.extra["episode"]) == ("2", "28")
+    assert first.categories == ("Informatief", "Nieuws/actualiteiten")
+    assert first.author == "VPRO"
 
     # No long synopsis, no first broadcast: the fallbacks.
     assert second.description == "Alleen kort."
     assert second.published == datetime.fromtimestamp(1789932300, tz=timezone.utc)
     assert second.image_url is None
+    # And an episode the page doesn't number is simply not numbered.
+    assert "season" not in second.extra and "episode" not in second.extra
+    assert (second.categories, second.author) == ((), None)
 
 
 def test_parse_is_what_the_feed_reader_uses_for_a_series(monkeypatch):
@@ -253,6 +271,18 @@ def test_resolve_takes_the_best_rung_when_one_message_is_enough(monkeypatch):
     plan = npo.resolve(item)
 
     assert (plan.rung.label, plan.parts) == ("480p", 1)
+
+
+def test_resolve_passes_over_a_rung_without_a_bitrate(monkeypatch):
+    # As Downloadgemist really lists it: a second 720p, bitrate 0. Sized by
+    # that it would be the smallest rung of all, and the 317 MB it is arrives
+    # in four parts.
+    rungs = [("720p_2", 0), ("720p", 2414455), ("480p", 991167), ("360p", 400171)]
+    _patch_streams(monkeypatch, _lookup(duration=1524.0, rungs=rungs))
+
+    plan = npo.resolve(FeedItem(title="t", description="", link=EPISODE_LINK))
+
+    assert (plan.rung.label, plan.parts) == ("360p", 2)
 
 
 def test_resolve_never_picks_audio_only(monkeypatch):

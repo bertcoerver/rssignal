@@ -3,6 +3,7 @@
 import os
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
 import pytest
@@ -128,6 +129,297 @@ def test_keep_swallows_errors_and_reports_none(media, tmp_path, monkeypatch, err
 def test_keep_preserves_the_extension_it_was_given(media, tmp_path):
     dest = archive.keep(_source(tmp_path, "v.mp4"), feed="S", item=_item())
     assert dest.endswith(".mp4")
+
+
+# --- an episode of a series -------------------------------------------------
+
+
+def _episode(season="2", episode="28", **fields):
+    """An item that knows its place in a series, as NPO's do."""
+    extra = {"show_title": "Bureau Buitenland", "duration_seconds": "1540"}
+    if season is not None:
+        extra["season"] = season
+    if episode is not None:
+        extra["episode"] = episode
+    return FeedItem(
+        title=fields.pop("title", "26.000 sancties tegen Rusland"),
+        description=fields.pop("description", "Hoe doen ze dat?"),
+        published=datetime(2026, 9, 27, 19, 30, tzinfo=timezone.utc),
+        author="VPRO",
+        categories=("Informatief", "Nieuws/actualiteiten"),
+        feed_name="Bureau Buitenland",
+        extra=extra,
+        **fields,
+    )
+
+
+@pytest.mark.parametrize(
+    "season, episode, expected",
+    [
+        ("2", "28", (2, 28)),
+        ("0", "3", (0, 3)),  # specials
+        (None, "28", None),
+        ("2", None, None),
+        ("two", "28", None),
+        ("2", "-1", None),
+    ],
+)
+def test_numbered(season, episode, expected):
+    assert archive.numbered(_episode(season, episode)) == expected
+
+
+def test_keep_files_a_numbered_episode_as_part_of_a_series(media, tmp_path):
+    dest = archive.keep(
+        _source(tmp_path, "v.mp4"), feed="Bureau Buitenland", item=_episode()
+    )
+
+    # Spelled the way a media server looks for it, and nothing after the number:
+    # this title, slugged on, would read as episodes 28 to 26.
+    assert os.path.relpath(dest, media) == os.path.join(
+        "bureau-buitenland", "Season 02", "bureau-buitenland-s02e28.mp4"
+    )
+
+
+def test_keep_pads_numbers_without_cutting_long_ones(media, tmp_path):
+    dest = archive.keep(
+        _source(tmp_path, "v.mp4"), feed="Show", item=_episode("12", "345")
+    )
+    assert os.path.relpath(dest, media) == os.path.join(
+        "show", "Season 12", "show-s12e345.mp4"
+    )
+
+
+def test_keep_replaces_a_numbered_episode_sent_again(media, tmp_path):
+    first = archive.keep(_source(tmp_path, "a.mp4", b"one"), feed="S", item=_episode())
+    second = archive.keep(_source(tmp_path, "b.mp4", b"two"), feed="S", item=_episode())
+
+    # One episode, one file: a `-2` would be a second episode to anything
+    # reading the folder.
+    assert first == second
+    assert os.listdir(os.path.dirname(second)) == ["s-s02e28.mp4"]
+    with open(second, "rb") as fh:
+        assert fh.read() == b"two"
+
+
+def test_describe_shows_the_series_layout(media):
+    assert archive.describe(_episode(), feed="Bureau Buitenland") == str(
+        media / "bureau-buitenland" / "Season 02" / "bureau-buitenland-s02e28.*"
+    )
+
+
+def _kept_episode(tmp_path, item=None, feed="Bureau Buitenland"):
+    item = item or _episode()
+    # A source of its own per episode: two links to one file share its date.
+    season, episode = archive.numbered(item)
+    source = _source(tmp_path, f"v{season}-{episode}.mp4", b"video")
+    return item, archive.keep(source, feed=feed, item=item)
+
+
+def test_annotate_writes_an_nfo_that_says_which_episode_it_is(media, tmp_path):
+    item, dest = _kept_episode(tmp_path)
+    archive.annotate(dest, item)
+
+    root = ET.parse(dest.removesuffix(".mp4") + ".nfo").getroot()
+    assert root.tag == "episodedetails"
+    assert {child.tag: child.text for child in root if child.tag != "genre"} == {
+        "title": "26.000 sancties tegen Rusland",
+        "showtitle": "Bureau Buitenland",
+        "season": "2",
+        "episode": "28",
+        "plot": "Hoe doen ze dat?",
+        "aired": "2026-09-27",
+        "runtime": "26",
+        "studio": "VPRO",
+        # Or a media server goes looking for a series of this name online.
+        "lockdata": "true",
+    }
+    assert [g.text for g in root.findall("genre")] == [
+        "Informatief",
+        "Nieuws/actualiteiten",
+    ]
+
+
+def test_annotate_still_writes_infuses_xml_for_a_numbered_episode(media, tmp_path):
+    item, dest = _kept_episode(tmp_path)
+    archive.annotate(dest, item)
+
+    root = ET.parse(dest.removesuffix(".mp4") + ".xml").getroot()
+    assert root.findtext("title") == "26.000 sancties tegen Rusland"
+    assert [g.text for g in root.findall("genres/genre")] == [
+        "Informatief",
+        "Nieuws/actualiteiten",
+    ]
+
+
+def test_annotate_writes_no_nfo_for_a_video_with_no_place_in_a_series(media, tmp_path):
+    dest = _described(tmp_path)
+    assert not os.path.exists(dest.removesuffix(".mp4") + ".nfo")
+
+
+def _show_files(media):
+    show = media / "bureau-buitenland"
+    return sorted(p.name for p in show.iterdir() if p.is_file())
+
+
+def test_annotate_show_describes_the_series_above_its_seasons(media, tmp_path):
+    item, dest = _kept_episode(tmp_path)
+    art = _source(tmp_path, "tmpabc.jpg", b"artwork")
+
+    archive.annotate_show(
+        dest, item, description="De wereldpolitiek.", fetch_image=lambda: art
+    )
+
+    assert _show_files(media) == ["fanart.jpg", "poster.jpg", "tvshow.nfo"]
+    root = ET.parse(media / "bureau-buitenland" / "tvshow.nfo").getroot()
+    assert root.tag == "tvshow"
+    assert root.findtext("title") == "Bureau Buitenland"
+    assert root.findtext("plot") == "De wereldpolitiek."
+    assert root.findtext("studio") == "VPRO"
+    assert root.findtext("lockdata") == "true"
+    for name in ("poster.jpg", "fanart.jpg"):
+        with open(media / "bureau-buitenland" / name, "rb") as fh:
+            assert fh.read() == b"artwork"
+
+
+def test_annotate_show_names_the_series_after_the_feed_when_it_must(media, tmp_path):
+    item = _episode()
+    del item.extra["show_title"]
+    item, dest = _kept_episode(tmp_path, item)
+
+    archive.annotate_show(dest, item)
+
+    root = ET.parse(media / "bureau-buitenland" / "tvshow.nfo").getroot()
+    assert root.findtext("title") == "Bureau Buitenland"
+
+
+def test_annotate_show_fetches_no_picture_it_already_has(media, tmp_path):
+    item, dest = _kept_episode(tmp_path)
+    art = _source(tmp_path, "tmpabc.jpg", b"artwork")
+    archive.annotate_show(dest, item, fetch_image=lambda: art)
+    # Somebody has since put a proper, tall poster there by hand.
+    poster = media / "bureau-buitenland" / "poster.jpg"
+    poster.unlink()
+    (media / "bureau-buitenland" / "poster.png").write_bytes(b"by hand")
+    _aged(media / "bureau-buitenland" / "poster.png", 10)
+
+    def no_fetch():
+        raise AssertionError("fetched a picture the series already has")
+
+    archive.annotate_show(dest, item, fetch_image=no_fetch)
+
+    assert _show_files(media) == ["fanart.jpg", "poster.png", "tvshow.nfo"]
+    assert (media / "bureau-buitenland" / "poster.png").read_bytes() == b"by hand"
+    # And dated afresh, so it lasts as long as the episode just archived.
+    assert time.time() - os.path.getmtime(media / "bureau-buitenland" / "poster.png") < 60
+
+
+def test_annotate_show_fills_in_only_the_picture_that_is_missing(media, tmp_path):
+    item, dest = _kept_episode(tmp_path)
+    (media / "bureau-buitenland" / "poster.jpg").write_bytes(b"by hand")
+
+    art = _source(tmp_path, "tmpabc.jpg", b"artwork")
+    archive.annotate_show(dest, item, fetch_image=lambda: art)
+
+    assert (media / "bureau-buitenland" / "poster.jpg").read_bytes() == b"by hand"
+    assert (media / "bureau-buitenland" / "fanart.jpg").read_bytes() == b"artwork"
+
+
+def test_annotate_show_is_only_for_an_episode_of_a_series(media, tmp_path):
+    item = _item()
+    dest = archive.keep(_source(tmp_path, "v.mp4"), feed="Show", item=item)
+
+    archive.annotate_show(dest, item, description="d", fetch_image=lambda: "")
+
+    assert _archived_names(media) == [os.path.join("show", "2026-03-04-episode-one.mp4")]
+
+
+def _archived_names(root):
+    return sorted(
+        os.path.relpath(os.path.join(dirpath, name), root)
+        for dirpath, _dirs, files in os.walk(root)
+        for name in files
+    )
+
+
+# --- describing a video to a player -----------------------------------------
+
+
+def _described(tmp_path, **fields):
+    """Archive a video and annotate it, returning the archived path."""
+    item = FeedItem(
+        title=fields.pop("title", "Episode One"),
+        description=fields.pop("description", "What happens in it."),
+        published=fields.pop("published", datetime(2026, 3, 4, tzinfo=timezone.utc)),
+    )
+    dest = archive.keep(_source(tmp_path, "v.mp4", b"video"), feed="Show", item=item)
+    archive.annotate(dest, item, **fields)
+    return dest
+
+
+def test_annotate_writes_the_metadata_a_player_reads(media, tmp_path):
+    dest = _described(tmp_path)
+
+    root = ET.parse(dest.removesuffix(".mp4") + ".xml").getroot()
+    # Infuse's own format, and "Other" rather than "Movie": it is not a film,
+    # and should not be looked up as one.
+    assert (root.tag, root.attrib) == ("media", {"type": "Other"})
+    assert root.findtext("title") == "Episode One"
+    assert root.findtext("description") == "What happens in it."
+    assert root.findtext("published") == "2026-03-04"
+
+
+def test_annotate_escapes_what_xml_would_trip_over(media, tmp_path):
+    dest = _described(
+        tmp_path, title="Tom & Jerry <live>", description="Ça \"marche\"\x0b, non ?"
+    )
+
+    root = ET.parse(dest.removesuffix(".mp4") + ".xml").getroot()
+    assert root.findtext("title") == "Tom & Jerry <live>"
+    # A vertical tab cannot be written in XML at all; the file has to parse.
+    assert root.findtext("description") == 'Ça "marche", non ?'
+
+
+def test_annotate_leaves_out_what_the_item_does_not_have(media, tmp_path):
+    dest = _described(tmp_path, description="", published=None)
+
+    root = ET.parse(dest.removesuffix(".mp4") + ".xml").getroot()
+    assert [child.tag for child in root] == ["title"]
+
+
+def test_annotate_puts_the_picture_under_the_videos_name(media, tmp_path):
+    still = _source(tmp_path, "tmpabc.JPG", b"a still")
+    dest = _described(tmp_path, image=still)
+
+    picture = dest.removesuffix(".mp4") + ".jpg"
+    with open(picture, "rb") as fh:
+        assert fh.read() == b"a still"
+    # Linked, like the video: the temporary name can go and this one stays.
+    assert os.stat(picture).st_ino == os.stat(still).st_ino
+
+
+@pytest.mark.parametrize("image", ["", "still.webp", "still"])
+def test_annotate_without_a_usable_picture_still_writes_the_metadata(
+    media, tmp_path, image
+):
+    if image:
+        image = _source(tmp_path, image, b"?")
+    dest = _described(tmp_path, image=image)
+
+    assert sorted(os.listdir(os.path.dirname(dest))) == [
+        "2026-03-04-episode-one.mp4",
+        "2026-03-04-episode-one.xml",
+    ]
+
+
+def test_annotate_swallows_errors(media, tmp_path, error_log):
+    item = _item()
+    dest = archive.keep(_source(tmp_path, "v.mp4"), feed="Show", item=item)
+
+    # A picture that has already gone: the caller got the order wrong.
+    archive.annotate(dest, item, image=str(tmp_path / "gone.jpg"))
+
+    assert os.path.exists(dest)
+    assert "could not describe" in error_log.read_text()
 
 
 # --- slugs ------------------------------------------------------------------
@@ -279,6 +571,67 @@ def test_prune_clears_abandoned_staging_files(media, tmp_path):
 
     assert archive.prune() == 1
     assert not os.path.exists(orphan)
+
+
+def test_prune_takes_a_videos_description_with_it(media, tmp_path):
+    dest = _described(tmp_path, image=_source(tmp_path, "still.jpg", b"a still"))
+    # Only the video is old. The other two are always a little newer than it,
+    # and on their own dates would be left behind for a run.
+    _aged(dest, 20)
+    os.utime(dest.removesuffix(".mp4") + ".xml")
+
+    # One episode expired, however many files it was.
+    assert archive.prune() == 1
+    assert not os.path.exists(media / "show")
+
+
+def test_prune_leaves_the_description_of_a_video_that_stays(media, tmp_path):
+    dest = _described(tmp_path, image=_source(tmp_path, "still.jpg", b"a still"))
+    stem = dest.removesuffix(".mp4")
+    _aged(stem + ".xml", 20)
+    _aged(stem + ".jpg", 20)
+
+    assert archive.prune() == 0
+    assert sorted(os.listdir(media / "show")) == [
+        "2026-03-04-episode-one.jpg",
+        "2026-03-04-episode-one.mp4",
+        "2026-03-04-episode-one.xml",
+    ]
+
+
+def test_prune_clears_a_description_with_no_video(media, tmp_path):
+    dest = _described(tmp_path)
+    os.unlink(dest)
+    _aged(dest.removesuffix(".mp4") + ".xml", 20)
+
+    assert archive.prune() == 1
+    assert not os.path.exists(media / "show")
+
+
+def test_prune_takes_a_series_with_its_last_episode(media, tmp_path):
+    item, dest = _kept_episode(tmp_path)
+    archive.annotate(dest, item, image=_source(tmp_path, "still.jpg", b"a still"))
+    archive.annotate_show(
+        dest, item, fetch_image=lambda: _source(tmp_path, "art.jpg", b"artwork")
+    )
+    # Only the video is old; the series' own files were dated a moment ago.
+    _aged(dest, 20)
+
+    assert archive.prune() == 1
+    assert not os.path.exists(media / "bureau-buitenland")
+
+
+def test_prune_leaves_a_series_that_still_has_an_episode(media, tmp_path):
+    old_item, old = _kept_episode(tmp_path, _episode("1", "9"))
+    new_item, new = _kept_episode(tmp_path, _episode("2", "28"))
+    archive.annotate_show(new, new_item)
+    _aged(old, 20)
+
+    assert archive.prune() == 1
+    assert _archived_names(media) == [
+        os.path.join("bureau-buitenland", "Season 02", "bureau-buitenland-s02e28.mp4"),
+        os.path.join("bureau-buitenland", "tvshow.nfo"),
+    ]
 
 
 def test_prune_on_a_missing_directory_is_not_an_error(media):

@@ -18,14 +18,22 @@ size of the file that landed. An estimate that ran low therefore costs one more
 part, never the episode.
 
 Splitting is a stream copy, cut at equal lengths with ffmpeg's segment muxer.
-Nothing is re-encoded — on a Raspberry Pi that is the difference between
-seconds and half an hour — so the cuts snap to the nearest keyframe and the
-parts come out close to, not exactly, equal. A part that lands over the limit
-is simply cut again one part finer.
+The picture is never re-encoded — on a Raspberry Pi that is the difference
+between seconds and half an hour — so the cuts snap to the nearest keyframe and
+the parts come out close to, not exactly, equal. A part that lands over the
+limit is simply cut again one part finer.
+
+The sound is another matter: it encodes at many times real time on one core,
+and in a lean video it can be a third of the file — NPO's 360p carries 256 kbps
+of it beside 400 of picture. So before a video is cut, :func:`slim` works out
+whether a leaner soundtrack alone would save a message, and re-encodes just
+that if so: a 25-minute episode that landed at 120 MB then arrives whole, at
+about 91, with its picture untouched.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -37,6 +45,7 @@ from contextlib import contextmanager
 from typing import Any, TypeVar
 
 from . import timing
+from .errorlog import log_line
 from .feeds import FeedError
 from .video import VIDEO_MAX_BYTES, VideoTooBig
 
@@ -55,6 +64,19 @@ MAX_PARTS = 4
 # A stream copy of a few hundred MB from local disk. Minutes would mean
 # something is wrong.
 SPLIT_TIMEOUT = 300
+
+# What a video's sound is re-encoded to when that alone saves a message, best
+# first: the first rate that brings the part count down is the one used. Both
+# are AAC, like every source's own soundtrack, so nothing downstream changes.
+SLIM_AUDIO_BITRATES = (96_000, 64_000)
+
+# The slimmed size is worked out before any work is done, and the encoder lands
+# within a fraction of a percent of it. A prediction closer to the limit than
+# this is not worth the minutes it would take to find out.
+SLIM_MARGIN = 1.02
+
+# An audio encode of a whole video, on one core of a Raspberry Pi.
+SLIM_TIMEOUT = 900
 
 # Containers that want their index at the front to start playing before the
 # whole part has arrived. The same reason ARTE's download asks for it.
@@ -115,8 +137,9 @@ def split_temp(
     """Yield ``path`` as a list of parts that each fit, deleting any made after.
 
     A file that already fits is yielded as itself, ``[path]``, and costs
-    nothing. The parts of one that doesn't live in their own temporary
-    directory, which goes away with them when the ``with`` block ends —
+    nothing. One that doesn't is first given the chance to fit in fewer parts
+    by :func:`slim`; what is left to cut is cut. Everything made here lives in
+    its own temporary directory, which goes away when the ``with`` block ends —
     ``path`` itself is the caller's and is left alone.
 
     Raises :class:`~rssignal.video.VideoTooBig` if even ``max_parts`` parts
@@ -127,9 +150,133 @@ def split_temp(
         yield [path]
         return
     with tempfile.TemporaryDirectory(prefix="rssignal-parts-") as into:
+        # In a directory of its own so it keeps the file's name, and the parts
+        # cut from it are named as they would have been without it.
+        aside = os.path.join(into, "slim")
+        os.mkdir(aside)
+        path = slim(path, aside, max_bytes=max_bytes) or path
+        if os.path.getsize(path) <= max_bytes:
+            yield [path]
+            return
         yield split(
             path, into, max_bytes=max_bytes, max_parts=max_parts, timeout=timeout
         )
+
+
+def slim(
+    path: str,
+    into: str,
+    *,
+    max_bytes: int = MAX_BYTES,
+    timeout: float = SLIM_TIMEOUT,
+) -> str | None:
+    """Re-encode a video's sound leaner if that saves a part; the new file's path.
+
+    ``None`` — and no work done — unless ``path`` is a video whose soundtrack is
+    heavy enough that one of :data:`SLIM_AUDIO_BITRATES` would bring it down a
+    part: audio alone (a podcast is its sound), a container that doesn't say
+    how big its sound is, and a file that would need just as many messages
+    afterwards are all left as they are. The picture is copied, not re-encoded.
+
+    The new file keeps ``path``'s name, so ``into`` has to be some other
+    directory than the one ``path`` is in.
+
+    Nothing that goes wrong with the file is raised. This is a nicety on the
+    way to :func:`split`, which still takes the file as it is: an encode that
+    fails or comes out no smaller is noted in the log and costs nothing but its
+    own time.
+    """
+    name = os.path.basename(path)
+    out = os.path.join(into, name)
+    if os.path.abspath(out) == os.path.abspath(path):
+        raise ValueError("slim would write over the file it was given")
+    if os.path.splitext(name)[1].lower() not in _FASTSTART_EXTS:
+        return None
+    size = os.path.getsize(path)
+    parts = parts_needed(size, max_bytes)
+
+    try:
+        sound = _sound(path, timeout=timeout)
+        if not sound:
+            return None
+        silent = size - sum(rate * seconds / 8 for rate, seconds in sound)
+        heard = sum(seconds for _, seconds in sound)
+        for bitrate in SLIM_AUDIO_BITRATES:
+            predicted = (silent + bitrate * heard / 8) * SLIM_MARGIN
+            if parts_needed(int(predicted), max_bytes) < parts:
+                break
+        else:
+            return None
+
+        cmd = [
+            _binary("ffmpeg"),
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            path,
+            "-map",
+            "0:V",
+            "-map",
+            "0:a",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            str(bitrate),
+            "-movflags",
+            "+faststart",
+            out,
+        ]
+        with timing.step("slim audio", f"{bitrate // 1000} kbps"):
+            _run(cmd, timeout=timeout, what="ffmpeg")
+        if parts_needed(os.path.getsize(out), max_bytes) >= parts:
+            raise FeedError(f"still {parts} parts at {bitrate // 1000} kbps")
+    except (FeedError, OSError) as exc:
+        log_line(f"parts: sound of {name} not slimmed: {exc}")
+        if os.path.exists(out):
+            os.unlink(out)
+        return None
+    return out
+
+
+def _sound(path: str, *, timeout: float) -> list[tuple[float, float]] | None:
+    """``(bits per second, seconds)`` for each audio stream of a video.
+
+    ``None`` if ``path`` has no picture — cover art doesn't count, for the
+    reason given in :func:`_segment` — or doesn't state both figures for every
+    audio stream, which mp4 does and some other containers don't.
+    """
+    result = _run(
+        [
+            _binary("ffprobe"),
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,bit_rate,duration:stream_disposition=attached_pic",
+            "-of",
+            "json",
+            path,
+        ],
+        timeout=timeout,
+        what="ffprobe",
+    )
+    try:
+        streams = json.loads(result.stdout)["streams"]
+        picture = any(
+            s["codec_type"] == "video" and not s["disposition"]["attached_pic"]
+            for s in streams
+        )
+        sound = [
+            (float(s["bit_rate"]), float(s["duration"]))
+            for s in streams
+            if s["codec_type"] == "audio"
+        ]
+    except (ValueError, KeyError, TypeError):
+        return None
+    return sound if picture else None
 
 
 def split(

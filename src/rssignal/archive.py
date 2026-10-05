@@ -33,6 +33,18 @@ Expiry is counted from when a file was *archived*, not when the item was
 published. An episodic feed (:mod:`rssignal.episodic`) releases a back catalogue
 years after it went up, and a fortnight that had already expired before the
 episode arrived would be a strange kind of archive.
+
+A video also gets small files beside it (:func:`annotate`): its title, synopsis
+and date as XML, and its picture. The file name is a slug, which is enough for a
+file listing and not much to look at on a television; a player such as Infuse
+reads the pair and shows the episode as the source described it.
+
+An item that says which episode of which season it is goes one step further and
+is filed the way a media server expects a series: ``<feed>/Season 02/…-s02e28``,
+with an ``.nfo`` of its own and a ``tvshow.nfo`` and artwork for the series above
+it (:func:`annotate_show`). Jellyfin and Emby build a series out of exactly that,
+with no database to look it up in — which matters, because a daily broadcast is
+in none of them.
 """
 
 from __future__ import annotations
@@ -43,6 +55,8 @@ import shutil
 import tempfile
 import time
 import unicodedata
+import xml.etree.ElementTree as ET
+from collections.abc import Callable
 from datetime import datetime
 
 from .errorlog import log_line
@@ -66,6 +80,25 @@ STAGING_NAME = ".staging"
 # survive the filesystems and browsers that still have opinions about path
 # length. Titles run to hundreds of characters surprisingly often.
 SLUG_MAX = 80
+
+# What `annotate` puts beside a video: Infuse's own metadata format, the Kodi
+# one that Jellyfin and Emby read, and the picture, all under the video's name.
+# Only image types a player is sure to read — an episode with no picture looks
+# better than one whose picture is a broken tile.
+METADATA_EXT = ".xml"
+NFO_EXT = ".nfo"
+IMAGE_EXTS = (".jpg", ".jpeg", ".png")
+SIDECAR_EXTS = (METADATA_EXT, NFO_EXT, *IMAGE_EXTS)
+
+# What `annotate_show` keeps in a series' own folder, above its seasons. The
+# names are the ones Kodi settled on and every media server since has read.
+SHOW_NFO = "tvshow.nfo"
+SHOW_IMAGES = ("poster", "fanart")
+
+# XML 1.0 has no way to write these at all, escaped or not, and a synopsis
+# pasted from somewhere odd occasionally carries one. One of them makes the
+# whole file unreadable.
+_XML_UNSAFE_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 
 
 def media_dir() -> str | None:
@@ -161,14 +194,41 @@ def _destination(root: str, feed: str, item: FeedItem, ext: str) -> str:
     is the grouping anyone browsing will want, the date in front because it is
     what makes a directory listing sort into a sensible order.
 
+    An item that knows its place in a series (:func:`numbered`) is filed by that
+    instead: ``<root>/<feed>/Season 02/<feed>-s02e28<ext>``. ``Season NN`` and
+    ``sNNeNN`` are spelled the way media servers look for them, and nothing
+    follows the number on purpose — a title that begins with a figure, slugged
+    onto the end, reads to them as a range of episodes.
+
     ``ext`` is passed in rather than derived here because the sources do not
     agree on an extension until the download is done — which is why
     :func:`rssignal.video.video_temp` hands out a directory instead of a path in
     the first place, and why a dry run can only say ``.*``.
     """
+    place = numbered(item)
+    if place is not None:
+        season, episode = place
+        show = _slug(feed)
+        name = f"{show}-s{season:02d}e{episode:02d}{ext}"
+        return os.path.join(root, show, f"Season {season:02d}", name)
+
     when = item.published or datetime.now().astimezone()
     name = f"{when.strftime('%Y-%m-%d')}-{_slug(item.title)}{ext}"
     return os.path.join(root, _slug(feed), name)
+
+
+def numbered(item: FeedItem) -> tuple[int, int] | None:
+    """``(season, episode)`` if ``item`` says which episode of a series it is.
+
+    A source that knows puts both in the item's ``extra``, as ``season`` and
+    ``episode``; NPO does. Anything else — a podcast, an upload, a film — has no
+    such place, and is filed by its date.
+    """
+    try:
+        season, episode = int(item.extra["season"]), int(item.extra["episode"])
+    except (KeyError, ValueError):
+        return None
+    return (season, episode) if season >= 0 and episode >= 0 else None
 
 
 def _unique(dest: str) -> str:
@@ -205,18 +265,178 @@ def keep(path: str, *, feed: str, item: FeedItem) -> str | None:
 
     try:
         _, ext = os.path.splitext(path)
-        dest = _unique(_destination(root, feed, item, ext))
+        dest = _destination(root, feed, item, ext)
+        if numbered(item) is None:
+            dest = _unique(dest)
+        elif os.path.exists(dest):
+            # The same episode of the same season is the same episode, sent
+            # again. A second copy named `…e28-2` would read as two episodes.
+            os.unlink(dest)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
-        try:
-            os.link(path, dest)
-        except OSError:
-            # Different filesystem, or one without hard links. Costs a full
-            # second write of the file, which is why staging lives where it does.
-            shutil.copy2(path, dest)
+        _link(path, dest)
         return dest
     except OSError as exc:
         log_line(f"archive: could not keep {os.path.basename(path)}: {exc}")
         return None
+
+
+def _link(path: str, dest: str) -> None:
+    """Give ``path`` the second name ``dest``, copying only if it can't be linked."""
+    try:
+        os.link(path, dest)
+    except OSError:
+        # Different filesystem, or one without hard links. Costs a full
+        # second write of the file, which is why staging lives where it does.
+        shutil.copy2(path, dest)
+
+
+def annotate(dest: str, item: FeedItem, *, image: str = "") -> None:
+    """Describe the archived file ``dest`` to a media player, in files beside it.
+
+    ``<name>.xml`` carries the item's title, synopsis, date and genres in the
+    format Infuse reads for a video it can't look up anywhere — which is every
+    video here: these are broadcasts and uploads, not films with a database
+    entry. An episode with a place in a series (:func:`numbered`) gets a
+    ``<name>.nfo`` as well, which is where a season and an episode number can be
+    said: Infuse's format has no word for either, and Jellyfin and Emby read
+    this one.
+
+    ``image`` is a **local file path**, the item's own picture, and gets the same
+    name with its own extension; it is linked like the video was, and for the
+    same reason must still exist when this is called. Empty, or a type a player
+    may not read, and the episode simply has no picture.
+
+    ``dest`` is what :func:`keep` returned. Like :func:`keep` this never raises:
+    the video is archived either way, and a missing caption is not worth more
+    than a line in the log.
+    """
+    stem, _ = os.path.splitext(dest)
+    aired = item.published.strftime("%Y-%m-%d") if item.published else ""
+    try:
+        root = ET.Element("media", type="Other")
+        _child(root, "title", item.title)
+        _child(root, "description", item.description)
+        _child(root, "published", aired)
+        if item.categories:
+            genres = ET.SubElement(root, "genres")
+            for genre in item.categories:
+                _child(genres, "genre", genre)
+        _write(root, stem + METADATA_EXT)
+
+        place = numbered(item)
+        if place is not None:
+            season, episode = place
+            root = ET.Element("episodedetails")
+            _child(root, "title", item.title)
+            _child(root, "showtitle", item.extra.get("show_title", ""))
+            _child(root, "season", str(season))
+            _child(root, "episode", str(episode))
+            _child(root, "plot", item.description)
+            _child(root, "aired", aired)
+            _child(root, "runtime", _minutes(item.extra.get("duration_seconds")))
+            for genre in item.categories:
+                _child(root, "genre", genre)
+            _child(root, "studio", item.author or "")
+            _locked(root)
+            _write(root, stem + NFO_EXT)
+
+        ext = os.path.splitext(image)[1].lower()
+        if image and ext in IMAGE_EXTS:
+            _link(image, stem + ext)
+    except OSError as exc:
+        log_line(f"archive: could not describe {os.path.basename(dest)}: {exc}")
+
+
+def annotate_show(
+    dest: str,
+    item: FeedItem,
+    *,
+    description: str = "",
+    fetch_image: Callable[[], str] | None = None,
+) -> None:
+    """Describe the series the archived episode ``dest`` belongs to.
+
+    Does nothing unless ``item`` has a place in one (:func:`numbered`). Then the
+    series' folder — two up from the episode, past its season — gets a
+    ``tvshow.nfo`` with the show's name and ``description``, and the show's
+    picture as both ``poster`` and ``fanart``: the tile a media server lists the
+    series by, and the backdrop behind its page.
+
+    The picture is only fetched when one of the two is missing, which is why it
+    arrives as ``fetch_image`` — something to call for a **local file path** —
+    rather than as the path: a download per episode for a file that is already
+    there would be a waste, and one that is there may have been put there by
+    hand. A source's artwork is as wide as a television and a poster is meant to
+    be tall, so replacing ``poster.jpg`` with a better one is a reasonable thing
+    to do and it is left alone if you do.
+
+    Everything here is dated afresh each time, so it lasts as long as the newest
+    episode does. Never raises, like the rest.
+    """
+    if numbered(item) is None:
+        return
+    show = os.path.dirname(os.path.dirname(dest))
+    try:
+        root = ET.Element("tvshow")
+        _child(root, "title", item.extra.get("show_title") or item.feed_name)
+        _child(root, "plot", description)
+        for genre in item.categories:
+            _child(root, "genre", genre)
+        _child(root, "studio", item.author or "")
+        _locked(root)
+        _write(root, os.path.join(show, SHOW_NFO))
+
+        have = {name: _show_image(show, name) for name in SHOW_IMAGES}
+        for path in filter(None, have.values()):
+            os.utime(path)
+        if fetch_image is not None and not all(have.values()):
+            image = fetch_image()
+            ext = os.path.splitext(image)[1].lower()
+            if image and ext in IMAGE_EXTS:
+                for name, path in have.items():
+                    if path is None:
+                        _link(image, os.path.join(show, name + ext))
+    except OSError as exc:
+        log_line(f"archive: could not describe the series in {show}: {exc}")
+
+
+def _show_image(show: str, name: str) -> str | None:
+    """The series picture called ``name`` in ``show``, whatever type it is."""
+    for ext in IMAGE_EXTS:
+        path = os.path.join(show, name + ext)
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def _child(parent: ET.Element, tag: str, text: str) -> None:
+    """Add ``<tag>text</tag>`` to ``parent`` — unless there is nothing to say."""
+    text = _XML_UNSAFE_RE.sub("", text).strip()
+    if text:
+        ET.SubElement(parent, tag).text = text
+
+
+def _locked(root: ET.Element) -> None:
+    """Tell a media server this file is the whole story, and not to go looking.
+
+    Left to itself Jellyfin or Emby searches its online sources for a series of
+    this name, and for a broadcast that is in none of them the nearest match is
+    somebody else's programme.
+    """
+    ET.SubElement(root, "lockdata").text = "true"
+
+
+def _write(root: ET.Element, path: str) -> None:
+    ET.indent(root, space="    ")
+    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+
+
+def _minutes(seconds: str | None) -> str:
+    """A length in seconds as whole minutes, which is what an ``.nfo`` counts in."""
+    try:
+        return str(max(1, round(int(seconds or "") / 60)))
+    except ValueError:
+        return ""
 
 
 def describe(item: FeedItem, *, feed: str) -> str | None:
@@ -241,6 +461,12 @@ def prune(*, now: float | None = None) -> int:
     so the media browser does not fill up with the names of shows that have
     nothing in them.
 
+    What :func:`annotate` wrote goes with the episode it describes, in the same
+    pass, and is not counted: the number returned is of episodes. Left to their
+    own dates the caption and picture would outlive the video by a run, being a
+    little newer than it, and a title with nothing to play is worse than neither.
+    A series' own files go the same way, once its last season has.
+
     Best-effort throughout: a file that cannot be deleted is skipped and the walk
     continues. Returns 0 when archiving is off.
     """
@@ -253,14 +479,34 @@ def prune(*, now: float | None = None) -> int:
     removed = 0
 
     for dirpath, _dirnames, filenames in os.walk(root, topdown=False):
+        names = set(filenames)
+        described = {
+            stem
+            for stem, ext in map(os.path.splitext, filenames)
+            if not _is_sidecar(ext)
+        }
         for name in filenames:
+            stem, ext = os.path.splitext(name)
+            if _is_sidecar(ext) and stem in described:
+                # Goes when its episode does, below. One with no episode beside
+                # it is just a file, and ages out like any other.
+                continue
             full = os.path.join(dirpath, name)
             try:
-                if os.path.getmtime(full) < cutoff:
-                    os.unlink(full)
-                    removed += 1
+                if os.path.getmtime(full) >= cutoff:
+                    continue
+                os.unlink(full)
+                removed += 1
             except OSError:
                 continue
+            for side in SIDECAR_EXTS:
+                if stem + side in names:
+                    try:
+                        os.unlink(os.path.join(dirpath, stem + side))
+                    except OSError:
+                        pass
+        if dirpath != root:
+            _drop_empty_show(dirpath)
         # topdown=False means the children have already been visited, so a
         # directory emptied by this pass is seen as empty now rather than next run.
         if dirpath != root:
@@ -270,3 +516,19 @@ def prune(*, now: float | None = None) -> int:
                 pass
 
     return removed
+
+
+def _is_sidecar(ext: str) -> bool:
+    return ext.lower() in SIDECAR_EXTS
+
+
+def _drop_empty_show(dirpath: str) -> None:
+    """Remove what :func:`annotate_show` wrote, if it is all ``dirpath`` holds."""
+    show_files = {SHOW_NFO} | {n + e for n in SHOW_IMAGES for e in IMAGE_EXTS}
+    try:
+        left = os.listdir(dirpath)
+        if SHOW_NFO in left and set(left) <= show_files:
+            for name in left:
+                os.unlink(os.path.join(dirpath, name))
+    except OSError:
+        pass

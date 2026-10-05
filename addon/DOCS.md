@@ -209,6 +209,53 @@ partway leaves a file there, and the next run's expiry pass clears it.
 Set `media_keep_days` to `0` to keep everything, and unset it entirely — by
 editing `rssignal-run` — to go back to keeping nothing.
 
+### Watching the videos in Infuse
+
+A video is filed with two small files of the same name: an `.xml` holding its
+title, synopsis and date, and a `.jpg` of its picture. A player that reads them
+shows each episode as its source described it, rather than as a file name.
+
+1. Install the **Samba share** add-on and give it a username and password.
+2. In Infuse, add a share: **SMB**, this machine's address, those credentials.
+3. Browse to `media/rssignal/<feed>` and mark the folder as a favourite.
+
+In **Settings → Metadata & Artwork**, switch on **Prefer Local Artwork** so the
+episode's own still is used. The pictures appear in Home Assistant's Media
+browser as well, next to the videos they belong to; both go when the video
+expires.
+
+This gives a folder of episodes, not a series with seasons: Infuse only builds
+those for shows it can find on TMDB.
+
+### A series with seasons: Jellyfin or Emby
+
+Episodes from a source that numbers them — NPO Start does — are filed the way a
+media server expects a series, with the Kodi-style `.nfo` files it reads:
+
+```
+/media/rssignal/<feed>/tvshow.nfo
+/media/rssignal/<feed>/poster.jpg
+/media/rssignal/<feed>/fanart.jpg
+/media/rssignal/<feed>/Season 02/<feed>-s02e28.mp4
+/media/rssignal/<feed>/Season 02/<feed>-s02e28.nfo
+/media/rssignal/<feed>/Season 02/<feed>-s02e28.jpg
+```
+
+1. Install a Jellyfin or Emby add-on (neither is official; the
+   `alexbelgium/hassio-addons` repository has both) and let it see `/media`.
+2. Add a library of type **Shows** pointing at `/media/rssignal`. Under its
+   metadata settings, keep **Nfo** enabled as a metadata reader.
+3. In Infuse, add the server (**Jellyfin** or **Emby**, not SMB) and the feed
+   shows up as a series, with seasons, the episode stills and the synopses.
+
+The files are marked locked, so the server does not replace them with an online
+match. `poster.jpg` is the series' wide artwork; swap in a tall one if you like
+— it is fetched only when missing and never overwritten.
+
+Feeds that are not numbered (ARTE, YouTube, podcasts) keep the dated layout and
+will look out of place in a Shows library; give the server a library per feed
+folder if that matters.
+
 ## The signal-cli problem
 
 Worth understanding before you upgrade anything.

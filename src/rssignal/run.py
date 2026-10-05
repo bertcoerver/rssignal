@@ -855,7 +855,9 @@ def _send_prepared(
             current if to else _record_progress(group, parsed, item, current, paced)
         )
         try:
-            delivered = _handle_item(cfg, item, recipient, dry_run=False)
+            delivered = _handle_item(
+                cfg, item, recipient, dry_run=False, show=parsed
+            )
         except Exception:
             # The marker promised an item that never arrived. Put the old
             # description back so the next run tries again.
@@ -977,9 +979,17 @@ def _rollback(group: SignalGroup, description: str, item: FeedItem) -> None:
 
 
 def _handle_item(
-    cfg: FeedConfig, item: FeedItem, recipient: str, *, dry_run: bool
+    cfg: FeedConfig,
+    item: FeedItem,
+    recipient: str,
+    *,
+    dry_run: bool,
+    show: ParsedFeed | None = None,
 ) -> bool:
     """Send (or, in dry-run, describe) a single item from feed ``cfg``.
+
+    ``show`` is the feed the item came from, for what it says about itself: the
+    archive files an episode of a series under a description of the series.
 
     Returns whether anything actually went to the group. Not every item that
     gets this far becomes a message — an upload that turns out to be a Short, or
@@ -1099,7 +1109,29 @@ def _handle_item(
         # image from `_local_image` is furniture, not content — and the whole of
         # it, not the parts it was cut into for Signal's sake.
         if full is not None:
-            archive.keep(full, feed=label, item=item)
+            kept = archive.keep(full, feed=label, item=item)
+            # A video is watched in a player, which can show more than a file
+            # name if it is told more. Fetched only now, and only if there is
+            # an archive to put it in: nothing about the send waits on it.
+            if kept and is_video:
+                archive.annotate(
+                    kept,
+                    item,
+                    image=_local_image(
+                        item.image_url, stack, label, what="archive image"
+                    ),
+                )
+                if show is not None:
+                    # Only an episode of a series has one to describe, and its
+                    # picture is only fetched if the series has none yet.
+                    archive.annotate_show(
+                        kept,
+                        item,
+                        description=show.description,
+                        fetch_image=lambda: _local_image(
+                            show.image_url, stack, label, what="series image"
+                        ),
+                    )
     return True
 
 

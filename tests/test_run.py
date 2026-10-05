@@ -1980,6 +1980,108 @@ def test_run_archives_the_audio_but_not_the_preview_image(media, tmp_path, monke
     assert [os.path.splitext(p)[1] for p in _archived(media)] == [".mp3"]
 
 
+def _video_item(**fields):
+    return FeedItem(
+        title="Le drapeau",
+        description="Ce qu'une image raconte.",
+        link=ARTE_LINK,
+        published=datetime(2026, 3, 4, tzinfo=timezone.utc),
+        **fields,
+    )
+
+
+def test_run_describes_an_archived_video_for_a_player(media, tmp_path, monkeypatch):
+    # A video is watched in something that can show a title, a synopsis and a
+    # picture — but only if they are filed beside it under its name.
+    cfg = FeedConfig(url="https://a", name="Arte")
+    item = _video_item(image_url="https://a/still.jpg")
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    _capture_sends(monkeypatch)
+    _real_downloads(monkeypatch, tmp_path)
+    video = tmp_path / "fetched.mp4"
+    video.write_bytes(b"video")
+    _patch_video(monkeypatch, path=str(video))
+
+    assert run_feeds("feeds.json") == 1
+
+    stem = os.path.join("arte", "2026-03-04-le-drapeau")
+    assert _archived(media) == [stem + ".jpg", stem + ".mp4", stem + ".xml"]
+    with open(media / (stem + ".jpg"), "rb") as fh:
+        assert fh.read() == b"the-bytes-of-https://a/still.jpg"
+    with open(media / (stem + ".xml"), encoding="utf-8") as fh:
+        assert "<title>Le drapeau</title>" in fh.read()
+
+
+def test_run_describes_a_video_that_has_no_picture(media, tmp_path, monkeypatch):
+    cfg = FeedConfig(url="https://a", name="Arte")
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [_video_item()]})
+    _capture_sends(monkeypatch)
+    video = tmp_path / "fetched.mp4"
+    video.write_bytes(b"video")
+    _patch_video(monkeypatch, path=str(video))
+
+    assert run_feeds("feeds.json") == 1
+
+    stem = os.path.join("arte", "2026-03-04-le-drapeau")
+    assert _archived(media) == [stem + ".mp4", stem + ".xml"]
+
+
+def test_run_files_an_episode_of_a_series_as_one(media, tmp_path, monkeypatch):
+    # An item that knows its season and episode is laid out, and described, the
+    # way a media server builds a series from — with the feed's own description
+    # and artwork for the series itself.
+    cfg = FeedConfig(url="https://a", name="Bureau Buitenland")
+    item = _video_item(
+        image_url="https://a/still.jpg",
+        extra={"season": "2", "episode": "28", "show_title": "Bureau Buitenland"},
+    )
+    _patch_feeds(
+        monkeypatch,
+        [cfg],
+        {"https://a": [item]},
+        image="https://a/show.jpg",
+        blurb="De wereld.",
+    )
+    _capture_sends(monkeypatch)
+    _real_downloads(monkeypatch, tmp_path)
+    video = tmp_path / "fetched.mp4"
+    video.write_bytes(b"video")
+    _patch_video(monkeypatch, path=str(video))
+
+    assert run_feeds("feeds.json") == 1
+
+    show = "bureau-buitenland"
+    stem = os.path.join(show, "Season 02", "bureau-buitenland-s02e28")
+    assert _archived(media) == [
+        stem + ".jpg",
+        stem + ".mp4",
+        stem + ".nfo",
+        stem + ".xml",
+        os.path.join(show, "fanart.jpg"),
+        os.path.join(show, "poster.jpg"),
+        os.path.join(show, "tvshow.nfo"),
+    ]
+    with open(media / show / "poster.jpg", "rb") as fh:
+        assert fh.read() == b"the-bytes-of-https://a/show.jpg"
+    with open(media / show / "tvshow.nfo", encoding="utf-8") as fh:
+        assert "<plot>De wereld.</plot>" in fh.read()
+
+
+def test_run_fetches_no_picture_when_nothing_is_archived(monkeypatch):
+    cfg = FeedConfig(url="https://a", name="Arte")
+    item = _video_item(image_url="https://a/still.jpg")
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    _capture_sends(monkeypatch)
+    _patch_video(monkeypatch)
+
+    def no_downloads(url, **kwargs):
+        raise AssertionError(f"downloaded {url} with no archive to put it in")
+
+    monkeypatch.setattr(run, "download_temp", no_downloads)
+
+    assert run_feeds("feeds.json") == 1
+
+
 def test_run_archives_nothing_when_the_send_fails(media, tmp_path, monkeypatch):
     cfg = FeedConfig(url="https://a", name="Pod")
     item = FeedItem(title="Ep", description="d", enclosure_url="https://a/ep.mp3")

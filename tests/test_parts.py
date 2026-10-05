@@ -1,9 +1,10 @@
 """Tests for rssignal.parts: the fewest-parts rule, and cutting files to fit.
 
-ffmpeg and ffprobe are faked except in the one test at the bottom that makes a
-real file and cuts it, which is skipped on a machine without ffmpeg.
+ffmpeg and ffprobe are faked except in the tests at the bottom that make a
+real file and cut or slim it, which are skipped on a machine without ffmpeg.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -206,6 +207,175 @@ def test_split_without_a_duration_fails(tmp_path, monkeypatch):
         parts.split(path, str(tmp_path), max_bytes=100)
 
 
+# --- slimming the sound, with ffmpeg faked ---------------------------------
+
+
+def _fake_slim(
+    monkeypatch, *, sound=(128_000,), seconds=1.0, picture=True, slimmed=None, fails=False
+):
+    """Fake ffprobe (the streams of a video) and the ffmpeg that slims it.
+
+    One second of sound, so 128 kbps is 16 kB of the file and 96 and 64 kbps
+    save 4 and 8 of them. The slimmed file is the size that arithmetic says
+    unless ``slimmed`` says otherwise. The segmenting ffmpeg writes small parts,
+    as in ``_fake_tools``.
+    """
+    calls = []
+    monkeypatch.setattr(parts.shutil, "which", lambda name: f"/usr/bin/{name}")
+    streams = [{"codec_type": "video", "disposition": {"attached_pic": 0}}] * picture
+    streams += [
+        {"codec_type": "audio", "bit_rate": str(rate), "duration": str(seconds),
+         "disposition": {"attached_pic": 0}}
+        for rate in sound
+    ]
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[0].endswith("ffprobe"):
+            if "json" in cmd:
+                answer = json.dumps({"streams": streams})
+                return subprocess.CompletedProcess(cmd, 0, answer, "")
+            return subprocess.CompletedProcess(cmd, 0, f"{seconds}\n", "")
+        if "-segment_times" in cmd:
+            count = cmd[cmd.index("-segment_times") + 1].count(",") + 2
+            for k in range(1, count + 1):
+                with open(cmd[-1].replace("%d", str(k)), "wb") as fh:
+                    fh.write(b"x" * 10)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if fails:
+            return subprocess.CompletedProcess(cmd, 1, "", "Unknown encoder 'aac'\n")
+        source = cmd[cmd.index("-i") + 1]
+        rate = int(cmd[cmd.index("-b:a") + 1])
+        size = os.path.getsize(source) - sum(
+            int((old - rate) * seconds / 8) for old in sound
+        )
+        with open(cmd[-1], "wb") as fh:
+            fh.write(b"x" * (size if slimmed is None else slimmed))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(parts.subprocess, "run", fake_run)
+    return calls
+
+
+def _into(tmp_path):
+    into = tmp_path / "slim"
+    into.mkdir(exist_ok=True)
+    return str(into)
+
+
+def _encodes(calls):
+    return [cmd for cmd in calls if "-b:a" in cmd]
+
+
+def test_split_temp_slims_the_sound_when_that_saves_a_part(tmp_path, monkeypatch):
+    # 5 kB over; at 96 kbps the sound is 4 kB lighter, at 64 kbps 8 kB.
+    calls = _fake_slim(monkeypatch)
+    path = _file(tmp_path, "video.mp4", 105_000)
+
+    with parts.split_temp(path, max_bytes=100_000) as pieces:
+        (piece,) = pieces
+        assert piece != path
+        assert os.path.basename(piece) == "video.mp4"
+        assert os.path.getsize(piece) == 97_000
+
+    (encode,) = _encodes(calls)
+    assert encode[encode.index("-b:a") + 1] == "64000"
+    assert encode[encode.index("-c:v") + 1] == "copy"
+    assert not os.path.exists(piece)
+    # The original is the caller's — and the archive's, with its sound whole.
+    assert os.path.getsize(path) == 105_000
+
+
+def test_slim_takes_the_best_sound_that_saves_the_part(tmp_path, monkeypatch):
+    calls = _fake_slim(monkeypatch)
+    path = _file(tmp_path, "video.mp4", 101_000)
+
+    assert parts.slim(path, _into(tmp_path), max_bytes=100_000) is not None
+
+    (encode,) = _encodes(calls)
+    assert encode[encode.index("-b:a") + 1] == "96000"
+
+
+def test_slim_leaves_a_video_it_could_not_bring_down_a_part(tmp_path, monkeypatch):
+    # 20 kB over, and the leanest sound saves 8.
+    calls = _fake_slim(monkeypatch)
+    path = _file(tmp_path, "video.mp4", 120_000)
+
+    with parts.split_temp(path, max_bytes=100_000) as pieces:
+        assert len(pieces) == 2
+
+    assert _encodes(calls) == []
+
+
+def test_slim_can_save_a_part_without_saving_the_split(tmp_path, monkeypatch):
+    calls = _fake_slim(monkeypatch)
+    path = _file(tmp_path, "video.mp4", 203_000)
+
+    with parts.split_temp(path, max_bytes=100_000) as pieces:
+        assert [os.path.basename(p) for p in pieces] == [
+            "video.part1.mp4",
+            "video.part2.mp4",
+        ]
+
+    assert len(_encodes(calls)) == 1
+
+
+def test_slim_leaves_sound_that_is_already_lean(tmp_path, monkeypatch):
+    calls = _fake_slim(monkeypatch, sound=(48_000,))
+    path = _file(tmp_path, "video.mp4", 101_000)
+
+    assert parts.slim(path, _into(tmp_path), max_bytes=100_000) is None
+    assert _encodes(calls) == []
+
+
+def test_slim_leaves_audio_alone(tmp_path, monkeypatch):
+    # A podcast is its sound: an m4a is probed and found to have no picture,
+    # an mp3 isn't even looked at.
+    calls = _fake_slim(monkeypatch, picture=False)
+    m4a = _file(tmp_path, "ep.m4a", 101_000)
+    mp3 = _file(tmp_path, "ep.mp3", 101_000)
+
+    assert parts.slim(m4a, _into(tmp_path), max_bytes=100_000) is None
+    assert len(calls) == 1
+    assert parts.slim(mp3, _into(tmp_path), max_bytes=100_000) is None
+    assert len(calls) == 1
+
+
+def test_slim_leaves_a_file_that_does_not_size_its_sound(tmp_path, monkeypatch):
+    calls = _fake_tools(monkeypatch)  # Answers every probe with a bare duration.
+    path = _file(tmp_path, "video.mp4", 101_000)
+
+    assert parts.slim(path, _into(tmp_path), max_bytes=100_000) is None
+    assert len(calls) == 1
+
+
+def test_slim_refuses_to_write_over_its_own_input(tmp_path, monkeypatch):
+    _fake_slim(monkeypatch)
+    path = _file(tmp_path, "video.mp4", 105_000)
+
+    with pytest.raises(ValueError, match="write over"):
+        parts.slim(path, str(tmp_path), max_bytes=100_000)
+
+    assert os.path.getsize(path) == 105_000
+
+
+@pytest.mark.parametrize("how", [{"fails": True}, {"slimmed": 100_001}])
+def test_a_slim_that_does_not_work_out_falls_back_to_splitting(
+    tmp_path, monkeypatch, how
+):
+    _fake_slim(monkeypatch, **how)
+    path = _file(tmp_path, "video.mp4", 105_000)
+
+    with parts.split_temp(path, max_bytes=100_000) as pieces:
+        assert [os.path.basename(p) for p in pieces] == [
+            "video.part1.mp4",
+            "video.part2.mp4",
+        ]
+        assert os.listdir(os.path.join(os.path.dirname(pieces[0]), "slim")) == []
+
+    assert "not slimmed" in (tmp_path / "rssignal.log").read_text()
+
+
 # --- the real thing -------------------------------------------------------
 
 
@@ -241,3 +411,43 @@ def test_split_really_cuts_an_mp3_into_playable_parts(tmp_path):
         assert all(os.path.getsize(p) <= size // 2 + 1024 for p in pieces)
 
     assert sum(durations) == pytest.approx(30, abs=0.5)
+
+
+@pytest.mark.skipif(
+    not (shutil.which("ffmpeg") and shutil.which("ffprobe")),
+    reason="needs ffmpeg and ffprobe",
+)
+def test_slim_really_re_encodes_only_the_sound(tmp_path):
+    source = tmp_path / "video.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-nostdin", "-loglevel", "error",
+            "-f", "lavfi", "-i", "testsrc=size=160x90:rate=5:duration=30",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=30",
+            "-c:v", "mpeg4", "-b:v", "40k", "-c:a", "aac", "-b:a", "256k",
+            str(source),
+        ],
+        check=True,
+    )
+    size = os.path.getsize(source)
+
+    def streams(path):
+        out = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-show_entries",
+                "stream=codec_type,codec_name,bit_rate,nb_frames", "-of", "json", path,
+            ],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        return {s["codec_type"]: s for s in json.loads(out)["streams"]}
+
+    # A limit the file is over by less than its sound can give up.
+    with parts.split_temp(str(source), max_bytes=size - 200_000) as pieces:
+        (piece,) = pieces
+        assert os.path.getsize(piece) <= size - 200_000
+        before, after = streams(str(source)), streams(piece)
+
+    assert after["video"]["nb_frames"] == before["video"]["nb_frames"]
+    assert after["video"]["bit_rate"] == before["video"]["bit_rate"]
+    assert after["audio"]["codec_name"] == "aac"
+    assert int(after["audio"]["bit_rate"]) < 110_000

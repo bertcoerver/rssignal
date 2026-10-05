@@ -158,7 +158,10 @@ def resolve(item: FeedItem, *, max_bytes: int = VIDEO_MAX_BYTES) -> NpoPlan:
         raise FeedError(f"Not an NPO Start episode link: {item.link!r}")
 
     lookup = downloadgemist.streams(NPO_EPISODE_URL.format(slug=slug))
-    rungs = lookup.video
+    # A rung listed without a bitrate (``720p_2`` is) has no size to estimate,
+    # and counted as its sound alone it would look like the smallest thing on
+    # offer rather than the 300 MB it is.
+    rungs = [rung for rung in lookup.video if rung.bitrate > 0]
     if not rungs:
         raise FeedError(f"Downloadgemist offered no video for {slug}")
 
@@ -243,6 +246,13 @@ def _item(program: dict, feed_name: str, show_title: str) -> FeedItem:
     duration = program.get("durationInSeconds")
     if duration:
         extra["duration_seconds"] = str(duration)
+    # Which episode of which season this is: what lets rssignal.archive file it
+    # as part of a series. Both or neither — half a place is no place.
+    season = (program.get("season") or {}).get("seasonKey")
+    episode = program.get("programKey")
+    if season and episode:
+        extra["season"] = str(season)
+        extra["episode"] = str(episode)
 
     return FeedItem(
         title=str(program.get("title") or show_title).strip(),
@@ -252,9 +262,30 @@ def _item(program: dict, feed_name: str, show_title: str) -> FeedItem:
             program.get("firstBroadcastDate") or program.get("publishedDateTime")
         ),
         image_url=_image(program),
+        author=", ".join(_names(program.get("broadcasters"))) or None,
+        categories=tuple(_genres(program)),
         feed_name=feed_name,
         extra=extra,
     )
+
+
+def _names(entries: object) -> list[str]:
+    """The ``name`` of each entry in one of the page's lists, in order."""
+    if not isinstance(entries, list):
+        return []
+    return [str(e["name"]) for e in entries if isinstance(e, dict) and e.get("name")]
+
+
+def _genres(program: dict) -> list[str]:
+    """An episode's genres, each main one followed by the finer ones under it."""
+    found: list[str] = []
+    genres = program.get("genres")
+    for genre in genres if isinstance(genres, list) else []:
+        if isinstance(genre, dict):
+            for name in [*_names([genre]), *_names(genre.get("secondaries"))]:
+                if name not in found:
+                    found.append(name)
+    return found
 
 
 def _when(epoch: object) -> datetime | None:
