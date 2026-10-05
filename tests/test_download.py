@@ -1,5 +1,6 @@
 """Tests for rssignal.download (urlopen is monkeypatched — no network)."""
 
+import http.client
 import io
 import os
 import socket
@@ -186,3 +187,110 @@ def test_reachable_does_not_retry(monkeypatch):
 
     assert probe("https://www.youtube.com/") is False
     assert len(calls) == 1
+
+
+# --- urls written for people ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "given, expected",
+    [
+        # Spaces are what http.client refuses outright.
+        ("https://a/My Show/ep 1.mp3", "https://a/My%20Show/ep%201.mp3"),
+        # Brackets and parentheses travel as they are, as a browser sends them.
+        (
+            "https://a/Show [2026-10-04] Episode (720p_2).mp4",
+            "https://a/Show%20[2026-10-04]%20Episode%20(720p_2).mp4",
+        ),
+        ("https://a/Oekraïne.mp3", "https://a/Oekra%C3%AFne.mp3"),
+        ("https://a/get?file=a b.mp3&t=1", "https://a/get?file=a%20b.mp3&t=1"),
+        # The fragment is never sent.
+        ("https://a/ep.mp3#t=30", "https://a/ep.mp3"),
+        ("  https://a/ep.mp3\n", "https://a/ep.mp3"),
+    ],
+)
+def test_safe_url_escapes_what_cannot_be_sent(given, expected):
+    assert download.safe_url(given) == expected
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://a/ep1.mp3",
+        # Already escaped: not escaped twice.
+        "https://a/My%20Show/ep%201.mp3",
+        # A signed link is signed over its exact bytes, so nothing that could
+        # be sent as it stood may be rewritten.
+        "https://cdn.example.com/e/ep.mp3?Expires=1790000000&Signature=aB3~x-_Y%2Bz==&Key-Pair-Id=K1",
+        "https://vod.example.com/p/a,b;c=d/x.m3u8?hdnts=exp=1~acl=/p/*~hmac=ab12",
+        "https://user:pw@a:8443/x/~me/file.mp3",
+    ],
+)
+def test_safe_url_leaves_a_sendable_url_exactly_alone(url):
+    assert download.safe_url(url) == url
+
+
+def test_download_temp_asks_for_a_url_with_spaces_in_it_escaped(monkeypatch):
+    asked = []
+
+    def fake_urlopen(url, timeout=30):
+        asked.append(url)
+        return _FakeResponse(b"audio-bytes")
+
+    monkeypatch.setattr(download, "urlopen", fake_urlopen)
+
+    with download_temp("https://a/My Show/ep 1.mp3") as path:
+        # The suffix still comes from the name as it was written.
+        assert path.endswith(".mp3")
+
+    assert asked == ["https://a/My%20Show/ep%201.mp3"]
+
+
+def test_fetch_text_asks_for_a_url_with_spaces_in_it_escaped(monkeypatch):
+    asked = []
+
+    def fake_urlopen(request, timeout=30):
+        asked.append(request.full_url)
+        return _FakeResponse(b"ok")
+
+    monkeypatch.setattr(download, "urlopen", fake_urlopen)
+
+    assert download.fetch_text("https://a/play list.m3u8") == "ok"
+    assert asked == ["https://a/play%20list.m3u8"]
+
+
+def test_a_complaint_from_http_client_is_a_feed_error(monkeypatch):
+    """Not an OSError, so it used to get out as itself and take the feed down."""
+
+    def refuses(url, timeout=30):
+        raise http.client.IncompleteRead(b"half")
+
+    monkeypatch.setattr(download, "urlopen", refuses)
+
+    with pytest.raises(FeedError, match="Could not download"):
+        with download_temp("https://a/ep1.mp3"):
+            pass
+    with pytest.raises(FeedError, match="Could not fetch"):
+        download.fetch_text("https://a/playlist")
+
+
+def test_reachable_is_false_for_a_complaint_from_http_client(monkeypatch):
+    def refuses(request, timeout=5):
+        raise http.client.InvalidURL("nope")
+
+    monkeypatch.setattr(download, "urlopen", refuses)
+
+    assert probe("https://a/") is False
+
+
+def test_download_temp_really_gets_a_spaced_url_past_http_client(monkeypatch):
+    """The real urlopen, stopped just short of the network."""
+
+    def no_network(*args, **kwargs):
+        raise OSError("no network in tests")
+
+    monkeypatch.setattr(socket, "create_connection", no_network)
+
+    with pytest.raises(FeedError, match="no network in tests"):
+        with download_temp("http://a.invalid/My Show/ep 1.mp3"):
+            pass

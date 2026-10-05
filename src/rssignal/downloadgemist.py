@@ -53,10 +53,11 @@ from datetime import datetime
 from http.client import HTTPException
 from http.cookiejar import CookieJar
 from urllib.error import URLError
-from urllib.parse import quote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
+from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 from . import cache, timing
+from .download import safe_url
 from .feeds import FeedError, retrying, strip_html
 from .video import VideoGone
 
@@ -394,20 +395,11 @@ def _safe_url(file_url: str) -> str:
 
     The site names its files for people — ``…/DownloadGemist [2026-10-04] Bureau
     Buitenland s02e29 (720p_2).mp4`` — and hands the link over exactly like
-    that, spaces and all, for a browser to tidy up. Nothing tidies it up here,
-    and http.client refuses a url with a space in it outright. ``%`` is left
-    alone so a link that arrives already escaped isn't escaped twice.
+    that, spaces and all, for a browser to tidy up. See
+    :func:`~rssignal.download.safe_url`, which does the tidying; this adds only
+    that a link without a host is the site's own.
     """
-    parts = urlsplit(urljoin(SITE, file_url.strip()))
-    return urlunsplit(
-        (
-            parts.scheme,
-            parts.netloc,
-            quote(parts.path, safe="/%"),
-            quote(parts.query, safe="=&%+"),
-            "",
-        )
-    )
+    return safe_url(urljoin(SITE, file_url.strip()))
 
 
 def _download(file_url: str, path: str, *, timeout: float) -> None:

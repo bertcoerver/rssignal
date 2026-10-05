@@ -404,8 +404,8 @@ RAW_FILE_URL = (
         # As the site really hands it over: spaces and brackets, for a browser.
         (
             RAW_FILE_URL,
-            "https://downloadgemist.nl/cache/2026/10/04/DownloadGemist%20%5B2026-10-04%5D"
-            "%20Bureau%20Buitenland%20s02e29%20%28720p_2%29.mp4",
+            "https://downloadgemist.nl/cache/2026/10/04/DownloadGemist%20[2026-10-04]"
+            "%20Bureau%20Buitenland%20s02e29%20(720p_2).mp4",
         ),
         # Already escaped: left exactly as it is, not escaped twice.
         (FILE_URL, FILE_URL),
@@ -440,7 +440,7 @@ def test_download_asks_for_a_url_with_spaces_in_it_escaped(monkeypatch, tmp_path
     downloadgemist._download(RAW_FILE_URL, path, timeout=60)
 
     assert " " not in asked[0]
-    assert asked[0].endswith("%28720p_2%29.mp4")
+    assert asked[0].endswith("%20(720p_2).mp4")
     with open(path, "rb") as fh:
         assert fh.read() == b"episode"
 

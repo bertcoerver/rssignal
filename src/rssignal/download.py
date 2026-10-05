@@ -11,12 +11,52 @@ import os
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
+from http.client import HTTPException
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from . import timing
 from .feeds import FeedError, retrying
+
+# What a fetch can fail with. ``HTTPException`` is on the list because
+# http.client's own complaints — a url it won't put on the wire, a response cut
+# short — are not OSErrors, and one that got out as itself would not be a
+# :class:`FeedError` to anything that knows how to handle those.
+_FETCH_ERRORS = (URLError, OSError, ValueError, HTTPException)
+
+# Everything a url's path or query may carry as it stands. Deliberately
+# generous: the point of :func:`safe_url` is to fix what cannot be sent, not to
+# normalise what can, because a signed link is signed over its exact bytes.
+_PATH_SAFE = "/%:@!$&'()*+,;=~[]"
+_QUERY_SAFE = _PATH_SAFE + "?"
+
+
+def safe_url(url: str) -> str:
+    """``url`` as something that can be requested, changed as little as possible.
+
+    Links are written for people as often as for programs. A feed's enclosure
+    or a download site's file link can arrive as ``…/Show [2026-10-04] Episode
+    (720p).mp4``, spaces and all, on the understanding that a browser will tidy
+    it up. Nothing tidied it up here, and http.client refuses a url with a space
+    in it outright.
+
+    So this does what a browser does and no more: spaces, non-ASCII and the few
+    characters that can't travel are percent-encoded; the fragment, which is
+    never sent, is dropped. ``%`` is left alone so a link that arrives already
+    escaped isn't escaped twice, and a url that was fine comes back unchanged.
+    """
+    parts = urlsplit(url.strip())
+    return urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            quote(parts.path, safe=_PATH_SAFE),
+            quote(parts.query, safe=_QUERY_SAFE),
+            "",
+        )
+    )
+
 
 # A reachability probe is answering one question — is this host there — and must
 # not become the slowest part of finding out that it isn't.
@@ -36,11 +76,11 @@ def reachable(url: str, *, timeout: float = PROBE_TIMEOUT) -> bool:
     "no".
     """
     try:
-        with urlopen(Request(url, method="HEAD"), timeout=timeout):
+        with urlopen(Request(safe_url(url), method="HEAD"), timeout=timeout):
             return True
     except HTTPError:
         return True
-    except (URLError, OSError, ValueError):
+    except _FETCH_ERRORS:
         return False
 
 
@@ -70,9 +110,10 @@ def fetch_text(
 
     def once() -> str:
         try:
-            with urlopen(Request(url, headers=headers or {}), timeout=timeout) as response:
+            request = Request(safe_url(url), headers=headers or {})
+            with urlopen(request, timeout=timeout) as response:
                 return response.read().decode("utf-8", errors="replace")
-        except (URLError, OSError, ValueError) as exc:
+        except _FETCH_ERRORS as exc:
             raise FeedError(f"Could not fetch {url!r}: {exc}") from exc
 
     with timing.step("http fetch", urlparse(url).netloc):
@@ -102,10 +143,10 @@ def download_temp(
                 out.seek(0)
                 out.truncate()
                 try:
-                    with urlopen(url, timeout=timeout) as response:
+                    with urlopen(safe_url(url), timeout=timeout) as response:
                         while chunk := response.read(64 * 1024):
                             out.write(chunk)
-                except (URLError, OSError, ValueError) as exc:
+                except _FETCH_ERRORS as exc:
                     raise FeedError(f"Could not download {url!r}: {exc}") from exc
 
             with timing.step("http download", urlparse(url).netloc):
