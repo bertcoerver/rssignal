@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.1
+
+- Refactor URL handling to ensure safe encoding for downloads and improve error handling
+- Add URL handling improvements for downloads and enhance error handling
+
 ## 0.4.0
 
 - Add support for NPO Start series and improve video handling in downloads
