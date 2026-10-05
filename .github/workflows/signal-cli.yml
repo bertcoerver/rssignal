@@ -1,0 +1,77 @@
+name: Check signal-cli
+
+# Looks for a signal-cli release newer than the one addon/Dockerfile pins, and
+# opens a pull request that bumps to it. Signal's servers turn old clients away
+# after a few months, so a pin nobody is watching is a send that fails one day
+# with no warning; this is the watching.
+#
+# It only ever proposes. Merging the pull request and running
+# `make addon-release` are still yours, because a new signal-cli is exactly the
+# kind of change to read the release notes for.
+#
+# Needs Settings → Actions → General → "Allow GitHub Actions to create and
+# approve pull requests", or the last step fails.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  bump:
+    # arm64, because that is the image the Pi runs and the only one that gets a
+    # third-party libsignal spliced in.
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Exits non-zero, failing the run, when there is a new release whose
+      # libsignal exquo has not built yet. That is deliberate: the failure mail
+      # is how you find out, and next week's run tries again.
+      - name: Look for a newer release
+        id: bump
+        run: |
+          addon/scripts/bump-signal-cli.sh
+          if git diff --quiet -- addon/Dockerfile; then
+            exit 0
+          fi
+          version="$(sed -n -E 's/^ARG SIGNAL_CLI_VERSION="(.*)"$/\1/p' addon/Dockerfile)"
+          # One pull request per release. A branch left behind by one you
+          # closed without merging also counts, which is how to say no.
+          if git ls-remote --exit-code --heads origin "signal-cli-${version}" > /dev/null; then
+            echo "A branch for ${version} already exists."
+            exit 0
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      # The build is the test: install-signal-cli.sh fails it if the libsignal
+      # does not match or is not an aarch64 library, and if the JRE is too old
+      # to start this signal-cli. Nothing is pushed.
+      - name: Build the image
+        if: steps.bump.outputs.version
+        run: |
+          docker build -f addon/Dockerfile \
+            --build-arg BUILD_FROM="$(yq '.build_from.aarch64' addon/build.yaml)" \
+            --build-arg BUILD_ARCH=aarch64 \
+            .
+
+      - name: Open a pull request
+        if: steps.bump.outputs.version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "signal-cli-${VERSION}"
+          git commit -m "Bump signal-cli to ${VERSION}" addon/Dockerfile
+          git push origin "signal-cli-${VERSION}"
+          {
+            echo "[signal-cli ${VERSION}](https://github.com/AsamK/signal-cli/releases/tag/v${VERSION}), with the libsignal and Java it needs. The aarch64 image built with these versions."
+            echo
+            echo "Read the release notes before merging, then publish with \`make addon-release VERSION=x.y.z\`."
+          } > "${RUNNER_TEMP}/body.md"
+          gh pr create --title "Bump signal-cli to ${VERSION}" --body-file "${RUNNER_TEMP}/body.md"

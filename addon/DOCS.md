@@ -229,19 +229,38 @@ rather than the first send.
 It also needs a **Java 25** runtime, which signal-cli has required since 0.14.0
 and Debian Trixie does not package — so the image pulls a Temurin JRE.
 
-**To upgrade signal-cli**, edit the two `ARG`s at the top of the `Dockerfile`
-together:
+**To upgrade signal-cli**, the `ARG`s at the top of the `Dockerfile` have to
+change together, and `make signal-cli-bump` does that:
 
-1. Set `SIGNAL_CLI_VERSION` to the new version.
-2. Read `https://github.com/AsamK/signal-cli/blob/v<version>/libsignal-version`
-   and set `LIBSIGNAL_VERSION` to exactly what it says.
-3. Check that
+1. It takes the newest signal-cli release, or `SIGNAL_CLI=x.y.z` if you name
+   one, and sets `SIGNAL_CLI_VERSION` to it.
+2. It reads `https://github.com/AsamK/signal-cli/blob/v<version>/libsignal-version`
+   and sets `LIBSIGNAL_VERSION` to exactly what it says.
+3. It checks that
    [exquo/signal-libs-build](https://github.com/exquo/signal-libs-build/releases)
-   has a `libsignal_v<version>` release. If it does not, wait — do not
-   substitute a nearby version. The mismatch is an ABI mismatch.
-4. Push, and [publish a new version](#publishing-a-new-version).
+   has a `libsignal_v<version>` release, and changes nothing if it does not.
+   Then wait — do not substitute a nearby version. The mismatch is an ABI
+   mismatch.
+4. It reads the Java version the release is built for out of signal-cli's
+   `build.gradle.kts`, and raises `JAVA_VERSION` if that is newer.
 
-The build fails clearly if the two versions disagree, and a failed build
+Commit and push the result, and [publish a new version](#publishing-a-new-version).
+
+You should rarely need to run it yourself. The **Check signal-cli** workflow
+(`.github/workflows/signal-cli.yml`) runs the same script every Monday, builds
+the aarch64 image with the new versions, and opens a pull request if that
+works; merging it and publishing a new version is all that is left. A run that
+fails means a release is out that cannot be used yet, usually because exquo has
+not built its libsignal. The pull request needs *Settings → Actions → General →
+Allow GitHub Actions to create and approve pull requests* switched on.
+
+The Java version is the one lookup with no file published for it, so it is the
+one that could stop working if signal-cli rearranges its build script. The
+script then says so and leaves `JAVA_VERSION` alone; the image build ends by
+running `signal-cli --version`, so a JRE that is too old fails the build rather
+than publishing an image that cannot start.
+
+The build also fails clearly if the two versions disagree, and a failed build
 publishes nothing.
 
 ## Checking on it
