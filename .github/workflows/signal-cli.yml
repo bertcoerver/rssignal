@@ -5,9 +5,10 @@ name: Check signal-cli
 # after a few months, so a pin nobody is watching is a send that fails one day
 # with no warning; this is the watching.
 #
-# It only ever proposes. Merging the pull request and running
-# `make addon-release` are still yours, because a new signal-cli is exactly the
-# kind of change to read the release notes for.
+# A patch release (0.14.8 → 0.14.9) is merged without asking, once the image
+# has built with it. Anything bigger is left as an open pull request, because
+# that is the kind of change to read the release notes for. Either way nothing
+# is published: `make addon-release` is still yours.
 #
 # Needs Settings → Actions → General → "Allow GitHub Actions to create and
 # approve pull requests", or the last step fails.
@@ -47,6 +48,17 @@ jobs:
           fi
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
 
+          # signal-cli has never left 0.x, so the middle number is its major
+          # one in practice: 0.13 → 0.14 was the release that needed Java 25.
+          # Only a newer last number, with the first two as they were, counts
+          # as small enough to merge unread.
+          pinned="$(git show HEAD:addon/Dockerfile | sed -n -E 's/^ARG SIGNAL_CLI_VERSION="(.*)"$/\1/p')"
+          echo "pinned=${pinned}" >> "${GITHUB_OUTPUT}"
+          newest="$(printf '%s\n%s\n' "${pinned}" "${version}" | sort -V | tail -n 1)"
+          if [ "${pinned%.*}" = "${version%.*}" ] && [ "${newest}" = "${version}" ]; then
+            echo "automerge=true" >> "${GITHUB_OUTPUT}"
+          fi
+
       # The build is the test: install-signal-cli.sh fails it if the libsignal
       # does not match or is not an aarch64 library, and if the JRE is too old
       # to start this signal-cli. Nothing is pushed.
@@ -59,10 +71,13 @@ jobs:
             .
 
       - name: Open a pull request
+        id: pr
         if: steps.bump.outputs.version
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.bump.outputs.version }}
+          PINNED: ${{ steps.bump.outputs.pinned }}
+          AUTOMERGE: ${{ steps.bump.outputs.automerge }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -72,6 +87,26 @@ jobs:
           {
             echo "[signal-cli ${VERSION}](https://github.com/AsamK/signal-cli/releases/tag/v${VERSION}), with the libsignal and Java it needs. The aarch64 image built with these versions."
             echo
-            echo "Read the release notes before merging, then publish with \`make addon-release VERSION=x.y.z\`."
+            if [ -n "${AUTOMERGE}" ]; then
+              echo "A patch release (${PINNED} → ${VERSION}), so this is merged without waiting for you. It reaches the Pi with the next \`make addon-release VERSION=x.y.z\`."
+            else
+              echo "More than a patch release (${PINNED} → ${VERSION}), so this is left for you. Read the release notes before merging, then publish with \`make addon-release VERSION=x.y.z\`."
+            fi
           } > "${RUNNER_TEMP}/body.md"
-          gh pr create --title "Bump signal-cli to ${VERSION}" --body-file "${RUNNER_TEMP}/body.md"
+          url="$(gh pr create --title "Bump signal-cli to ${VERSION}" --body-file "${RUNNER_TEMP}/body.md")"
+          echo "${url}"
+          echo "url=${url}" >> "${GITHUB_OUTPUT}"
+
+      # Rebased rather than squashed or merged, so main gets the one commit
+      # under its own subject, which is what the add-on changelog is written
+      # from. If this fails the run fails, and the pull request stays open to
+      # merge by hand.
+      - name: Merge it, if it is a patch release
+        if: steps.bump.outputs.automerge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.bump.outputs.version }}
+          URL: ${{ steps.pr.outputs.url }}
+        run: |
+          gh pr merge "${URL}" --rebase
+          git push origin --delete "signal-cli-${VERSION}"

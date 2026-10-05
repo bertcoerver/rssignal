@@ -249,9 +249,11 @@ Commit and push the result, and [publish a new version](#publishing-a-new-versio
 You should rarely need to run it yourself. The **Check signal-cli** workflow
 (`.github/workflows/signal-cli.yml`) runs the same script every Monday, builds
 the aarch64 image with the new versions, and opens a pull request if that
-works; merging it and publishing a new version is all that is left. A run that
-fails means a release is out that cannot be used yet, usually because exquo has
-not built its libsignal. The pull request needs *Settings → Actions → General →
+works. A patch release (0.14.8 → 0.14.9) is merged there and then, and only
+publishing a new version is left; anything bigger waits for you to read the
+release notes and merge it. A run that fails means a release is out that
+cannot be used yet, usually because exquo has not built its libsignal. The
+pull request needs *Settings → Actions → General →
 Allow GitHub Actions to create and approve pull requests* switched on.
 
 The Java version is the one lookup with no file published for it, so it is the
