@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.0
+
+- Enhance documentation for video playback in Infuse and add support for series metadata in NPO feed parsing
+- Enhance GitHub Actions workflow to support automatic merging of patch releases and improve pull request handling
+- Add GitHub Actions workflow to automate signal-cli version bumping
+
 ## 0.4.1
 
 - Refactor URL handling to ensure safe encoding for downloads and improve error handling
