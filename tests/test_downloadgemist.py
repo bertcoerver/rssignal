@@ -19,6 +19,8 @@ EPISODE = "https://npo.nl/start/afspelen/bureau-buitenland_825"
 OTHER = "https://npo.nl/start/afspelen/bureau-buitenland_826"
 FILE_URL = "https://downloadgemist.nl/cache/abc/Bureau%20Buitenland.mp4"
 
+_REAL_DOWNLOAD = downloadgemist._download
+
 STREAMS = {
     "sessionID": "1790595490-7408",
     "title": "Bureau Buitenland s02e28",
@@ -386,3 +388,96 @@ def test_call_strips_the_html_from_what_the_site_said(monkeypatch):
 
     assert "6 van de 5 actieve downloads" in str(caught.value)
     assert "<a" not in str(caught.value)
+
+
+# --- the file's own url ---------------------------------------------------
+
+RAW_FILE_URL = (
+    "https://downloadgemist.nl/cache/2026/10/04/"
+    "DownloadGemist [2026-10-04] Bureau Buitenland s02e29 (720p_2).mp4"
+)
+
+
+@pytest.mark.parametrize(
+    "given, expected",
+    [
+        # As the site really hands it over: spaces and brackets, for a browser.
+        (
+            RAW_FILE_URL,
+            "https://downloadgemist.nl/cache/2026/10/04/DownloadGemist%20%5B2026-10-04%5D"
+            "%20Bureau%20Buitenland%20s02e29%20%28720p_2%29.mp4",
+        ),
+        # Already escaped: left exactly as it is, not escaped twice.
+        (FILE_URL, FILE_URL),
+        # A title with an accent in it.
+        (
+            "https://downloadgemist.nl/cache/Oekraïne.mp4",
+            "https://downloadgemist.nl/cache/Oekra%C3%AFne.mp4",
+        ),
+        # Relative to the site.
+        ("cache/a b.mp4", "https://downloadgemist.nl/cache/a%20b.mp4"),
+        # A query survives as a query.
+        (
+            "https://files.example.com/get?file=a b.mp4&token=x%2Fy",
+            "https://files.example.com/get?file=a%20b.mp4&token=x%2Fy",
+        ),
+    ],
+)
+def test_safe_url(given, expected):
+    assert downloadgemist._safe_url(given) == expected
+
+
+def test_download_asks_for_a_url_with_spaces_in_it_escaped(monkeypatch, tmp_path):
+    asked = []
+
+    def fake_open(request, timeout):
+        asked.append(request.full_url)
+        return _Response(b"episode")
+
+    monkeypatch.setattr(downloadgemist, "_open", fake_open)
+    path = str(tmp_path / "video.mp4")
+
+    downloadgemist._download(RAW_FILE_URL, path, timeout=60)
+
+    assert " " not in asked[0]
+    assert asked[0].endswith("%28720p_2%29.mp4")
+    with open(path, "rb") as fh:
+        assert fh.read() == b"episode"
+
+
+def test_download_really_gets_past_http_client_with_such_a_url(monkeypatch, tmp_path):
+    """The real opener, stopped just short of the network.
+
+    The unescaped url never got as far as a socket: http.client refused to put
+    it on the wire. Escaped, it has to reach the connect.
+    """
+    import socket
+
+    def no_network(*args, **kwargs):
+        raise OSError("no network in tests")
+
+    monkeypatch.setattr(socket, "create_connection", no_network)
+
+    with pytest.raises(FeedError, match="no network in tests"):
+        downloadgemist._download(RAW_FILE_URL, str(tmp_path / "v.mp4"), timeout=5)
+
+
+def test_a_complaint_from_http_client_is_a_failure_like_any_other(
+    clock, site, tmp_path, monkeypatch
+):
+    """Counted, so the episode backs off instead of being asked for every run."""
+    import http.client
+
+    def refuses(request, timeout):
+        raise http.client.InvalidURL("URL can't contain control characters.")
+
+    lookup = downloadgemist.streams(EPISODE)
+    # The site fixture fakes the download whole; this test wants the real one,
+    # failing where the real one failed.
+    monkeypatch.setattr(downloadgemist, "_download", _REAL_DOWNLOAD)
+    monkeypatch.setattr(downloadgemist, "_open", refuses)
+
+    with pytest.raises(FeedError, match="control characters"):
+        downloadgemist.fetch(lookup, "360p", str(tmp_path), timeout=900)
+
+    assert cache.get("downloadgemist_failed", EPISODE)["count"] == 1

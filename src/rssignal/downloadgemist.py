@@ -50,15 +50,17 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime
+from http.client import HTTPException
 from http.cookiejar import CookieJar
 from urllib.error import URLError
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 from urllib.request import HTTPCookieProcessor, Request, build_opener
 
 from . import cache, timing
 from .feeds import FeedError, retrying, strip_html
 from .video import VideoGone
 
+SITE = "https://downloadgemist.nl/"
 HYPERBRIDGE = "https://downloadgemist.nl/core/hyperbridge.php"
 
 # Who is asking, said plainly, and from where the site's own page would ask.
@@ -363,7 +365,7 @@ def _call(**form: str):
         try:
             with _open(request, timeout=CALL_TIMEOUT) as response:
                 return response.read().decode("utf-8", errors="replace")
-        except (URLError, OSError, ValueError) as exc:
+        except (URLError, OSError, ValueError, HTTPException) as exc:
             raise FeedError(f"Could not reach Downloadgemist: {exc}") from exc
 
     with timing.step("downloadgemist", form.get("mode", "")):
@@ -387,8 +389,30 @@ def _open(request: Request, *, timeout: float):
     return _opener.open(request, timeout=timeout)
 
 
+def _safe_url(file_url: str) -> str:
+    """``file_url`` as something that can be requested.
+
+    The site names its files for people — ``…/DownloadGemist [2026-10-04] Bureau
+    Buitenland s02e29 (720p_2).mp4`` — and hands the link over exactly like
+    that, spaces and all, for a browser to tidy up. Nothing tidies it up here,
+    and http.client refuses a url with a space in it outright. ``%`` is left
+    alone so a link that arrives already escaped isn't escaped twice.
+    """
+    parts = urlsplit(urljoin(SITE, file_url.strip()))
+    return urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            quote(parts.path, safe="/%"),
+            quote(parts.query, safe="=&%+"),
+            "",
+        )
+    )
+
+
 def _download(file_url: str, path: str, *, timeout: float) -> None:
     """Stream ``file_url`` into ``path``, starting over if the network drops."""
+    file_url = _safe_url(file_url)
 
     def once() -> None:
         request = Request(file_url, headers=HEADERS)
@@ -396,7 +420,10 @@ def _download(file_url: str, path: str, *, timeout: float) -> None:
             with _open(request, timeout=timeout) as response, open(path, "wb") as out:
                 while chunk := response.read(256 * 1024):
                     out.write(chunk)
-        except (URLError, OSError, ValueError) as exc:
+        # HTTPException too: http.client's complaints (a url it won't send, a
+        # response cut short) are not OSErrors, and one that escaped as itself
+        # would skip the backoff below and be asked for again every run.
+        except (URLError, OSError, ValueError, HTTPException) as exc:
             raise FeedError(f"Could not download {file_url!r}: {exc}") from exc
 
     with timing.step("http download", urlparse(file_url).netloc):
