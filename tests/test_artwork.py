@@ -90,6 +90,19 @@ def test_refresh_creates_no_group(monkeypatch, tmp_path):
     assert updated == []
 
 
+def test_refresh_skips_a_feed_that_opted_out(monkeypatch, tmp_path):
+    # A source whose artwork is this week's episode would be uploaded every time.
+    updated = _patch(
+        monkeypatch,
+        tmp_path,
+        {"Maps": ("https://a/maps.jpg", b"maps"), "Pod": ("https://a/pod.jpg", b"pod")},
+    )
+    maps = FeedConfig(url="https://maps", name="Maps", refresh_image=False)
+
+    assert artwork.refresh([maps, *_feeds("Pod")], _groups("Maps", "Pod")) == 1
+    assert updated == [("Pod=", "pod.jpg")]
+
+
 def test_refresh_leaves_the_picture_of_a_feed_without_artwork(monkeypatch, tmp_path):
     updated = _patch(monkeypatch, tmp_path, {})
 

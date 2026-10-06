@@ -34,7 +34,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from . import cache, timing
 from .download import fetch_text
@@ -85,6 +85,17 @@ ARTE_DATED_ITEMS = 12
 # had none to give. See :mod:`rssignal.cache`.
 _PUBLISHED_NS = "arte_published"
 _UNDATED_NS = "arte_undated"
+
+# How long a programme ARTE lists without a video is waited for.
+#
+# A missing stream is normally ARTE running behind its own schedule, and the
+# video turns up within a day or two. Not always: 125533-026-A, a rerun of an
+# episode from May, was given a new three-week rights window and no video at
+# all, and for as long as it was retried nothing published after it could go
+# out — a feed is sent oldest first. A week is every chance a late video needs,
+# and it is the whole of a weekly show's cycle: wait any longer and the next
+# episode is the one being held up.
+STREAMS_PATIENCE = timedelta(days=7)
 
 # H.265 rungs duplicate resolutions that also exist in H.264, at no useful size
 # saving here, and play back unevenly across Signal's clients. Not worth the
@@ -159,12 +170,16 @@ class _NoRights(FeedError):
     """ARTE has no rights to show the programme right now — see :func:`resolve`."""
 
 
+class _NoStreams(FeedError):
+    """ARTE lists the programme but has no video for it — see :func:`resolve`."""
+
+
 def resolve(item: FeedItem, *, max_bytes: int = VIDEO_MAX_BYTES) -> HlsPlan:
     """Work out which stream and quality ``item``'s video would be fetched at.
 
     Raises :class:`FeedError` if the item is not an ARTE programme, the player
     api has nothing usable, or every rung is too big to send, and
-    :class:`VideoGone` if its rights have run out.
+    :class:`VideoGone` if its rights have run out or its video never arrived.
     """
     found = arte_program_id(item.link)
     if not found:
@@ -181,6 +196,17 @@ def resolve(item: FeedItem, *, max_bytes: int = VIDEO_MAX_BYTES) -> HlsPlan:
         if released is not None and released <= datetime.now(timezone.utc):
             raise VideoGone(
                 f"{program_id} is no longer on ARTE: its rights have expired"
+            ) from exc
+        raise
+    except _NoStreams as exc:
+        # Worth waiting for, but not for ever: see STREAMS_PATIENCE. An item
+        # with no date can't say how long it has been, and is left to retry.
+        released = item.published
+        waited = datetime.now(timezone.utc) - released if released else None
+        if waited is not None and waited > STREAMS_PATIENCE:
+            raise VideoGone(
+                f"ARTE has listed {program_id} for {waited.days} days without "
+                "a video for it; not waiting for it any longer"
             ) from exc
         raise
     variants = _variants(fetch_text(master_url))
@@ -214,12 +240,13 @@ def _player_config(program_id: str, lang: str) -> tuple[str, float]:
         # ARTE says why in `error.code`, and the two it gives mean opposite
         # things: NO_RIGHTS is a programme outside its rights window, while
         # STREAMS_MISSING is one inside it whose video ARTE has not got to yet —
-        # seen on a Dessous des Cartes three days after its rights opened.
+        # seen on a Dessous des Cartes three days after its rights opened, and
+        # still eleven days after.
         code = (attributes.get("error") or {}).get("code")
         if code == "ERROR_NO_RIGHTS":
             raise _NoRights(f"{program_id} is not on ARTE at the moment ({code})")
         if code == "ERROR_STREAMS_MISSING":
-            raise FeedError(
+            raise _NoStreams(
                 f"ARTE lists {program_id} but has no video for it yet ({code}); "
                 "trying again next run"
             )

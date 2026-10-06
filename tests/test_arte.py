@@ -280,6 +280,22 @@ def test_a_missing_stream_inside_the_rights_window_is_retried(monkeypatch):
     assert not isinstance(caught.value, VideoGone)
 
 
+def test_a_stream_still_missing_after_a_week_is_given_up_on(monkeypatch):
+    # The same programme eleven days in: a rerun ARTE opened a rights window
+    # for and never put a video behind. Retried, it holds up everything after it.
+    _patch_fetch(monkeypatch, config=_no_streams("ERROR_STREAMS_MISSING"))
+    with pytest.raises(VideoGone, match="for 11 days without a video"):
+        arte.resolve(_dated(days_ago=11))
+
+
+def test_an_undated_programme_without_a_stream_is_still_retried(monkeypatch):
+    # No date, no way to say how long it has been missing.
+    _patch_fetch(monkeypatch, config=_no_streams("ERROR_STREAMS_MISSING"))
+    with pytest.raises(FeedError, match="has no video for it yet") as caught:
+        arte.resolve(_dated(days_ago=None))
+    assert not isinstance(caught.value, VideoGone)
+
+
 def test_expired_rights_on_a_released_programme_are_permanent(monkeypatch):
     _patch_fetch(monkeypatch, config=_no_streams("ERROR_NO_RIGHTS"))
     with pytest.raises(VideoGone, match="rights have expired"):

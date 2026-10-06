@@ -163,6 +163,7 @@ Each feed entry supports:
 | `preview_description` | no     | Template for the card's text. Omit for a card with no description.     |
 | `episodic`          | no       | Follow this feed from the beginning, at a set pace. See [episodic feeds](#episodic-feeds). |
 | `start`             | no       | Where an episodic feed begins, e.g. `"2019-01-01"`. Episodic feeds only. |
+| `refresh_image`     | no       | `false` leaves this feed's group picture alone. See [keeping group pictures current](#keeping-group-pictures-current). |
 | `<field>_contains`  | no       | Keep items whose field contains any of these terms.                    |
 | `<field>_excludes`  | no       | Drop items whose field contains any of these terms.                    |
 | `<field>_matches`   | no       | Keep items whose field matches any of these regexes.                   |
@@ -401,7 +402,9 @@ parts that didn't arrive.
 The exception is something too big even for four parts (about 380 MB), which is
 the one failure that won't read differently tomorrow. That one is stepped over like
 a Short — nothing sent, watermark and all — so it doesn't block the items behind
-it.
+it. So is an ARTE programme that has been listed for a week with no video behind
+it: ARTE sometimes opens a rights window for a rerun and never supplies the video,
+and waiting on it would hold up every episode after it until the window closed.
 
 Unlike a voice note, a video that fits one message goes out as a single message:
 these items get no preview card by default, so there's nothing for the attachment
@@ -579,6 +582,13 @@ channel avatars its picture.
 Only groups that already exist are touched. A feed whose source has no artwork
 leaves its group's picture alone. A feed whose source is down, or whose image
 won't download, is reported and skipped, and it doesn't stop the others.
+
+Some sources have no fixed artwork to keep in step with. ARTE's picture for *Le
+Dessous des Cartes* is a still from the current episode, so it is a different
+image every week and every refresh changes the group's picture. Set
+`"refresh_image": false` on a feed like that: its group keeps the picture it
+has — the one it was created with, or one you set by hand — and the refresh
+skips it.
 
 To change how often it runs, set how many runs there are between refreshes on
 average, or `0` to turn it off:

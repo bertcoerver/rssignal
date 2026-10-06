@@ -18,6 +18,13 @@ Setting a group's picture is not silent: every member sees "changed the group
 picture" in the chat. So an image is only uploaded when it differs from the one
 rssignal last put there, which is remembered by content in the cache. Losing
 the cache costs one redundant upload per group, nothing worse.
+
+That comparison is only as good as the source's idea of artwork. ARTE gives Le
+Dessous des Cartes no logo at all: the picture it calls the show's is a still
+from the current episode, so it is a different image every week and every
+refresh is an upload. There is nothing to compare that would tell such a source
+from one that has rebranded, so it is said in feeds.json instead —
+``"refresh_image": false`` — and that feed's group is left alone.
 """
 
 from __future__ import annotations
@@ -73,7 +80,8 @@ def refresh(
     Only feeds whose group already exists are looked at: a group is created on
     a feed's first send, with its picture, and creating one here would be the
     stray empty group that rule exists to prevent. A source with no artwork
-    leaves its group's picture alone rather than clearing it.
+    leaves its group's picture alone rather than clearing it, and so does a feed
+    with ``refresh_image`` turned off.
 
     Each feed is its own attempt. One whose source is down or whose image won't
     download is reported and skipped, and the rest carry on — a picture is
@@ -82,6 +90,8 @@ def refresh(
     changed = 0
     for cfg in feeds:
         label = cfg.name or cfg.url
+        if not cfg.refresh_image:
+            continue
         try:
             group = match_group(groups, cfg.name)
             if group is None:

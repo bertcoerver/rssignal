@@ -80,6 +80,7 @@ KNOWN_KEYS = (
     "preview_description",
     "episodic",
     "start",
+    "refresh_image",
 )
 
 # The field names every item has, in the order item_fields lists them.
@@ -203,6 +204,10 @@ class FeedConfig:
     released at the cadence's pace. ``start`` is where that walk begins, for a
     back catalogue you don't want all of — it acts as the watermark the feed
     would have had, so everything published before it is behind us already.
+
+    ``refresh_image`` off leaves the group's picture as it is when pictures are
+    refreshed (see :mod:`rssignal.artwork`), for a source whose "artwork" is not
+    a logo but whatever it is showing this week.
     """
 
     url: str
@@ -216,6 +221,7 @@ class FeedConfig:
     preview_description: str | None = None
     episodic: Cadence | None = None
     start: datetime | None = None
+    refresh_image: bool = True
 
 
 @dataclass(frozen=True)
@@ -346,6 +352,10 @@ def _build_feed_config(raw: object, index: int) -> FeedConfig:
     if link_preview is not None and not isinstance(link_preview, bool):
         raise FeedError(f"{where} link_preview must be true or false.")
 
+    refresh_image = raw.get("refresh_image", True)
+    if not isinstance(refresh_image, bool):
+        raise FeedError(f"{where} refresh_image must be true or false.")
+
     previews = {}
     for key in ("preview_url", "preview_title", "preview_description"):
         value = raw.get(key)
@@ -371,6 +381,7 @@ def _build_feed_config(raw: object, index: int) -> FeedConfig:
         link_preview=link_preview,
         episodic=episodic,
         start=start,
+        refresh_image=refresh_image,
         **previews,
     )
 

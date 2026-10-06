@@ -72,7 +72,8 @@ class VideoGone(FeedError):
 
     The third permanent answer. An ARTE programme whose rights window has closed
     does not come back, and one left to retry would hold every later episode of
-    its feed behind it from then on.
+    its feed behind it from then on. The same goes for one that was listed and
+    never turned up: at some point that is an answer too.
     """
 
 

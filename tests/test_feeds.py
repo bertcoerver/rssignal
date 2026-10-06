@@ -817,6 +817,32 @@ def test_load_feeds_preview_defaults_are_none(tmp_path):
     assert preview_fields(_POST, cfg) is None
 
 
+def test_load_feeds_refresh_image_defaults_to_on_and_can_be_turned_off(tmp_path):
+    path = _write_config(
+        tmp_path,
+        {
+            "feeds": [
+                {"name": "F", "url": "https://a"},
+                {"name": "G", "url": "https://b", "refresh_image": False},
+            ]
+        },
+    )
+
+    kept, pinned = load_feeds(path)
+
+    assert kept.refresh_image is True
+    assert pinned.refresh_image is False
+
+
+def test_load_feeds_refresh_image_must_be_boolean(tmp_path):
+    path = _write_config(
+        tmp_path,
+        {"feeds": [{"name": "F", "url": "https://a", "refresh_image": "no"}]},
+    )
+    with pytest.raises(FeedError, match="refresh_image must be true or false"):
+        load_feeds(path)
+
+
 def test_load_feeds_link_preview_must_be_boolean(tmp_path):
     path = _write_config(
         tmp_path,
