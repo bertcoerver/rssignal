@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.1
+
+- Add refresh_image option to FeedConfig and update related functionality
+
 ## 0.5.0
 
 - Enhance documentation for video playback in Infuse and add support for series metadata in NPO feed parsing
