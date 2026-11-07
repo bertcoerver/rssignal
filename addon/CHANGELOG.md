@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.2
+
+- Read NPO Start series from its streamed page data, now that __NEXT_DATA__ is gone
+- Bump signal-cli to 0.14.9
+
 ## 0.5.1
 
 - Add refresh_image option to FeedConfig and update related functionality
