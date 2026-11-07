@@ -67,6 +67,22 @@ def _page(queries):
     )
 
 
+def _flight_page(queries):
+    """The page as NPO has served it since November 2026: a Next.js App Router
+    page, its data streamed in pieces through ``self.__next_f.push``, with the
+    react-query cache handed to a client component somewhere in the stream."""
+    line = json.dumps(
+        ["$", "$L20", None, {"state": {"mutations": [], "queries": queries}, "children": "$L21"}]
+    )
+    stream = '0:{"P":null}\n1a:["$","title","0",{"children":"Bureau Buitenland"}]\n1f:' + line + "\n"
+    third = len(stream) // 3
+    pieces = [stream[:third], stream[third : 2 * third], stream[2 * third :]]
+    scripts = ['<script>(self.__next_f=self.__next_f||[]).push([0])</script>'] + [
+        f"<script>self.__next_f.push({json.dumps([1, piece])})</script>" for piece in pieces
+    ]
+    return "<html><head></head><body>" + "".join(scripts) + "</body></html>"
+
+
 def _queries(programs=PROGRAMS, series=SERIES):
     return [
         {"queryKey": ["series:detail-bureau-buitenland"], "state": {"data": series}},
@@ -194,6 +210,24 @@ def test_parse_applies_extracts(monkeypatch):
     feed = npo.parse_npo_series(cfg)
 
     assert feed.items[0].extra["number"] == "825"
+
+
+def test_parse_reads_the_streamed_page_npo_serves_now(monkeypatch):
+    """No __NEXT_DATA__ any more: the same data, in the App Router's flight stream."""
+    _patch_page(monkeypatch, html=_flight_page(_queries()))
+
+    feed = npo.parse_npo_series(FeedConfig(url=SERIES_URL, name="BB"))
+
+    assert [item.title for item in feed.items] == [p["title"] for p in PROGRAMS]
+    assert feed.description
+
+
+def test_parse_of_a_streamed_page_without_the_series_fails_loudly(monkeypatch):
+    queries = [q for q in _queries() if not q["queryKey"][0].startswith("series:")]
+    _patch_page(monkeypatch, html=_flight_page(queries))
+
+    with pytest.raises(FeedError, match="NPO has changed its pages again"):
+        npo.parse_npo_series(FeedConfig(url=SERIES_URL, name="BB"))
 
 
 def test_parse_without_page_data_fails_loudly(monkeypatch):

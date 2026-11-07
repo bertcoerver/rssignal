@@ -71,6 +71,12 @@ _NEXT_DATA_RE = re.compile(
     r'<script id="__NEXT_DATA__"[^>]*>(?P<json>.*?)</script>', re.DOTALL
 )
 
+# Since November 2026 the page is a Next.js App Router page: no __NEXT_DATA__,
+# but its data streamed in as "flight" chunks, each a JSON array whose second
+# element is a piece of the stream, in <script>self.__next_f.push([1,"…"])</script>.
+_FLIGHT_RE = re.compile(r"self\.__next_f\.push\((?P<json>\[.*?\])\)\s*</script>", re.DOTALL)
+_QUERIES_RE = re.compile(r'"queries"\s*:\s*\[')
+
 # Downloadgemist lists video rungs without saying whether their bitrate includes
 # the sound. Assuming it doesn't costs, at worst, a rung of quality; assuming it
 # does could cost an extra part. See `resolve`.
@@ -197,16 +203,55 @@ def _queries(url: str) -> list[dict]:
 
     html = fetch_text(url, headers=PAGE_HEADERS)
     match = _NEXT_DATA_RE.search(html)
-    if not match:
-        raise FeedError(f"NPO page {url!r} carries no __NEXT_DATA__")
-    try:
-        data = json.loads(match["json"])
-        queries = data["props"]["pageProps"]["dehydratedState"]["queries"]
-        if not isinstance(queries, list):
-            raise TypeError("queries is not a list")
-    except (ValueError, KeyError, TypeError) as exc:
-        raise FeedError(f"Unexpected NPO page data for {url!r}: {exc}") from exc
+    if match:
+        try:
+            data = json.loads(match["json"])
+            queries = data["props"]["pageProps"]["dehydratedState"]["queries"]
+            if not isinstance(queries, list):
+                raise TypeError("queries is not a list")
+        except (ValueError, KeyError, TypeError) as exc:
+            raise FeedError(f"Unexpected NPO page data for {url!r}: {exc}") from exc
+        return queries
+
+    queries = _flight_queries(html)
+    if queries is None:
+        raise FeedError(
+            f"NPO page {url!r} carries neither __NEXT_DATA__ nor the series data "
+            "in its streamed page data — NPO has changed its pages again."
+        )
     return queries
+
+
+def _flight_queries(html: str) -> list[dict] | None:
+    """The react-query cache out of an App Router page's flight stream.
+
+    The stream is the chunks' text put back together. Somewhere in it a client
+    component is handed the dehydrated cache, ``{"mutations": [...],
+    "queries": [...]}``, as plain JSON: the list that holds the series' own
+    query is the one wanted. ``None`` if there is no such list.
+    """
+    stream = []
+    for match in _FLIGHT_RE.finditer(html):
+        try:
+            chunk = json.loads(match["json"])
+        except ValueError:
+            continue
+        if isinstance(chunk, list) and len(chunk) > 1 and isinstance(chunk[1], str):
+            stream.append(chunk[1])
+    text = "".join(stream)
+
+    decoder = json.JSONDecoder()
+    for found in _QUERIES_RE.finditer(text):
+        try:
+            queries, _ = decoder.raw_decode(text, found.end() - 1)
+        except ValueError:
+            continue
+        if not isinstance(queries, list):
+            continue
+        queries = [q for q in queries if isinstance(q, dict)]
+        if _query(queries, "series:detail-") is not None:
+            return queries
+    return None
 
 
 def _query(queries: list[dict], prefix: str):
