@@ -24,8 +24,8 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # To upgrade signal-cli: bump SIGNAL_CLI_VERSION, then read
 # https://github.com/AsamK/signal-cli/blob/v<version>/libsignal-version
 # and set LIBSIGNAL_VERSION to what it says. The build fails if they disagree.
-ARG SIGNAL_CLI_VERSION="0.14.9"
-ARG LIBSIGNAL_VERSION="0.103.0"
+ARG SIGNAL_CLI_VERSION="0.14.10"
+ARG LIBSIGNAL_VERSION="0.106.1"
 ARG JAVA_VERSION="25"
 
 # Prepend, never replace. The base image's own s6 services run with this PATH
