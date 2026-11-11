@@ -51,7 +51,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: pip install pytest pytest-xdist ".[video]"
+      - run: pip install pytest pytest-xdist .
       - run: pytest
 
   build:

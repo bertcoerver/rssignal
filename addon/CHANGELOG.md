@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+- rssignal no longer downloads anything. The fetchit add-on reads the feeds and
+  files what is new in /media/fetchit; rssignal sends from there. Move each
+  feed's `url`, and the filters that decide what is worth downloading, to a
+  feed of the same name in fetchit.json — rssignal says so if it finds a `url`.
+- Removed: the media archive (`media_keep_days`; fetchit's library replaces it),
+  `update_yt_dlp`, and yt-dlp itself. New option: `library`.
+- Group pictures come from the library and are checked after every run, rather
+  than fetched from the source about once a month.
+- A panel in Home Assistant's sidebar: status, every feed and where it stands,
+  run and dry-run buttons, a send form, recent activity, the log, and linking
+  by QR code.
+- Notifications from Home Assistant: its Signal Messenger integration works with
+  rssignal as its `url`, and `/api/send` takes JSON from anything else. New
+  options `api_allow` and `api_token`.
+- The schedule is kept by `rssignal serve`, which holds one signal-cli for the
+  add-on's whole life, so a notification never waits behind a run.
+
 ## 0.5.0
 
 - Enhance documentation for video playback in Infuse and add support for series metadata in NPO feed parsing

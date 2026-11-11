@@ -3,6 +3,10 @@
 Runs rssignal on a schedule inside Home Assistant OS, so the feeds keep arriving
 on a machine that is never asleep.
 
+rssignal sends; it does not download. The **fetchit** add-on
+(`https://github.com/bertcoerver/fetchit`) reads the feeds and files what is new
+in `/media/fetchit`, and this add-on sends from there. Install both.
+
 This exists because the alternative was a laptop. rssignal used to fire from an
 Apple Shortcut on a Mac, and about a third of the wrapper script was there to
 fight the machine: `caffeinate` to keep it awake, `pmset` to record when that
@@ -12,10 +16,8 @@ Pi has none of those problems.
 ## What you need
 
 - Home Assistant OS on aarch64 (Raspberry Pi 4 or 5) or amd64.
-- **Booting from a USB SSD is strongly recommended over an SD card.** Every
-  podcast and video is written to disk in full before being uploaded, and
-  episodes are then kept for two weeks. That is a standing few GB and on the
-  order of 100 GB of writes a year, which an SD card will not enjoy.
+- The **fetchit** add-on, filling `/media/fetchit`. Its DOCS cover the disk:
+  a USB SSD rather than an SD card.
 - A phone with Signal, to link the account.
 - A way to put `feeds.json` on the host: the **File Editor** or **Samba
   share** add-on. That is the only file you provide; the add-on itself comes
@@ -102,9 +104,12 @@ The prefix is Home Assistant's hash of the repository URL. If you added the
 repository under a different spelling — a trailing `/` or `.git` — it will be
 another one; it is the folder that ends in `_rssignal`.
 
-Use `feeds.example.json` from the repository as a starting point. You can edit
-it later with the File Editor add-on; the next run picks up the change, with
-no restart needed.
+Use `feeds.example.json` from the repository as a starting point. A feed's
+`name` is its Signal group, and it sends from the feed of the same name in
+fetchit's `fetchit.json` unless `source` names another. Which feeds are read and
+what is worth downloading is fetchit's config, not this one. You can edit it
+later with the File Editor add-on; the next run picks up the change, with no
+restart needed.
 
 ### 2. The account number
 
@@ -115,7 +120,12 @@ it.
 ### 3. Link the Signal account
 
 rssignal sends as a linked device, like Signal Desktop, so the add-on has to be
-linked to your account once. It links itself:
+linked to your account once. The easiest way is the panel: start the add-on,
+open **rssignal** in Home Assistant's sidebar, press **Show the QR code**, and
+scan it from **Signal → Settings → Linked Devices → Link New Device**. The panel
+says *Linked* when the initial sync has finished.
+
+The older way still works, for when the panel is not an option:
 
 1. **Configuration** tab → set `link_mode` to **true** → Save.
 2. **Start** the add-on.
@@ -162,8 +172,9 @@ descriptions that hold the watermarks.
 | `link_mode` | `false` | Link to Signal instead of running. See above. |
 | `on_start` | `wait` | `wait`, `dry-run` or `run` — what to do at startup, before the schedule takes over. |
 | `schedule` | `01:30`, `06:30`, `15:00` | Local times to run at. |
-| `media_keep_days` | `14` | How long sent episodes stay in `/media`. `0` keeps them forever. |
-| `update_yt_dlp` | `true` | Upgrade yt-dlp once a day before the first run. |
+| `library` | `/media/fetchit` | The library the fetchit add-on fills. |
+| `api_allow` | `172.30.32.1` | Addresses that may send through rssignal: Home Assistant itself. |
+| `api_token` | (none) | A bearer token that lets anything else on Home Assistant's network send. |
 | `log_level` | `info` | Add-on log verbosity. |
 
 ### About the schedule
@@ -178,83 +189,101 @@ every-other-day one.
 Running more often is harmless — nothing is ever sent twice, and a run with
 nothing to do takes a few seconds — but there is little to gain.
 
-About once a month a run also refreshes every feed group's picture from its
-source's artwork. That happens by chance, on one run in N, and the add-on works
-N out from the schedule (30 × the number of times), so the rate stays about
-monthly however many times you list. Starting the add-on with `on_start: run`
-refreshes them straight away. See
-[Keeping group pictures current](../README.md#keeping-group-pictures-current).
+Put the times a little after fetchit's (its defaults are 01:00, 06:00 and
+14:30), so each run finds what the last download brought. Nothing breaks if
+they overlap: fetchit moves an item into place only once all of it is there.
 
 Changing the schedule takes effect when the add-on restarts.
 
-## The media archive
+## The panel
 
-Everything the add-on sends is also kept in Home Assistant's media folder, under
-**Media → rssignal**, laid out as:
+Once started, the add-on is **rssignal** in Home Assistant's sidebar (or **Open
+Web UI** on its page). It shows whether the account is linked and when the next
+run is; every feed with its group, how many of its items are waiting, how far it
+has been sent, and when an episodic feed's next episode is due; what was sent
+recently, by a run, by Home Assistant or by hand; and the log. Buttons start a
+run, a dry run or a group picture refresh now, with what it printed shown as it
+goes; a form sends a message to any group or number.
 
-```
-/media/rssignal/<feed>/<YYYY-MM-DD>-<episode-title>.mp3
-```
+It is reached through Home Assistant's ingress, so it is behind your Home
+Assistant login and nothing else can open it.
 
-Files are deleted `media_keep_days` after they were archived — counted from when
-the file was saved, not when the episode was published, so a back catalogue
-released years late still gets its full fortnight.
+## Notifications from Home Assistant
 
-This costs no extra disk writes. The file is *hard-linked* into place rather
-than copied, which is why downloads are staged in `/media/rssignal/.staging`:
-the link only works within one filesystem. The `.staging` folder is dot-prefixed
-so the Media browser does not show half-finished downloads; a run that is killed
-partway leaves a file there, and the next run's expiry pass clears it.
+rssignal can send messages for Home Assistant — "the washing machine is done",
+"someone is at the door" — through the same linked account. There are two ways
+in. Both are reached at `http://<hostname>:8099`, where `<hostname>` is shown on
+the add-on's **Info** page (something like `a67c9053-rssignal`); the panel shows
+the snippet below already filled in.
 
-Set `media_keep_days` to `0` to keep everything, and unset it entirely — by
-editing `rssignal-run` — to go back to keeping nothing.
+### Home Assistant's Signal Messenger integration
 
-### Watching the videos in Infuse
+rssignal speaks the part of `signal-cli-rest-api` that Home Assistant's built-in
+[Signal Messenger](https://www.home-assistant.io/integrations/signal_messenger/)
+integration uses, so it works as it is. In `configuration.yaml`:
 
-A video is filed with two small files of the same name: an `.xml` holding its
-title, synopsis and date, and a `.jpg` of its picture. A player that reads them
-shows each episode as its source described it, rather than as a file name.
-
-1. Install the **Samba share** add-on and give it a username and password.
-2. In Infuse, add a share: **SMB**, this machine's address, those credentials.
-3. Browse to `media/rssignal/<feed>` and mark the folder as a favourite.
-
-In **Settings → Metadata & Artwork**, switch on **Prefer Local Artwork** so the
-episode's own still is used. The pictures appear in Home Assistant's Media
-browser as well, next to the videos they belong to; both go when the video
-expires.
-
-This gives a folder of episodes, not a series with seasons: Infuse only builds
-those for shows it can find on TMDB.
-
-### A series with seasons: Jellyfin or Emby
-
-Episodes from a source that numbers them — NPO Start does — are filed the way a
-media server expects a series, with the Kodi-style `.nfo` files it reads:
-
-```
-/media/rssignal/<feed>/tvshow.nfo
-/media/rssignal/<feed>/poster.jpg
-/media/rssignal/<feed>/fanart.jpg
-/media/rssignal/<feed>/Season 02/<feed>-s02e28.mp4
-/media/rssignal/<feed>/Season 02/<feed>-s02e28.nfo
-/media/rssignal/<feed>/Season 02/<feed>-s02e28.jpg
+```yaml
+notify:
+  - platform: signal_messenger
+    name: signal
+    url: "http://a67c9053-rssignal:8099"
+    number: "+31600000000"        # the account in this add-on's configuration
+    recipients:
+      - "Laundry"                 # a group's name, a number, or group:<id>
 ```
 
-1. Install a Jellyfin or Emby add-on (neither is official; the
-   `alexbelgium/hassio-addons` repository has both) and let it see `/media`.
-2. Add a library of type **Shows** pointing at `/media/rssignal`. Under its
-   metadata settings, keep **Nfo** enabled as a metadata reader.
-3. In Infuse, add the server (**Jellyfin** or **Emby**, not SMB) and the feed
-   shows up as a series, with seasons, the episode stills and the synopses.
+Restart Home Assistant, and `notify.signal` sends to the Laundry group:
 
-The files are marked locked, so the server does not replace them with an online
-match. `poster.jpg` is the series' wide artwork; swap in a tall one if you like
-— it is fetched only when missing and never overwritten.
+```yaml
+automation:
+  - alias: Washing machine is done
+    triggers:
+      - trigger: state
+        entity_id: sensor.washing_machine_status
+        to: "done"
+    actions:
+      - action: notify.signal
+        data:
+          message: "The washing machine is done."
+```
 
-Feeds that are not numbered (ARTE, YouTube, podcasts) keep the dated layout and
-will look out of place in a Shows library; give the server a library per feed
-folder if that matters.
+`target:` in the action sends one message somewhere else instead
+(`target: ["+31611111111"]`), and `data: {urls: [...]}` or `data: {attachments:
+[...]}` attaches a picture — a camera snapshot, say.
+
+Recipients are matched to groups by name, ignoring case. rssignal does not
+create a group for a notification: make it in Signal first (an announcement-only
+group with just you in it is what a feed gets too), and invite whoever should
+hear about the washing.
+
+### Anything else: `/api/send`
+
+```yaml
+rest_command:
+  signal:
+    url: "http://a67c9053-rssignal:8099/api/send"
+    method: POST
+    content_type: "application/json"
+    payload: '{"to": "{{ to }}", "message": "{{ message }}"}'
+```
+
+`to` is a group's name, a number, `group:<id>`, or a list of them;
+`attachments` is a list of base64 strings or `data:` URIs.
+
+### Who may send
+
+Home Assistant reaches the add-on over its internal network; no port is
+published on yours. Requests are accepted from the addresses in `api_allow`
+(Home Assistant is `172.30.32.1`) and from anything presenting `api_token` as
+`Authorization: Bearer <token>`. A refused request is named in the log and in
+the panel's activity, with its address, so you can see what to allow.
+
+## Watching what was sent
+
+The library in `/media/fetchit` is laid out for Jellyfin: videos as series with
+seasons, podcasts as albums. See the fetchit add-on's DOCS for setting up a
+Jellyfin library on it, and Infuse on top of that. How long things stay there
+is fetchit's `keep_days`.
 
 ## The signal-cli problem
 
@@ -319,24 +348,24 @@ There is no shell into an add-on on Home Assistant OS (see
 normally type is reported or triggered from the Configuration tab instead.
 
 **`rssignal doctor` runs on every start** and its output goes to the add-on log.
-It checks signal-cli, ffmpeg and yt-dlp on `PATH`, which accounts are linked,
-the config and the log path — so restarting the add-on is the way to ask "is
+It checks signal-cli and ffmpeg on `PATH`, which accounts are linked, the
+library, the config and the log path — so restarting the add-on is the way to ask "is
 this thing healthy?". The answer is the block of indented lines near the top of
 the log, under `Checking the install...`.
 
-**To make a run happen now**, rather than waiting for the next slot, set
-`on_start` and restart:
+**To make a run happen now**, use the panel's buttons. Or set `on_start` and
+restart:
 
 | `on_start` | What happens at startup |
 |---|---|
 | `wait` | Nothing; sleeps until the next scheduled slot. The normal setting. |
-| `dry-run` | Fetches every feed, reports what it would send, sends nothing. |
-| `run` | A real run, immediately, which also refreshes every group's picture. |
+| `dry-run` | Reads every feed, reports what it would send, sends nothing. |
+| `run` | A real run, immediately. |
 
 Set it back to `wait` afterwards, or every restart will fire a run.
 
-`dry-run` is the one to use after editing `feeds.json`: it exercises every
-feed's fetch path — and deliberately lifts the pacing gate that normally holds
+`dry-run` is the one to use after editing `feeds.json`: it reads every feed
+from the library — and deliberately lifts the pacing gate that normally holds
 episodic feeds back — without sending anything.
 
 Longer-term evidence lives in `/data/rssignal.log`, which records the start and
@@ -353,7 +382,7 @@ backup.
 | `/data/cache.json`, `/data/pending.json` | add-on volume | yes |
 | `/data/rssignal.log` | add-on volume | yes |
 | `/config/feeds.json` | `/addon_configs/a67c9053_rssignal/` | yes |
-| `/media/rssignal/` | `/media/rssignal/` | yes |
+| `/media/fetchit/` | `/media/fetchit/` | fetchit's library, read only |
 
 Of these, only the signal-cli directory and `feeds.json` are irreplaceable. The
 cache is a speed cache and deleting it costs one slow run. `pending.json` is

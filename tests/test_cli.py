@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from rssignal import archive, cli
+from rssignal import cli
 from rssignal.config import ConfigError
 from rssignal.feeds import FeedConfig, FeedItem, ParsedFeed
 from rssignal.signal_cli import SignalGroup, SignalSendError
@@ -119,15 +119,15 @@ _ITEM = FeedItem(
 )
 
 _CONFIGS = [
-    FeedConfig(url="https://a/rss", name="Pod"),
-    FeedConfig(url="https://b/rss", name="Blog"),
+    FeedConfig(name="Pod"),
+    FeedConfig(source="Some Blog", name="Blog"),
 ]
 
 
 @pytest.fixture
 def patched_feeds(monkeypatch):
     monkeypatch.setattr(cli, "load_feeds", lambda path: _CONFIGS)
-    monkeypatch.setattr(cli, "parse_feed", lambda cfg: ParsedFeed([_ITEM, _ITEM]))
+    monkeypatch.setattr(cli, "read_feed", lambda cfg: ParsedFeed([_ITEM, _ITEM]))
 
 
 def test_fields_lists_core_and_extra_fields(patched_feeds, capsys):
@@ -152,15 +152,22 @@ def test_fields_unknown_feed_errors(patched_feeds, capsys):
     assert "No feed matching" in capsys.readouterr().err
 
 
-def test_fields_url_bypasses_the_config(monkeypatch, capsys):
+def test_fields_selects_feed_by_source(patched_feeds, capsys):
+    assert cli.main(["fields", "--feed", "some blog"]) == 0
+    assert "Blog" in capsys.readouterr().out
+
+
+def test_fields_source_bypasses_the_config(monkeypatch, capsys):
     def fail(path):
-        raise AssertionError("--url should not read the config")
+        raise AssertionError("--source should not read the config")
 
+    seen = []
     monkeypatch.setattr(cli, "load_feeds", fail)
-    monkeypatch.setattr(cli, "parse_feed", lambda cfg: ParsedFeed([_ITEM]))
+    monkeypatch.setattr(cli, "read_feed", lambda cfg: seen.append(cfg.library_name) or ParsedFeed([_ITEM]))
 
-    assert cli.main(["fields", "--url", "https://c/rss"]) == 0
-    assert "https://c/rss" in capsys.readouterr().out
+    assert cli.main(["fields", "--source", "Karambolage"]) == 0
+    assert seen == ["Karambolage"]
+    assert "Karambolage" in capsys.readouterr().out
 
 
 def test_fields_item_out_of_range_errors(patched_feeds, capsys):
@@ -351,12 +358,8 @@ def test_create_group_error_returns_1(monkeypatch, capsys):
 def _capture_run_feeds(monkeypatch):
     captured = {}
 
-    def fake_run_feeds(
-        config, *, dry_run=False, to=None, since=None, refresh_images=False
-    ):
+    def fake_run_feeds(config, *, dry_run=False, to=None, since=None):
         captured.update(config=config, dry_run=dry_run, to=to, since=since)
-        if refresh_images:
-            captured["refresh_images"] = True
         return 0
 
     monkeypatch.setattr(cli, "run_feeds", fake_run_feeds)
@@ -459,40 +462,6 @@ def _doctor_ready(monkeypatch):
     )
 
 
-def test_doctor_says_the_media_archive_is_off(monkeypatch, capsys):
-    _doctor_ready(monkeypatch)
-
-    assert cli.main(["doctor"]) == 0
-    # Named rather than merely absent: "off" is a setting, and the next
-    # question is always how to turn it on.
-    assert "media archive: off" in capsys.readouterr().out
-
-
-def test_doctor_reports_the_media_archive_and_its_window(
-    monkeypatch, capsys, tmp_path
-):
-    _doctor_ready(monkeypatch)
-    monkeypatch.setenv(archive.MEDIA_DIR_ENV, str(tmp_path / "media"))
-    monkeypatch.setenv(archive.MEDIA_KEEP_DAYS_ENV, "21")
-
-    assert cli.main(["doctor"]) == 0
-
-    out = capsys.readouterr().out
-    assert str(tmp_path / "media") in out
-    assert "21 day(s)" in out
-
-
-def test_doctor_spells_out_an_archive_that_never_expires(
-    monkeypatch, capsys, tmp_path
-):
-    _doctor_ready(monkeypatch)
-    monkeypatch.setenv(archive.MEDIA_DIR_ENV, str(tmp_path / "media"))
-    monkeypatch.setenv(archive.MEDIA_KEEP_DAYS_ENV, "0")
-
-    assert cli.main(["doctor"]) == 0
-    assert "kept indefinitely" in capsys.readouterr().out
-
-
 def test_refresh_images_is_threaded_through(monkeypatch, capsys):
     captured = {}
 
@@ -507,8 +476,18 @@ def test_refresh_images_is_threaded_through(monkeypatch, capsys):
     assert "2 group image(s) would be updated" in capsys.readouterr().out
 
 
-def test_run_refresh_images_is_threaded_through(monkeypatch):
-    captured = _capture_run_feeds(monkeypatch)
 
-    assert cli.main(["run", "--refresh-images"]) == 0
-    assert captured["refresh_images"] is True
+
+def test_doctor_reports_where_the_library_is(monkeypatch, capsys, own_library):
+    _doctor_ready(monkeypatch)
+    (own_library / "shows").mkdir(parents=True)
+
+    assert cli.main(["doctor"]) == 0
+    assert f"library: {own_library} (shows)" in capsys.readouterr().out
+
+
+def test_doctor_says_when_there_is_no_library(monkeypatch, capsys, own_library):
+    _doctor_ready(monkeypatch)
+
+    assert cli.main(["doctor"]) == 0
+    assert "does not exist (set RSSIGNAL_LIBRARY" in capsys.readouterr().out

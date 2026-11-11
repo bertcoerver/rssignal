@@ -11,17 +11,19 @@ from .feeds import (
     FeedItem,
     FieldExtract,
     ParsedFeed,
+    SourceMissing,
     apply_extracts,
     apply_filters,
     filter_since,
     is_audio_item,
+    is_video_item,
     item_fields,
     load_feeds,
     newest,
-    parse_feed,
     preview_fields,
     render_message,
 )
+from .library import library_root, read_feed
 from .run import refresh_group_images, run_feeds
 from .signal_cli import (
     AccountNotLinked,
@@ -42,18 +44,6 @@ from .signal_cli import (
     set_group_avatar,
     update_group,
 )
-from .arte import arte_collection_id, arte_program_id, parse_arte_collection
-from .video import (
-    VIDEO_MAX_BYTES,
-    VideoPlan,
-    VideoTooShort,
-    channel_feed_url,
-    collection_feed,
-    is_video_item,
-    resolve_video,
-    video_temp,
-)
-from .youtube import youtube_feed_url, youtube_video_id
 from .watermark import compose_description, read_watermark, strip_watermark
 
 try:
@@ -88,7 +78,9 @@ __all__ = [
     "run_feeds",
     "refresh_group_images",
     "load_feeds",
-    "parse_feed",
+    "read_feed",
+    "library_root",
+    "SourceMissing",
     "FeedConfig",
     "FeedItem",
     "ParsedFeed",
@@ -99,18 +91,6 @@ __all__ = [
     "filter_since",
     "is_audio_item",
     "is_video_item",
-    "arte_collection_id",
-    "arte_program_id",
-    "parse_arte_collection",
-    "youtube_feed_url",
-    "youtube_video_id",
-    "channel_feed_url",
-    "collection_feed",
-    "resolve_video",
-    "video_temp",
-    "VideoPlan",
-    "VideoTooShort",
-    "VIDEO_MAX_BYTES",
     "newest",
     "apply_extracts",
     "item_fields",

@@ -11,7 +11,7 @@ name: rssignal
 version: "0.5.0"
 slug: rssignal
 image: ghcr.io/bertcoerver/{arch}-rssignal
-description: Forward RSS feeds to Signal, on a machine that never sleeps
+description: Send what fetchit downloads to Signal groups, on a machine that never sleeps
 url: https://github.com/bertcoerver/rssignal
 
 # aarch64 is the Raspberry Pi 4/5; amd64 is here because the image builds and
@@ -25,17 +25,24 @@ arch:
 # init on top of it.
 init: false
 
-# rssignal is a batch job on a timer, not a service anything waits for.
 startup: application
 
-# No ports, no ingress, no API access: this talks to Signal and to the feeds,
-# and has no business inside Home Assistant itself.
+# The GUI, as a panel in Home Assistant's sidebar. Ingress means Home Assistant
+# signs you in and proxies the page; no port is published on your network.
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:message-processing
+panel_title: rssignal
+
+# Home Assistant reaches the send API on the same port, over its own internal
+# network, at http://<this add-on's hostname>:8099 — see DOCS.md.
 map:
   # -> /config in the container. feeds.json lives here, so it can be edited
   #    with the File Editor or over Samba without rebuilding the image.
   - addon_config:rw
-  # -> /media in the container: the folder the Media browser shows. Sent
-  #    episodes are kept here for `media_keep_days`.
+  # -> /media in the container: where the fetchit add-on files everything it
+  #    downloads (/media/fetchit), which is what rssignal sends from. Writable
+  #    only for the linking QR code; rssignal never writes to the library.
   - media:rw
 
 options:
@@ -46,8 +53,10 @@ options:
     - "01:30"
     - "06:30"
     - "15:00"
-  media_keep_days: 14
-  update_yt_dlp: true
+  library: /media/fetchit
+  api_allow:
+    - 172.30.32.1
+  api_token: ""
   log_level: info
 
 schema:
@@ -60,19 +69,23 @@ schema:
   # which is how linking used to be done.
   link_mode: bool
   # What to do the moment the add-on starts, before settling into the schedule.
-  # `wait` is the normal answer. `dry-run` fetches every feed and sends nothing,
+  # `wait` is the normal answer. `dry-run` reads every feed and sends nothing,
   # which is how you check a new feeds.json; `run` sends for real. Both exist
   # because there is no shell here to run them from.
   on_start: list(wait|dry-run|run)
-  # Local times to run at, HH:MM. Keep three or so spread across the day: the
+  # Local times to run at, HH:MM. Empty runs only when asked, from the panel. Keep three or so spread across the day: the
   # `EARLY` allowance in rssignal.episodic is sized for runs a few hours apart,
   # and a single daily run would make a "daily" feed drift to every other day.
   schedule:
     - match(^([01][0-9]|2[0-3]):[0-5][0-9]$)
-  # How long a sent episode stays in /media. 0 keeps everything forever.
-  media_keep_days: int(0,365)
-  # YouTube extraction breaks often enough that a pinned yt-dlp rots. This is
-  # the container's equivalent of the `brew upgrade yt-dlp` the macOS
-  # Shortcut wrapper does on every run.
-  update_yt_dlp: bool
+  # The library the fetchit add-on downloads into. Put this add-on's runs a
+  # little after fetchit's, so each finds what the last download brought.
+  library: str
+  # Who may send through rssignal without the token: Home Assistant itself is
+  # 172.30.32.1. A refused address is named in the log, to add here.
+  api_allow:
+    - str
+  # A bearer token that lets anything on Home Assistant's network send, for
+  # rest_command or another add-on. Empty: only the addresses above.
+  api_token: password?
   log_level: list(trace|debug|info|warning|error|fatal)

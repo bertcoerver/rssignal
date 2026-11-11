@@ -6,18 +6,14 @@ would leave a file behind in the checkout. Pointing it at ``tmp_path`` for every
 test keeps that from happening whether or not the test cares about logging.
 """
 
-import tempfile
 from contextlib import contextmanager
 
 import pytest
 
 from rssignal import (
-    archive,
-    artwork,
     cache,
     config,
-    download,
-    feeds,
+    library,
     pending,
     run,
     signal_cli,
@@ -26,22 +22,15 @@ from rssignal.errorlog import DEFAULT_LOG_PATH
 
 
 @pytest.fixture(autouse=True)
-def no_media_archive(monkeypatch):
-    """Archiving off by default, whatever the developer's own environment says.
+def own_library(tmp_path, monkeypatch):
+    """Point every test at a library of its own, empty until the test fills it.
 
-    :mod:`rssignal.archive` is opt-in through ``RSSIGNAL_MEDIA_DIR``, so on a
-    host that has it set — the Home Assistant add-on, or anyone who exported it
-    to try it — the suite would start writing real files into a real media
-    folder. Tests that mean to exercise the archive set it themselves.
-
-    :func:`rssignal.archive.prepare` also points :mod:`tempfile` at its staging
-    directory, which is process-global and outlives the test that caused it.
-    Left alone, one archive test would send every later test's temporary files
-    into a ``tmp_path`` that pytest had already taken away.
+    The real one — fetchit's folder on this machine, or the add-on's
+    ``/media/fetchit`` — must never be what a test happens to read.
     """
-    monkeypatch.delenv(archive.MEDIA_DIR_ENV, raising=False)
-    monkeypatch.delenv(archive.MEDIA_KEEP_DAYS_ENV, raising=False)
-    monkeypatch.setattr(tempfile, "tempdir", tempfile.tempdir, raising=False)
+    root = tmp_path / "library"
+    monkeypatch.setenv(library.LIBRARY_ENV, str(root))
+    return root
 
 
 @pytest.fixture(autouse=True)
@@ -76,18 +65,6 @@ def no_signal_daemon(monkeypatch):
     build a fake one and turn this off for themselves.
     """
     monkeypatch.setenv(signal_cli.DAEMON_ENV, "0")
-
-
-@pytest.fixture(autouse=True)
-def no_artwork_dice(monkeypatch):
-    """Never let a run roll for a group image refresh on its own.
-
-    :func:`rssignal.artwork.refresh_due` is a real dice roll, one in several
-    hundred — which across a suite that calls ``run_feeds`` hundreds of times
-    means a test that fails now and then for no reason anyone can reproduce.
-    Tests about the refresh turn it back on.
-    """
-    monkeypatch.setenv(artwork.REFRESH_ONE_IN_ENV, "0")
 
 
 @pytest.fixture(autouse=True)
@@ -128,26 +105,12 @@ def error_log(tmp_path, monkeypatch):
 def no_retry_backoff(monkeypatch):
     """Keep the network retry, drop its wait.
 
-    Every test that exercises a failing fetch goes through
-    :func:`rssignal.feeds.retrying`, and every one that exercises a failing send
-    through :func:`rssignal.signal_cli._sending`; both would otherwise sit out
-    their backoff and add seconds to the suite for nothing. The retries still
-    happen — only the sleeping is removed — so the tests still cover the loop.
+    Every test that exercises a failing send goes through
+    :func:`rssignal.signal_cli._sending`, which would otherwise sit out its
+    backoff and add seconds to the suite for nothing. The retries still happen
+    — only the sleeping is removed — so the tests still cover the loop.
     """
-    monkeypatch.setattr(feeds.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(signal_cli.time, "sleep", lambda _seconds: None)
-
-
-@pytest.fixture(autouse=True)
-def source_reachable(monkeypatch):
-    """Answer the source reachability probe without a network.
-
-    :func:`rssignal.youtube.check_available` runs ahead of every feed parse, and
-    the probe behind it is a real request — which under pytest would mean the
-    whole suite quietly depending on YouTube being up. Tests that care about the
-    blocked path override this with ``lambda url, **kw: False``.
-    """
-    monkeypatch.setattr(download, "reachable", lambda url, **kwargs: True)
 
 
 @pytest.fixture(autouse=True)
@@ -155,7 +118,7 @@ def no_splitting(monkeypatch):
     """Hand every downloaded file to the send as one piece, unmeasured.
 
     :func:`rssignal.parts.split_temp` reads the file's size to decide whether to
-    cut it, and most run tests download nothing at all — they hand
+    cut it, and most run tests have no real file at all — they hand
     ``_handle_item`` a made-up path like ``/tmp/fake-ep.mp3``. Splitting is
     covered in tests/test_parts.py; run tests about it put the real one back
     with ``monkeypatch.setattr(run, "split_temp", parts.split_temp)`` or a fake

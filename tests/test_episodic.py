@@ -1,7 +1,7 @@
 """Tests for episodic feeds: the cadence, the config keys, and a paced run.
 
-The YouTube archive that makes an episodic YouTube feed possible is tested in
-test_youtube.py, next to the rest of the yt-dlp plumbing it belongs to.
+The back catalogue an episodic feed walks is fetchit's to download (a feed with
+``since`` there); what is tested here is the walk through the library.
 """
 
 import dataclasses
@@ -17,7 +17,12 @@ from rssignal.run import run_feeds
 from rssignal.signal_cli import SignalGroup
 from rssignal.watermark import format_pace, format_watermark, read_pace, read_watermark
 
-from .test_run import _capture_sends, _patch_groups, _patch_video
+from contextlib import contextmanager
+
+from rssignal.parts import VideoTooBig
+from rssignal.signal_cli import SignalError
+
+from .test_run import _capture_sends, _patch_groups
 
 NOW = datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -134,7 +139,6 @@ def test_load_feeds_reads_episodic_and_start(tmp_path):
         tmp_path,
         {
             "name": "Show",
-            "url": "https://a",
             "episodic": "2-weekly",
             "start": "2019-01-01",
         },
@@ -150,7 +154,6 @@ def test_load_feeds_reads_a_full_start_timestamp(tmp_path):
         tmp_path,
         {
             "name": "Show",
-            "url": "https://a",
             "episodic": True,
             "start": "2019-06-01T09:30:00+02:00",
         },
@@ -159,18 +162,18 @@ def test_load_feeds_reads_a_full_start_timestamp(tmp_path):
 
 
 def test_a_feed_without_episodic_has_neither(tmp_path):
-    cfg = load_feeds(_write(tmp_path, {"name": "Blog", "url": "https://a"}))[0]
+    cfg = load_feeds(_write(tmp_path, {"name": "Blog"}))[0]
     assert cfg.episodic is None and cfg.start is None
 
 
 def test_start_without_episodic_is_an_error(tmp_path):
-    path = _write(tmp_path, {"name": "Blog", "url": "https://a", "start": "2019-01-01"})
+    path = _write(tmp_path, {"name": "Blog", "start": "2019-01-01"})
     with pytest.raises(FeedError, match="not \"episodic\""):
         load_feeds(path)
 
 
 def test_a_bad_cadence_names_the_feed_and_the_value(tmp_path):
-    path = _write(tmp_path, {"name": "Show", "url": "https://a", "episodic": "often"})
+    path = _write(tmp_path, {"name": "Show", "episodic": "often"})
     with pytest.raises(FeedError, match="feeds\\[0\\] episodic .*'often'"):
         load_feeds(path)
 
@@ -178,7 +181,7 @@ def test_a_bad_cadence_names_the_feed_and_the_value(tmp_path):
 def test_a_bad_start_says_what_it_wanted(tmp_path):
     path = _write(
         tmp_path,
-        {"name": "S", "url": "https://a", "episodic": True, "start": "last summer"},
+        {"name": "S", "episodic": True, "start": "last summer"},
     )
     with pytest.raises(FeedError, match="2019-01-01"):
         load_feeds(path)
@@ -205,7 +208,7 @@ def _patch(monkeypatch, cfg, items, groups):
     monkeypatch.setattr(run, "load_feeds", lambda path: [cfg])
     monkeypatch.setattr(
         run,
-        "parse_feed",
+        "read_feed",
         lambda c: dataclasses.replace(
             run.ParsedFeed(items=list(items)), description="blurb"
         ),
@@ -216,7 +219,7 @@ def _patch(monkeypatch, cfg, items, groups):
 
 def test_an_episodic_feed_opens_at_the_beginning(monkeypatch):
     """Not `newest`, which is what any other feed would have sent."""
-    cfg = FeedConfig(url="https://a", name="Show", episodic=WEEKLY)
+    cfg = FeedConfig(source="https://a", name="Show", episodic=WEEKLY)
     group = SignalGroup(id="g=", name="Show", description="blurb")
     calls = _patch(monkeypatch, cfg, EPISODES, [group])
     sends = _capture_sends(monkeypatch)
@@ -231,17 +234,18 @@ def test_an_episodic_feed_opens_at_the_beginning(monkeypatch):
 
 
 def test_a_skipped_episode_does_not_spend_the_pace_slot(monkeypatch):
-    """A Short nobody was sent is not this interval's episode.
+    """An episode nobody was sent is not this interval's episode.
 
-    The archive replay hits one sooner or later, and spending the day on it
-    would mean a paced feed going quiet for a release that never happened.
+    A back catalogue holds one too big to send sooner or later, and spending
+    the day on it would mean a paced feed going quiet for a release that never
+    happened.
     """
     shorts = [
-        dataclasses.replace(ep, link="https://www.youtube.com/watch?v=BFcjfKZ0BeI")
+        dataclasses.replace(ep, kind="video", media="/tmp/huge.mp4")
         for ep in EPISODES
     ]
     earlier = NOW - timedelta(days=8)
-    cfg = FeedConfig(url="https://a", name="Show", episodic=WEEKLY)
+    cfg = FeedConfig(source="https://a", name="Show", episodic=WEEKLY)
     group = SignalGroup(
         id="g=",
         name="Show",
@@ -250,39 +254,47 @@ def test_a_skipped_episode_does_not_spend_the_pace_slot(monkeypatch):
     )
     calls = _patch(monkeypatch, cfg, shorts, [group])
     sends = _capture_sends(monkeypatch)
-    _patch_video(monkeypatch, resolve_fail=run.VideoTooShort("47s — a Short"))
+
+    @contextmanager
+    def too_big(path, **kwargs):
+        raise VideoTooBig("File is too big to send: 500 MB is over 4 parts of 95 MB")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(run, "split_temp", too_big)
 
     assert run_feeds("feeds.json") == 0
     assert sends == []
 
-    # The watermark is past the Short — it is not offered again — but the clock
+    # The watermark is past the episode — it is not offered again — but the clock
     # reads what it read before, so the next run may send episode 3 at once.
     written = calls["updated"][-1]["description"]
     assert read_watermark(written) == shorts[1].published
     assert read_pace(written) == earlier
 
 
-def test_a_video_that_could_not_be_fetched_leaves_the_clock_alone(monkeypatch):
-    """A failed fetch costs neither the episode nor the day it was due.
+def test_an_episode_that_could_not_be_sent_leaves_the_clock_alone(monkeypatch):
+    """A failed send costs neither the episode nor the day it was due.
 
     The clock says when this feed last released something. A video that never
     arrived is not a release, so both markers go back and the next run sends
     the same episode rather than holding it back for a week it already spent.
     """
     videos = [
-        dataclasses.replace(ep, link="https://www.youtube.com/watch?v=BFcjfKZ0BeI")
+        dataclasses.replace(ep, kind="video", media="/tmp/ep.mp4")
         for ep in EPISODES
     ]
     earlier = NOW - timedelta(days=8)
     before = f"blurb\n\n{format_watermark(videos[0].published)}\n{format_pace(earlier)}"
-    cfg = FeedConfig(url="https://a", name="Show", episodic=WEEKLY)
+    cfg = FeedConfig(source="https://a", name="Show", episodic=WEEKLY)
     group = SignalGroup(id="g=", name="Show", description=before)
     calls = _patch(monkeypatch, cfg, videos, [group])
-    sends = _capture_sends(monkeypatch)
-    _patch_video(monkeypatch, fail=FeedError("yt-dlp failed: HTTP Error 403"))
+
+    def fail(*args, **kwargs):
+        raise SignalError("Connection reset (PushNetworkException)")
+
+    monkeypatch.setattr(run, "send_msg", fail)
 
     assert run_feeds("feeds.json") == 0
-    assert sends == []
 
     written = calls["updated"][-1]["description"]
     assert written == before
@@ -291,7 +303,7 @@ def test_a_video_that_could_not_be_fetched_leaves_the_clock_alone(monkeypatch):
 
 
 def test_a_paced_feed_holds_the_next_episode_back(monkeypatch):
-    cfg = FeedConfig(url="https://a", name="Show", episodic=WEEKLY)
+    cfg = FeedConfig(source="https://a", name="Show", episodic=WEEKLY)
     group = SignalGroup(
         id="g=",
         name="Show",
@@ -308,7 +320,7 @@ def test_a_paced_feed_holds_the_next_episode_back(monkeypatch):
 
 
 def test_the_next_episode_goes_once_the_interval_is_up(monkeypatch):
-    cfg = FeedConfig(url="https://a", name="Show", episodic=WEEKLY)
+    cfg = FeedConfig(source="https://a", name="Show", episodic=WEEKLY)
     group = SignalGroup(
         id="g=",
         name="Show",
@@ -326,7 +338,7 @@ def test_the_next_episode_goes_once_the_interval_is_up(monkeypatch):
 
 def test_a_start_date_skips_the_years_before_it(monkeypatch):
     cfg = FeedConfig(
-        url="https://a",
+        source="https://a",
         name="Show",
         episodic=WEEKLY,
         start=datetime(2017, 1, 1, tzinfo=timezone.utc),
@@ -343,7 +355,7 @@ def test_a_start_date_skips_the_years_before_it(monkeypatch):
 @pytest.mark.parametrize("groups", [[SignalGroup(id="g=", name="Show", description="blurb")], []])
 def test_an_unpaced_episodic_feed_sends_the_lot_oldest_first(monkeypatch, groups):
     """Including on the very first run, before the group exists."""
-    cfg = FeedConfig(url="https://a", name="Show", episodic=Cadence())
+    cfg = FeedConfig(source="https://a", name="Show", episodic=Cadence())
     _patch(monkeypatch, cfg, EPISODES, groups)
     sends = _capture_sends(monkeypatch)
 
@@ -354,7 +366,7 @@ def test_an_unpaced_episodic_feed_sends_the_lot_oldest_first(monkeypatch, groups
 
 
 def test_to_sends_the_next_episode_and_touches_no_group(monkeypatch):
-    cfg = FeedConfig(url="https://a", name="Show", episodic=WEEKLY)
+    cfg = FeedConfig(source="https://a", name="Show", episodic=WEEKLY)
     calls = _patch(monkeypatch, cfg, EPISODES, [])
     sends = _capture_sends(monkeypatch)
 
@@ -365,7 +377,7 @@ def test_to_sends_the_next_episode_and_touches_no_group(monkeypatch):
 
 def test_since_overrides_the_pace(monkeypatch):
     """An explicit replay is not rationed."""
-    cfg = FeedConfig(url="https://a", name="Show", episodic=WEEKLY)
+    cfg = FeedConfig(source="https://a", name="Show", episodic=WEEKLY)
     group = SignalGroup(
         id="g=",
         name="Show",
@@ -385,7 +397,7 @@ def test_since_overrides_the_pace(monkeypatch):
 
 
 def test_a_failed_send_puts_both_markers_back(monkeypatch):
-    cfg = FeedConfig(url="https://a", name="Show", episodic=WEEKLY)
+    cfg = FeedConfig(source="https://a", name="Show", episodic=WEEKLY)
     group = SignalGroup(id="g=", name="Show", description="blurb")
     calls = _patch(monkeypatch, cfg, EPISODES, [group])
 
@@ -401,7 +413,7 @@ def test_a_failed_send_puts_both_markers_back(monkeypatch):
 
 def test_a_paced_feed_with_nothing_due_is_not_even_fetched(monkeypatch):
     """The gate is the point: no channel listing, no dating, on most runs."""
-    cfg = FeedConfig(url="https://a", name="Show", episodic=WEEKLY)
+    cfg = FeedConfig(source="https://a", name="Show", episodic=WEEKLY)
     group = SignalGroup(
         id="g=",
         name="Show",
@@ -414,7 +426,7 @@ def test_a_paced_feed_with_nothing_due_is_not_even_fetched(monkeypatch):
     def fail(cfg):
         raise AssertionError("nothing is due; the feed should not be read")
 
-    monkeypatch.setattr(run, "parse_feed", fail)
+    monkeypatch.setattr(run, "read_feed", fail)
     _capture_sends(monkeypatch)
 
     assert run_feeds("feeds.json") == 0
@@ -423,7 +435,7 @@ def test_a_paced_feed_with_nothing_due_is_not_even_fetched(monkeypatch):
 def test_a_dry_run_lifts_the_gate_and_says_where_the_feed_stands(
     monkeypatch, capsys
 ):
-    cfg = FeedConfig(url="https://a", name="Show", episodic=WEEKLY)
+    cfg = FeedConfig(source="https://a", name="Show", episodic=WEEKLY)
     group = SignalGroup(
         id="g=",
         name="Show",

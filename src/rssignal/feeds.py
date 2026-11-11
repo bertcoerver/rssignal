@@ -1,39 +1,20 @@
-"""Read feed configuration, parse RSS/Atom feeds, and filter items by recency.
+"""Read feed configuration, and filter and format the items a feed has.
 
-This module is pure with respect to Signal: it turns a JSON config plus the
-feeds it names into a list of :class:`FeedItem` objects and helpers for
-filtering and formatting them. Sending is left to :mod:`rssignal.run`.
-
-Parsing is delegated to `feedparser <https://feedparser.readthedocs.io>`_, which
-handles the many RSS/Atom dialects, malformed markup, date formats, and podcast
-enclosures that show up in real-world feeds.
+This module is pure with respect to Signal: it turns a JSON config into
+:class:`FeedConfig` objects, and :class:`FeedItem` objects into message text
+and link-preview cards. Where the items come from is :mod:`rssignal.library` —
+the folder fetchit fills — and sending is left to :mod:`rssignal.run`.
 """
 
 from __future__ import annotations
 
 import json
 import re
-import time
-from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from html import unescape
-from html.parser import HTMLParser
 from urllib.parse import urlsplit
 
-import feedparser
-
-from . import cache, timing
 from .episodic import Cadence, parse_cadence
-
-# Cache namespace for the ETag / Last-Modified a feed last handed out.
-_HTTP_NS = "feed_http"
-
-# How hard to lean on a network read before calling the feed lost. Three tries
-# two and four seconds apart covers the gap between a machine waking and its
-# network coming up, without holding a run open long enough to matter.
-RETRY_ATTEMPTS = 3
-RETRY_DELAY = 2.0
 
 # Extensions that mark an enclosure as audio when its declared type doesn't.
 AUDIO_SUFFIXES = (
@@ -47,6 +28,11 @@ AUDIO_SUFFIXES = (
     ".wav",
     ".flac",
 )
+
+# The kinds of item fetchit files, and what each goes out as.
+AUDIO = "audio"
+VIDEO = "video"
+TEXT = "text"
 
 # Suffixes that turn a feed config key into a filter, e.g. "title_contains".
 FILTER_OPS = ("contains", "excludes", "matches", "min", "max")
@@ -70,8 +56,8 @@ WEEKDAYS = (
 
 # Config keys that are settings rather than filters.
 KNOWN_KEYS = (
-    "url",
     "name",
+    "source",
     "message_template",
     "extract",
     "link_preview",
@@ -82,6 +68,10 @@ KNOWN_KEYS = (
     "start",
     "refresh_image",
 )
+
+# Keys that decide what is downloaded, which is fetchit's business now. Each
+# gets a message saying where it went rather than "unknown key".
+FETCHIT_KEYS = ("url", "urls", "since", "max_per_run", "quality", "keep_days", "language")
 
 # The field names every item has, in the order item_fields lists them.
 CORE_FIELDS = (
@@ -103,63 +93,20 @@ CORE_FIELDS = (
 DEFAULT_PREVIEW_URL = "{link}"
 DEFAULT_PREVIEW_TITLE = "{title}"
 
-# Entry keys already mapped onto FeedItem, so they don't repeat in ``extra``.
-_MAPPED_ENTRY_KEYS = frozenset(
-    {
-        "title",
-        "summary",
-        "description",
-        "link",
-        "published",
-        "published_parsed",
-        "enclosures",
-        "author",
-        "tags",
-        "image",
-        "media_thumbnail",
-    }
-)
-
 
 class FeedError(Exception):
-    """Raised when feed configuration or a feed itself cannot be read."""
+    """Raised when feed configuration or a feed's items cannot be read."""
 
 
-class SourceBlocked(FeedError):
-    """Raised when a source isn't reachable from this machine on purpose.
+class SourceMissing(FeedError):
+    """Raised when the library has nothing for a feed yet.
 
-    Distinct from a plain :class:`FeedError` because it means something
-    different to the caller and to whoever reads the log: nothing is broken. A
-    network-level filter — a DNS profile, a firewall, a schedule that only opens
-    at night — is doing exactly what it was set up to do, and the feed will read
-    fine the next time the window is open. So this is reported as a skip rather
-    than a failure, and leaves no traceback behind.
+    Not a failure: a feed newly added to both configs has no folder until
+    fetchit's next run files its first item, and a run before that has simply
+    nothing to send. So this is reported as a skip, with no traceback — but
+    every run, because a feed whose ``source`` is misspelled looks exactly the
+    same, and that one would wait for ever.
     """
-
-
-def retrying[T](
-    work: Callable[[], T], *, attempts: int = RETRY_ATTEMPTS, delay: float = RETRY_DELAY
-) -> T:
-    """Call ``work``, trying again if it fails for a reason the network caused.
-
-    This runs unattended, on a laptop that sleeps, over a link that occasionally
-    isn't there yet: a name that won't resolve, a connection refused a second
-    after wake, a reset mid-read. Those cost a feed its whole run and a day of
-    its items, and they are almost always gone by the time anyone looks. A
-    couple of seconds spent asking again is cheaper than that.
-
-    Only :class:`OSError` causes are retried — ``URLError``, timeouts, resets.
-    A feed whose XML doesn't parse will not parse any better the second time, so
-    it fails immediately.
-    """
-    for attempt in range(1, attempts + 1):
-        try:
-            return work()
-        except FeedError as exc:
-            if attempt == attempts or not isinstance(exc.__cause__, OSError):
-                raise
-            time.sleep(delay * attempt)
-    raise AssertionError("unreachable")  # pragma: no cover
 
 
 @dataclass(frozen=True)
@@ -200,17 +147,20 @@ class FeedConfig:
     :func:`load_feeds` requires it. It defaults to empty here only so that the
     pure rendering helpers can be exercised without one.
 
+    ``source`` is the feed in the library this one sends from — its ``name`` in
+    fetchit's config. Left empty, it is ``name``: one name for the feed in
+    both places, which is the usual case. See :attr:`library_name`.
+
     ``episodic`` set makes this a series rather than a ticker: oldest item first,
     released at the cadence's pace. ``start`` is where that walk begins, for a
     back catalogue you don't want all of — it acts as the watermark the feed
     would have had, so everything published before it is behind us already.
 
     ``refresh_image`` off leaves the group's picture as it is when pictures are
-    refreshed (see :mod:`rssignal.artwork`), for a source whose "artwork" is not
-    a logo but whatever it is showing this week.
+    refreshed (see :mod:`rssignal.artwork`).
     """
 
-    url: str
+    source: str = ""
     name: str = ""
     message_template: str | None = None
     filters: tuple[FeedFilter, ...] = ()
@@ -223,15 +173,24 @@ class FeedConfig:
     start: datetime | None = None
     refresh_image: bool = True
 
+    @property
+    def library_name(self) -> str:
+        """The feed in the library this one reads: ``source``, or else ``name``."""
+        return self.source or self.name
+
 
 @dataclass(frozen=True)
 class FeedItem:
-    """A single normalized entry from a feed.
+    """A single item of a feed, as the library holds it.
 
-    The named fields are the ones every feed kind is expected to have; anything
-    else the feed happens to publish (``itunes_duration``, ``id``, …) lands in
+    The named fields are the ones every item is expected to have; anything else
+    the source happened to publish (``itunes_duration``, ``id``, …) lands in
     ``extra``. Use :func:`item_fields` to get the flat, stringified view that
     templates and filters see.
+
+    ``kind`` is what fetchit filed it as — ``"audio"``, ``"video"`` or
+    ``"text"`` — and ``media`` and ``image`` are the paths of its file and its
+    picture in the library, where it has them.
     """
 
     title: str
@@ -245,39 +204,40 @@ class FeedItem:
     categories: tuple[str, ...] = ()
     feed_name: str = ""
     extra: dict[str, str] = field(default_factory=dict)
+    kind: str | None = None
+    media: str | None = None
+    image: str | None = None
 
 
 @dataclass(frozen=True)
 class ParsedFeed:
-    """A parsed feed: its entries plus the channel-level data rssignal uses.
+    """A feed's items plus what it says about itself.
 
-    ``image_url`` is the show's / site's own artwork and ``description`` is what
-    the feed says about itself. Items deliberately never inherit either (see
-    :func:`_build_feed_item`) — on a preview card the same logo and blurb every
-    time say nothing. On the *group* they are exactly right, which is the only
-    thing they are used for.
+    ``image`` is the path of the feed's own artwork in the library — a series'
+    poster, a podcast's cover — and ``description`` is what the feed says about
+    itself. Items deliberately never inherit either: on a preview card the same
+    logo and blurb every time say nothing. On the *group* they are exactly
+    right, which is the only thing they are used for.
     """
 
     items: list[FeedItem]
-    image_url: str | None = None
+    image: str | None = None
     description: str = ""
+    title: str = ""
 
 
 def is_audio_item(item: FeedItem) -> bool:
     """Whether ``item`` carries audio to send — rssignal's idea of an episode.
 
-    This is asked per item rather than per feed, and it is what a podcast *is*
-    as far as rssignal is concerned: there is no ``type`` setting to declare.
     An item that says yes goes out as a voice note with a preview card; one that
-    says no goes out as text with its link. A show that posts the occasional
-    written note therefore gets that note as a readable message rather than a
-    linkless stub.
-
-    An enclosure alone is not enough — plenty of ordinary feeds attach an image
-    or a PDF. The declared type decides when there is one, and the URL only gets
-    a say when the feed didn't declare anything useful, which is common enough:
-    ``application/octet-stream`` on an mp3 is a real thing feeds do.
+    says no goes out as text with its link, or with its video. fetchit has
+    already decided, per item, and says so in ``kind``. An item with no ``kind``
+    — built by hand rather than read from the library — is judged by its
+    enclosure, the way fetchit judges it: the declared type when there is one,
+    and the URL when the feed didn't declare anything useful.
     """
+    if item.kind is not None:
+        return item.kind == AUDIO
     if not item.enclosure_url:
         return False
 
@@ -285,25 +245,24 @@ def is_audio_item(item: FeedItem) -> bool:
     if mime.startswith("audio/"):
         return True
     if mime and not mime.startswith("application/"):
-        # image/, video/, text/ — declared, and declared as something else.
-        # Video included: it isn't a voice note, so the item keeps its link.
         return False
-
-    # Split the URL first: podcast CDNs bolt tracking parameters onto every
-    # enclosure, and "…/ep.mp3?source=rss" doesn't end in ".mp3".
     return urlsplit(item.enclosure_url).path.lower().endswith(AUDIO_SUFFIXES)
+
+
+def is_video_item(item: FeedItem) -> bool:
+    """Whether ``item`` is a video to attach, as fetchit filed it."""
+    return item.kind == VIDEO
 
 
 def load_feeds(path: str = "feeds.json") -> list[FeedConfig]:
     """Read ``path`` and return the list of :class:`FeedConfig` it describes.
 
-    Expects ``{"feeds": [ {...}, ... ]}``. Each feed needs a ``url`` and a
-    ``name`` — the name is the Signal group the feed sends to. There is no
-    setting for what kind of feed it is: :func:`is_audio_item` works that out
-    per item. There is no recency setting either: how far a feed got is
-    remembered in its group's description (see :mod:`rssignal.watermark`).
-    Raises :class:`FeedError` on a missing file, invalid JSON, or a malformed
-    entry.
+    Expects ``{"feeds": [ {...}, ... ]}``. Each feed needs a ``name`` — the
+    Signal group the feed sends to — and reads the feed of the same name in the
+    library unless ``source`` names another. There is no recency setting: how
+    far a feed got is remembered in its group's description (see
+    :mod:`rssignal.watermark`). Raises :class:`FeedError` on a missing file,
+    invalid JSON, or a malformed entry.
     """
     try:
         with open(path, encoding="utf-8") as fh:
@@ -333,15 +292,17 @@ def _build_feed_config(raw: object, index: int) -> FeedConfig:
     if not isinstance(raw, dict):
         raise FeedError(f"{where} must be an object.")
 
-    url = raw.get("url")
-    if not isinstance(url, str) or not url:
-        raise FeedError(f"{where} is missing a non-empty \"url\".")
-
     name = raw.get("name")
     if not isinstance(name, str) or not name.strip():
         raise FeedError(
             f"{where} is missing a non-empty \"name\". The name is the Signal "
             "group this feed sends to; rssignal creates it if it doesn't exist."
+        )
+
+    source = raw.get("source")
+    if source is not None and (not isinstance(source, str) or not source.strip()):
+        raise FeedError(
+            f"{where} source must be the name of a feed in fetchit's config."
         )
 
     template = raw.get("message_template")
@@ -373,7 +334,7 @@ def _build_feed_config(raw: object, index: int) -> FeedConfig:
     start = _build_start(raw.get("start"), where, episodic)
 
     return FeedConfig(
-        url=url,
+        source=source.strip() if isinstance(source, str) else "",
         name=name.strip(),
         message_template=template,
         filters=_build_filters(raw, where),
@@ -470,6 +431,20 @@ def _build_filters(raw: dict, where: str) -> tuple[FeedFilter, ...]:
     for key, value in raw.items():
         if key in KNOWN_KEYS:
             continue
+        if key == "url":
+            raise FeedError(
+                f"{where} still has a \"url\". rssignal no longer reads feeds "
+                "itself: fetchit downloads them into a library, and rssignal "
+                "sends from there. Move this feed's url — and any filter that "
+                "decides what is worth downloading — to a feed of the same name "
+                "in fetchit.json (or give it another name there, and set "
+                "\"source\" here to that name). Then drop the key."
+            )
+        if key in FETCHIT_KEYS:
+            raise FeedError(
+                f"{where} has {key!r}, which is about downloading rather than "
+                "sending. It belongs on this feed in fetchit.json."
+            )
         if key in ("max_age_hours", "max_age_days"):
             raise FeedError(
                 f"{where} still has a {key!r}. rssignal no longer works from a "
@@ -480,10 +455,10 @@ def _build_filters(raw: dict, where: str) -> tuple[FeedFilter, ...]:
             )
         if key == "type":
             raise FeedError(
-                f"{where} still has a \"type\". rssignal now works this out from "
-                "the feed itself: an item with an audio enclosure is sent as a "
-                "voice note, anything else as text plus its link. Drop the key. "
-                "To turn a preview card on or off by hand, use \"link_preview\"."
+                f"{where} still has a \"type\". What an item is now comes from "
+                "the library: fetchit files each one as audio, video or text, "
+                "and rssignal sends it accordingly. Drop the key. To turn a "
+                "preview card on or off by hand, use \"link_preview\"."
             )
         if key == "recipient":
             raise FeedError(
@@ -546,370 +521,6 @@ def _numeric_filter(
     return FeedFilter(field=field_name, op=op, values=(text,))
 
 
-def _read(url: str, *, conditional: bool = True) -> feedparser.FeedParserDict:
-    """Fetch and parse ``url``, raising :class:`FeedError` if it can't be read.
-
-    feedparser doesn't raise on network or parse trouble; it records it on the
-    result instead. Turning that back into an exception — and chaining the cause
-    it recorded — is what lets :func:`retrying` tell a link that was briefly
-    down from a feed that is genuinely broken.
-
-    The validators the feed handed out last time go back with the request, so a
-    feed with nothing new answers ``304`` and sends no body at all. rssignal is
-    built to be run often and mostly find nothing, which is exactly the case that
-    pays for.
-
-    ``conditional`` off asks for the body regardless. That is for an episodic
-    feed, whose work does not depend on the feed having changed: it is walking a
-    back catalogue years behind the newest item, and "nothing new" is both true
-    and beside the point. It is not the saving it looks like either — a paced
-    feed is only fetched at all on the runs where an episode is actually due.
-
-    It also leaves the remembered validators alone. A read that isn't the run's
-    own — :func:`feed_image` looking for a picture — must not hand the next run
-    an ETag for a body whose items it never saw, or that run would be told
-    "nothing new" about them.
-    """
-    known = (cache.get(_HTTP_NS, url) or {}) if conditional else {}
-    # Passed only when there is something to pass, so a feed nobody has a
-    # validator for is fetched exactly as it always was.
-    conditional_args = {
-        name: known[name]
-        for name in ("etag", "modified")
-        if isinstance(known, dict) and known.get(name)
-    }
-    parsed = feedparser.parse(url, **conditional_args)
-
-    if getattr(parsed, "status", None) == 304:
-        # Unchanged since last time; there is no body to look at and no reason to
-        # have wanted one. Handled before the bozo check below, which would
-        # otherwise read an empty 304 as a feed that failed to parse.
-        return parsed
-
-    etag = getattr(parsed, "etag", None)
-    modified = getattr(parsed, "modified", None)
-    if conditional and (etag or modified):
-        cache.put(_HTTP_NS, url, {"etag": etag, "modified": modified})
-
-    if getattr(parsed, "bozo", False) and not parsed.entries:
-        exc = getattr(parsed, "bozo_exception", None)
-        served = _content_type(parsed)
-        if served and not _is_feed_type(served):
-            # Not a feed that failed to parse — something else answering in a
-            # feed's place. A DNS filter's block page, a captive portal, a
-            # sign-in wall. The parse error underneath it is real and completely
-            # uninformative: it describes the first stray angle bracket in a
-            # page of HTML, and says nothing about why the page is there. The
-            # status does say something — a 404 or a 500 is the source's own
-            # error page, not a filter's — so it goes in the message.
-            status = getattr(parsed, "status", None)
-            answer = f"HTTP {status} {served}" if status else served
-            raise SourceBlocked(
-                f"{url} answered with {answer} rather than a feed — a block "
-                "page, a captive portal or a sign-in wall standing in front of "
-                "the source, not a broken feed. Skipping until it lifts."
-            ) from (exc if isinstance(exc, BaseException) else None)
-        raise FeedError(
-            f"Could not read feed {url!r}: {exc or 'unknown error'}"
-        ) from (exc if isinstance(exc, BaseException) else None)
-    return parsed
-
-
-# The media types that are never a feed and always a page. Written as the
-# things to rule out rather than the things to accept, because the accept list
-# is the open-ended one: feeds arrive as application/rss+xml, application/atom+xml,
-# text/xml, application/json, text/plain, and whatever else a server has been
-# left misconfigured to say. A page announcing itself as HTML is the only answer
-# unambiguous enough to act on.
-_PAGE_CONTENT_TYPES = ("text/html", "application/xhtml+xml")
-
-
-def _content_type(parsed: feedparser.FeedParserDict) -> str:
-    """The media type ``parsed`` came back as, lowercased, without parameters.
-
-    Empty when the response carried no ``Content-Type`` — which is what a feed
-    read from a file or a string looks like, and is not evidence of anything.
-    """
-    headers = getattr(parsed, "headers", None) or {}
-    value = headers.get("content-type") or headers.get("Content-Type") or ""
-    return value.split(";")[0].strip().lower()
-
-
-def _is_feed_type(content_type: str) -> bool:
-    """Whether ``content_type`` leaves it possible that this was meant as a feed.
-
-    The question is not "is this a valid feed media type" but "is this so
-    clearly a web page that the parse error underneath it is beside the point".
-    Anything that isn't HTML gets the benefit of the doubt and the old
-    behaviour — a feed served as ``text/plain`` is odd, not a block page.
-    """
-    return content_type not in _PAGE_CONTENT_TYPES
-
-
-def parse_feed(cfg: FeedConfig) -> ParsedFeed:
-    """Fetch and parse ``cfg.url`` into a :class:`ParsedFeed`.
-
-    Usually that means RSS or Atom, and a video source's own page counts as
-    either a substitute for one or a signpost to one: an ARTE collection page is
-    read directly, since ARTE publishes no feed at all, and a YouTube channel
-    page is swapped for the feed YouTube publishes at an address nobody would
-    guess. Either way, following a show needs nothing in the config but the
-    address of its page.
-
-    A video item also gets the one thing its feed tends to leave out — how long
-    the video is — so that ``duration_seconds`` is an ordinary field like any
-    other. See :func:`~rssignal.video.annotate_durations`.
-
-    An episodic feed gets one thing more: everything the source published before
-    the handful its feed still lists, which is the material a series is made of.
-    See :func:`~rssignal.video.with_archive`.
-
-    Raises :class:`SourceBlocked` before doing any of that, if the source turns
-    out to be one this machine currently can't reach at all. A YouTube feed that
-    is reachable but not answering with a feed is read through yt-dlp instead —
-    see :func:`~rssignal.video.listed_items`.
-    """
-    # Imported here, not at the top: rssignal.video builds FeedItems and so
-    # imports this module. Deferring it keeps that one-way and leaves feeds.py
-    # free of any knowledge of what video sources exist.
-    from .video import (
-        annotate_durations,
-        channel_feed_url,
-        check_source_available,
-        collection_feed,
-        with_archive,
-    )
-
-    check_source_available(cfg.url)
-
-    collection = collection_feed(cfg)
-    if collection is not None:
-        return collection
-
-    feed_url = channel_feed_url(cfg.url)
-    if feed_url:
-        cfg = replace(cfg, url=feed_url)
-
-    try:
-        with timing.step("feedparser", cfg.name or cfg.url):
-            parsed = retrying(
-                lambda: _read(cfg.url, conditional=cfg.episodic is None)
-            )
-    except FeedError as exc:
-        # A feed a source can list some other way is worth that other way: see
-        # :func:`~rssignal.video.listed_items`. Anything else fails as it did.
-        items = _listed_instead(cfg, exc)
-        image_url, description = None, ""
-    else:
-        if getattr(parsed, "status", None) == 304:
-            # Nothing has changed since the last run, so there is nothing to
-            # build and — the part worth the early return — nothing to look
-            # durations up for either, which is a yt-dlp launch this feed now
-            # never pays.
-            return ParsedFeed(items=[], image_url=None, description="")
-
-        channel = getattr(parsed, "feed", None) or {}
-        cget = channel.get if hasattr(channel, "get") else lambda k, d=None: getattr(channel, k, d)
-
-        # "summary" is the channel's <description>; "subtitle" is the shorter
-        # <itunes:subtitle>, which some feeds fill in instead.
-        description = strip_html(cget("summary") or cget("subtitle") or "")
-        image_url = _href(cget("image"))
-        items = [_build_feed_item(entry, cfg.name) for entry in parsed.entries]
-
-    # Durations come before extracts so a rule can read one, and after the items
-    # exist because they are looked up per feed, not per entry.
-    items = annotate_durations(cfg.url, items)
-
-    # The back catalogue, for an episodic feed only, and after durations because
-    # the archive brings its own — a listing reports them, so the items that come
-    # back from here are already annotated and filter the same as the rest.
-    if cfg.episodic is not None:
-        items = with_archive(cfg.url, items, feed_name=cfg.name)
-
-    return ParsedFeed(
-        items=[apply_extracts(item, cfg.extract) for item in items],
-        image_url=image_url,
-        description=description,
-    )
-
-
-def feed_image(cfg: FeedConfig) -> str | None:
-    """The artwork ``cfg``'s source shows for itself right now, or ``None``.
-
-    What :func:`parse_feed` puts in :attr:`ParsedFeed.image_url`, without the
-    rest of the work — no items built, no durations looked up, no back catalogue
-    walked — plus the one thing it can't do: a YouTube channel's picture, which
-    its feed doesn't carry. The feed is read unconditionally, because one that
-    hasn't changed since the last run would otherwise answer 304 and say nothing
-    at all.
-
-    Raises :class:`SourceBlocked` or :class:`FeedError` if the source can't be
-    read.
-    """
-    from .video import check_source_available, source_image
-
-    check_source_available(cfg.url)
-    image = source_image(cfg.url)
-    if image is not None:
-        return image
-
-    parsed = retrying(lambda: _read(cfg.url, conditional=False))
-    channel = getattr(parsed, "feed", None) or {}
-    cget = channel.get if hasattr(channel, "get") else lambda k, d=None: getattr(channel, k, d)
-    return _href(cget("image"))
-
-
-def _listed_instead(cfg: FeedConfig, failure: FeedError) -> list[FeedItem]:
-    """The items ``cfg``'s source lists without its feed, or ``failure`` raised.
-
-    Re-raised as the same kind of error it was, so a feed that answered with a
-    block page and couldn't be listed either is still a skip rather than a
-    failure — with the reason the listing gave added to it.
-    """
-    from .video import listed_items
-
-    try:
-        items = listed_items(cfg.url, feed_name=cfg.name)
-    except FeedError as exc:
-        raise type(failure)(
-            f"{failure}\nListing it through yt-dlp instead failed too: {exc}"
-        ) from failure
-    if items is None:
-        raise failure
-    return items
-
-
-def _clean_url(url: object) -> str | None:
-    """A URL out of a feed, with any over-escaping undone.
-
-    XML escapes an ampersand once and the parser unescapes it once, so a URL
-    with a query string normally survives the round trip unchanged. NPO's
-    podcast feeds escape twice — ``&amp;amp;`` in the document — which leaves a
-    literal ``&amp;`` in the query once feedparser has had its turn, renaming
-    the second parameter to ``amp;awEpisodeid``. Their file server answers that
-    with a 404, so the episode can't be downloaded at all.
-
-    No URL means ``&amp;`` where it means ``&``, so unescaping until nothing is
-    left to unescape is safe, and a no-op for every feed that got it right.
-    """
-    if not url:
-        return None
-    text = str(url)
-    while "&amp;" in text:
-        text = text.replace("&amp;", "&")
-    return text or None
-
-
-def _href(value: object) -> str | None:
-    """Pull a URL out of a feedparser image/thumbnail mapping, if there is one."""
-    if not value:
-        return None
-    get = value.get if hasattr(value, "get") else lambda k, d=None: getattr(value, k, d)
-    return _clean_url(get("href") or get("url"))
-
-
-def _build_feed_item(entry: object, feed_name: str = "") -> FeedItem:
-    """Map a single feedparser entry to a :class:`FeedItem`."""
-    get = entry.get if isinstance(entry, dict) else lambda k, d=None: getattr(entry, k, d)
-
-    title = (get("title") or "").strip()
-    description = strip_html(get("summary") or get("description") or "")
-    link = _clean_url(get("link"))
-
-    published = None
-    published_parsed = get("published_parsed")
-    if published_parsed is not None:
-        # published_parsed is a time.struct_time in UTC.
-        published = datetime(*published_parsed[:6], tzinfo=timezone.utc)
-
-    enclosure_url = None
-    enclosure_type = None
-    enclosures = get("enclosures") or []
-    if enclosures:
-        first = enclosures[0]
-        fget = first.get if isinstance(first, dict) else lambda k, d=None: getattr(first, k, d)
-        enclosure_url = _clean_url(fget("href") or fget("url"))
-        enclosure_type = fget("type") or None
-
-    # Episode artwork only: <itunes:image> lands in "image", media RSS in
-    # "media_thumbnail". The channel's artwork is deliberately not a fallback —
-    # the same show logo on every item makes a preview card less informative,
-    # not more.
-    thumbnails = get("media_thumbnail") or []
-    image_url = _href(get("image")) or _href(thumbnails[0] if thumbnails else None)
-
-    # feedparser exposes categories as tags: [{"term": "news", ...}, ...].
-    categories = []
-    for tag in get("tags") or []:
-        tget = tag.get if isinstance(tag, dict) else lambda k, d=None: getattr(tag, k, d)
-        term = tget("term")
-        if term:
-            categories.append(str(term))
-
-    return FeedItem(
-        title=title,
-        description=description,
-        link=link,
-        published=published,
-        enclosure_url=enclosure_url,
-        enclosure_type=enclosure_type,
-        image_url=image_url,
-        author=get("author") or None,
-        categories=tuple(categories),
-        feed_name=feed_name,
-        extra=_extra_fields(entry),
-    )
-
-
-def _extra_fields(entry: object) -> dict[str, str]:
-    """Collect the feed's own scalar keys that FeedItem doesn't name.
-
-    Feeds carry all sorts of extra data (``itunes_duration``, ``id``, episode
-    numbers). Keeping the scalar ones makes them available to templates and
-    filters; the structured ``*_detail`` / ``*_parsed`` mirrors feedparser adds
-    are skipped, since they have no useful string form.
-    """
-    items = entry.items() if hasattr(entry, "items") else vars(entry).items()
-    extra: dict[str, str] = {}
-    for key, value in items:
-        if key in _MAPPED_ENTRY_KEYS or key.endswith(("_detail", "_parsed")):
-            continue
-        if isinstance(value, str):
-            extra[key] = strip_html(value) if "<" in value else value
-        elif isinstance(value, (int, float)) and not isinstance(value, bool):
-            extra[key] = str(value)
-    return extra
-
-
-class _TextExtractor(HTMLParser):
-    """Collect text content from HTML, dropping tags."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._parts: list[str] = []
-
-    def handle_data(self, data: str) -> None:
-        self._parts.append(data)
-
-    def text(self) -> str:
-        return "".join(self._parts)
-
-
-def strip_html(text: str) -> str:
-    """Return ``text`` with HTML tags removed and entities unescaped.
-
-    Feed descriptions are frequently HTML; a plain-text rendering reads far
-    better as a Signal message. Whitespace is collapsed to single spaces.
-    """
-    if not text:
-        return ""
-    extractor = _TextExtractor()
-    extractor.feed(text)
-    plain = unescape(extractor.text())
-    return " ".join(plain.split())
-
-
 def filter_since(items: list[FeedItem], since: datetime | None) -> list[FeedItem]:
     """Return the items published strictly after ``since``, oldest first.
 
@@ -943,7 +554,7 @@ def item_fields(item: FeedItem) -> dict[str, str]:
 
     This is the single view of an item shared by message templates, filters, and
     the ``rssignal fields`` command, so what that command prints is exactly what
-    the other two can use. Named fields come first; the feed's own extras fill
+    the other two can use. Named fields come first; the source's own extras fill
     in behind them without overwriting a named field.
 
     The three ``published*`` fields are the one date in three shapes: the full
@@ -952,13 +563,14 @@ def item_fields(item: FeedItem) -> dict[str, str]:
     like every date rssignal reads, so a late-evening upload can belong to the
     next day.
     """
+    published = item.published.astimezone(timezone.utc) if item.published else None
     fields: dict[str, str] = {
         "title": item.title,
         "description": item.description,
         "link": item.link or "",
-        "published": item.published.isoformat() if item.published else "",
-        "published_date": item.published.strftime("%Y-%m-%d") if item.published else "",
-        "published_weekday": WEEKDAYS[item.published.weekday()] if item.published else "",
+        "published": published.isoformat() if published else "",
+        "published_date": published.strftime("%Y-%m-%d") if published else "",
+        "published_weekday": WEEKDAYS[published.weekday()] if published else "",
         "enclosure_url": item.enclosure_url or "",
         "enclosure_type": item.enclosure_type or "",
         "image_url": item.image_url or "",
@@ -977,8 +589,8 @@ def apply_extracts(item: FeedItem, rules: tuple[FieldExtract, ...]) -> FeedItem:
     Landing them in ``extra`` is what makes them ordinary fields: templates,
     filters, and ``rssignal fields`` all read :func:`item_fields`, which merges
     extras behind the named fields. A rule can therefore never shadow ``title``
-    or ``link``, and it reads the item as it came off the feed — extracts do not
-    chain into one another.
+    or ``link``, and it reads the item as it came out of the library —
+    extracts do not chain into one another.
 
     A pattern that doesn't match yields an empty field rather than an error, in
     keeping with how templates treat a missing placeholder.
@@ -1079,7 +691,7 @@ def _render_template(template: str, item: FeedItem, cfg: FeedConfig, what: str) 
     try:
         return template.format_map(_DefaultingFields(item_fields(item)))
     except (ValueError, IndexError) as exc:
-        label = cfg.name or cfg.url
+        label = cfg.name or cfg.library_name
         raise FeedError(f"{what} for feed {label!r} is malformed: {exc}") from exc
 
 
@@ -1087,8 +699,8 @@ def preview_fields(item: FeedItem, cfg: FeedConfig) -> dict[str, str] | None:
     """Return the link-preview card for ``item``, or ``None`` for no preview.
 
     The card is rendered from the same fields as message templates, so anything
-    ``rssignal fields`` lists can go in it. ``image_url`` is the *remote* URL —
-    signal-cli wants a local file, so :mod:`rssignal.run` downloads it.
+    ``rssignal fields`` lists can go in it. ``image`` is the item's own picture
+    in the library — a local file, which is what signal-cli wants — or empty.
 
     The card carries no description unless ``preview_description`` asks for one:
     the body of the message is right underneath it, so repeating the item's text
@@ -1126,7 +738,7 @@ def preview_fields(item: FeedItem, cfg: FeedConfig) -> dict[str, str] | None:
         "url": url,
         "title": title,
         "description": description,
-        "image_url": item.image_url or "",
+        "image": item.image or "",
     }
 
 

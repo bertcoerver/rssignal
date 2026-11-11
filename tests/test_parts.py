@@ -13,18 +13,9 @@ import pytest
 
 from rssignal import parts
 from rssignal.feeds import FeedError
-from rssignal.video import VideoTooBig
+from rssignal.parts import VideoTooBig
 
 MB = 1_000_000
-
-
-def _choose(sizes_mb, max_mb=95):
-    return parts.choose(
-        sizes_mb,
-        size=lambda s: s * MB,
-        rank=lambda s: s,
-        max_bytes=max_mb * MB,
-    )
 
 
 # --- choosing -------------------------------------------------------------
@@ -36,29 +27,6 @@ def test_parts_needed_rounds_up_and_never_says_zero():
     assert parts.parts_needed(96, 95) == 2
     assert parts.parts_needed(190, 95) == 2
     assert parts.parts_needed(191, 95) == 3
-
-
-def test_choose_takes_the_best_that_fits_in_one_when_anything_does():
-    assert _choose([40, 90, 180, 400]) == (90, 1)
-
-
-def test_choose_takes_the_fewest_parts_then_the_best_in_them():
-    # The smallest is 105 MB, so two parts; two parts' 190 MB takes the 180,
-    # not the 400 that three or more parts would have allowed.
-    assert _choose([105, 180, 250, 400]) == (180, 2)
-
-
-def test_choose_gives_up_past_the_most_parts():
-    assert _choose([parts.MAX_PARTS * 95 + 1]) is None
-
-
-def test_choose_with_nothing_to_choose_from():
-    assert _choose([]) is None
-
-
-def test_in_parts_says_nothing_for_one():
-    assert parts.in_parts(1) == ""
-    assert parts.in_parts(3) == ", in 3 parts"
 
 
 # --- splitting, with ffmpeg faked -----------------------------------------

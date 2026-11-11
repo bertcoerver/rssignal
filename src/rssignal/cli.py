@@ -4,12 +4,13 @@ Subcommands:
     doctor          check the signal-cli install, linked accounts, and config
     link [--name]   link this machine to your Signal account (scan a QR code)
     send MESSAGE    send a text message (uses configured account/recipient)
-    run [--config]  parse configured feeds and send whatever is new to the
-                    Signal group named after each feed (created if missing)
+    run [--config]  read each feed from the library and send whatever is new
+                    to the Signal group named after it (created if missing)
     fields          show the fields an item exposes, for writing templates
     groups          list the Signal groups you can send to
     create-group    create a new group containing only you
-    refresh-images  update each feed group's picture from its source's artwork
+    refresh-images  update each feed group's picture from the library's artwork
+    serve           run on a schedule, with a web GUI and an API to send through
 """
 
 from __future__ import annotations
@@ -20,18 +21,21 @@ import shutil
 import sys
 from datetime import datetime, timezone
 
-from . import archive, timing
+from dataclasses import replace
+
+from . import timing
 from .config import ConfigError, get_config
 from .errorlog import log_exception, log_line, log_path
 from .feeds import (
     CORE_FIELDS,
     FeedConfig,
     FeedError,
+    apply_extracts,
     item_fields,
     load_feeds,
-    parse_feed,
     render_message,
 )
+from .library import LIBRARY_ENV, library_root, read_feed
 from .run import AlreadyRunning, refresh_group_images, run_feeds
 from .signal_cli import (
     SignalError,
@@ -56,27 +60,23 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     binary = find_signal_cli()
     print(f"signal-cli: {binary}")
 
-    # Only video feeds need it, so its absence is worth reporting but is not a
-    # broken install.
+    # Only files too big for one message need it, so its absence is worth
+    # reporting but is not a broken install.
     ffmpeg = shutil.which("ffmpeg")
-    print(f"ffmpeg: {ffmpeg or 'not found (only needed for video feeds)'}")
-
-    ytdlp = shutil.which("yt-dlp")
-    print(f"yt-dlp: {ytdlp or 'not found (only needed for YouTube feeds)'}")
+    print(f"ffmpeg: {ffmpeg or 'not found (only needed to split files over 95 MB)'}")
 
     # Where to look after an unattended run went wrong, printed whether or not
     # the file exists yet — the point is knowing where it will be.
     print(f"error log: {os.path.abspath(log_path())}")
 
-    # Off unless RSSIGNAL_MEDIA_DIR is set, which is the whole answer most of
-    # the time — and when it is on, the number matters enough to say out loud.
-    media = archive.media_dir()
-    if media:
-        days = archive.keep_days()
-        expiry = f"kept {days} day(s)" if days else "kept indefinitely"
-        print(f"media archive: {os.path.abspath(media)} ({expiry})")
+    # Where the items come from. A library that isn't there is the one thing
+    # that makes every feed quietly send nothing, so it is said out loud.
+    root = library_root()
+    if os.path.isdir(root):
+        kinds = [k for k in ("shows", "podcasts", "articles") if os.path.isdir(os.path.join(root, k))]
+        print(f"library: {root} ({', '.join(kinds) or 'empty so far'})")
     else:
-        print(f"media archive: off (set {archive.MEDIA_DIR_ENV} to keep sends)")
+        print(f"library: {root} does not exist (set {LIBRARY_ENV} to fetchit's library)")
 
     accounts = list_accounts()
     if accounts:
@@ -125,7 +125,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 dry_run=args.dry_run,
                 to=args.to,
                 since=_parse_since(args.since),
-                refresh_images=args.refresh_images,
             )
         except AlreadyRunning as exc:
             # Exit 0: the last run being slow is not this run's failure, and an
@@ -168,12 +167,12 @@ def _parse_since(value: str | None) -> datetime | None:
 def _resolve_feed(args: argparse.Namespace) -> FeedConfig:
     """Pick the feed the ``fields`` command should sample.
 
-    ``--url`` names a feed directly, which is handy before it's in the config at
-    all; otherwise ``--feed`` matches a configured feed by name or URL substring,
-    and with neither the first configured feed is used.
+    ``--source`` names a feed in the library directly, which is handy before
+    it's in feeds.json at all; otherwise ``--feed`` matches a configured feed by
+    name or source, and with neither the first configured feed is used.
     """
-    if args.url:
-        return FeedConfig(url=args.url, name=args.url)
+    if args.source:
+        return FeedConfig(source=args.source, name=args.source)
 
     feeds = load_feeds(args.config)
     if not feeds:
@@ -184,17 +183,18 @@ def _resolve_feed(args: argparse.Namespace) -> FeedConfig:
 
     needle = args.feed.lower()
     for cfg in feeds:
-        if needle in (cfg.name or "").lower() or needle in cfg.url.lower():
+        if needle in (cfg.name or "").lower() or needle in cfg.library_name.lower():
             return cfg
-    known = ", ".join(repr(cfg.name or cfg.url) for cfg in feeds)
+    known = ", ".join(repr(cfg.name or cfg.library_name) for cfg in feeds)
     raise FeedError(f"No feed matching {args.feed!r}. Configured feeds: {known}.")
 
 
 def _cmd_fields(args: argparse.Namespace) -> int:
     cfg = _resolve_feed(args)
-    items = parse_feed(cfg).items
+    # Newest first, the way a feed lists them: item 1 is the latest.
+    items = [apply_extracts(i, cfg.extract) for i in reversed(read_feed(cfg).items)]
     if not items:
-        print(f"Feed {cfg.name or cfg.url!r} has no items.")
+        print(f"Feed {cfg.name or cfg.library_name!r} has no items in the library.")
         return 1
     if not 1 <= args.item <= len(items):
         raise ValueError(
@@ -203,7 +203,7 @@ def _cmd_fields(args: argparse.Namespace) -> int:
 
     item = items[args.item - 1]
     fields = item_fields(item)
-    print(f"Fields for {cfg.name or cfg.url} (item {args.item} of {len(items)}):\n")
+    print(f"Fields for {cfg.name or cfg.library_name} (item {args.item} of {len(items)}, a {item.kind or 'text'} item):\n")
 
     width = max(len(name) for name in fields)
     for name, value in fields.items():
@@ -216,10 +216,7 @@ def _cmd_fields(args: argparse.Namespace) -> int:
     print(f"\nUse any name above in a template, e.g. \"{{{next(iter(fields))}}}\".")
 
     if args.template:
-        preview = render_message(
-            item,
-            FeedConfig(url=cfg.url, name=cfg.name, message_template=args.template),
-        )
+        preview = render_message(item, replace(cfg, message_template=args.template))
         print("\n--- rendered message ---")
         print(preview)
     return 0
@@ -297,6 +294,13 @@ def _cmd_refresh_images(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_serve(args: argparse.Namespace) -> int:
+    from .server import serve
+
+    serve(args.config, host=args.host, port=args.port, on_start=args.on_start)
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rssignal", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -326,7 +330,7 @@ def _build_parser() -> argparse.ArgumentParser:
     send.set_defaults(func=_cmd_send)
 
     run = subparsers.add_parser(
-        "run", help="parse configured feeds and send whatever is new"
+        "run", help="read each feed from the library and send whatever is new"
     )
     run.add_argument(
         "--config",
@@ -336,7 +340,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--dry-run",
         action="store_true",
-        help="print what would be sent without sending, downloading, or creating",
+        help="print what would be sent without sending or creating anything",
     )
     run.add_argument(
         "--to",
@@ -353,15 +357,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "send items published after this ISO timestamp, ignoring what each "
             "group remembers (e.g. 2026-07-01, or 2026-07-01T09:00+02:00)"
-        ),
-    )
-    run.add_argument(
-        "--refresh-images",
-        action="store_true",
-        help=(
-            "after sending, refresh every feed group's picture from its source "
-            "(otherwise done at random, about once a month); no effect with "
-            "--dry-run or --to"
         ),
     )
     run.add_argument(
@@ -382,12 +377,12 @@ def _build_parser() -> argparse.ArgumentParser:
     fields.add_argument(
         "--feed",
         default=None,
-        help="configured feed to sample, by name or URL (default: the first one)",
+        help="configured feed to sample, by name or source (default: the first one)",
     )
     fields.add_argument(
-        "--url",
+        "--source",
         default=None,
-        help="sample this feed URL directly, without adding it to the config",
+        help="sample this feed in the library directly, without adding it to the config",
     )
     fields.add_argument(
         "--item",
@@ -458,11 +453,11 @@ def _build_parser() -> argparse.ArgumentParser:
 
     refresh = subparsers.add_parser(
         "refresh-images",
-        help="update each feed group's picture from its source's artwork",
+        help="update each feed group's picture from the library's artwork",
         description=(
-            "Fetch every feed's current artwork and set it as the picture of "
-            "the feed's group, where it has changed. `rssignal run` does this "
-            "by itself about once a month."
+            "Set every feed's artwork in the library as the picture of the "
+            "feed's group, where it has changed. `rssignal run` does this by "
+            "itself after sending."
         ),
     )
     refresh.add_argument(
@@ -476,6 +471,27 @@ def _build_parser() -> argparse.ArgumentParser:
         help="report which groups would get a new picture without changing any",
     )
     refresh.set_defaults(func=_cmd_refresh_images)
+
+    serve = subparsers.add_parser(
+        "serve",
+        help="run on a schedule, with a web GUI and an API to send through",
+        description=(
+            "Keep one signal-cli open and run the feeds at the times in "
+            "RSSIGNAL_SCHEDULE (e.g. 01:30,06:30,15:00), serve the GUI, and "
+            "accept messages to send — including from Home Assistant's Signal "
+            "Messenger integration. See the README."
+        ),
+    )
+    serve.add_argument("--config", default="feeds.json", help="path to the feeds JSON config (default: feeds.json)")
+    serve.add_argument("--host", default="127.0.0.1", help="address to listen on (default: 127.0.0.1)")
+    serve.add_argument("--port", type=int, default=8099, help="port to listen on (default: 8099)")
+    serve.add_argument(
+        "--on-start",
+        choices=("wait", "dry-run", "run"),
+        default="wait",
+        help="what to do at once, before the schedule takes over (default: wait)",
+    )
+    serve.set_defaults(func=_cmd_serve)
 
     return parser
 
