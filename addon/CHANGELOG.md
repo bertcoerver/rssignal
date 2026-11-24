@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.0
+
+- Remove episodic pacing; fetchit's max_per_day does it now
+
 ## 0.6.1
 
 - Run as soon as fetchit says it downloaded something
