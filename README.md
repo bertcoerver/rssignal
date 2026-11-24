@@ -165,6 +165,10 @@ and serves on one port:
   [Signal Messenger](https://www.home-assistant.io/integrations/signal_messenger/)
   integration calls, so it can use rssignal as its `url` — see
   [the add-on's docs](addon/DOCS.md#notifications-from-home-assistant).
+- **`POST /api/fetched`** with `{"feeds": ["Bureau Buitenland"]}` — what fetchit's
+  `FETCHIT_NOTIFY` sends after a run that downloaded something. Starts a run if
+  one of the feeds is one rssignal sends from (or queues one more behind a run
+  under way). Answers `202`.
 
 Only this machine may use either, unless told otherwise:
 

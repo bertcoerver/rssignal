@@ -278,6 +278,27 @@ published on yours. Requests are accepted from the addresses in `api_allow`
 `Authorization: Bearer <token>`. A refused request is named in the log and in
 the panel's activity, with its address, so you can see what to allow.
 
+### Runs as soon as fetchit downloads: `/api/fetched`
+
+fetchit can tell rssignal the moment a run of its brings something new, so it
+is sent within a minute instead of at the next scheduled run. Set `api_token`
+here, then give fetchit `http://<hostname>:8099/api/fetched` and the same token
+in its `notify` and `notify_token` options (fetchit's documentation has the
+steps). fetchit's address on Home Assistant's network changes, which is why
+this goes by the token rather than by `api_allow`.
+
+The body names the feeds, as fetchit.json calls them:
+
+```json
+{"feeds": ["Bureau Buitenland", "3Blue1Brown"]}
+```
+
+A run starts if any of them is a feed rssignal sends from — matched on
+`source`, or `name` where there is no `source` — and the call is otherwise
+ignored. If a run is already going, one more follows it, since the one under
+way may have read the library before the new items landed. The schedule keeps
+working as before, as the safety net.
+
 ## Watching what was sent
 
 The library in `/media/fetchit` is laid out for Jellyfin: videos as series with

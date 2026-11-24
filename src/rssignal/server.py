@@ -24,8 +24,12 @@ What it serves, on one port:
     The parts of `signal-cli-rest-api <https://github.com/bbernhard/signal-cli-rest-api>`_
     that Home Assistant's own **Signal Messenger** integration uses, so it works
     unchanged with this as its ``url``.
+``/api/fetched``
+    ``{"feeds": ["Bureau Buitenland", ...]}``: fetchit's word that it has just
+    downloaded something for these feeds. If any of them is a feed rssignal
+    sends from, a run starts — or, if one is under way, another follows it.
 
-The send endpoints answer clients in :data:`API_FROM_ENV`, or any client that
+The send endpoints and ``/api/fetched`` answer clients in :data:`API_FROM_ENV`, or any client that
 presents :data:`API_TOKEN_ENV` as a bearer token. A recipient is a phone
 number, ``group:<id>``, ``group.<id>`` the way signal-cli-rest-api writes it,
 or simply the name of a group.
@@ -349,6 +353,8 @@ class Service:
         self._scheduler: threading.Thread | None = None
         self._link: dict = {"state": "idle"}
         self._stdout = self._stderr = None
+        self._run_lock = threading.Lock()
+        self._queued = False
 
     # life cycle
 
@@ -457,11 +463,48 @@ class Service:
             jobs = [self.jobs[i] for i in self._jobs_order]
         return next((j for j in reversed(jobs) if j.finished is None and j.kind in ("run", "dry-run")), None)
 
-    def run(self, *, dry_run: bool = False) -> Job:
-        busy = self.running()
-        if busy is not None and not dry_run:
+    def run(self, *, dry_run: bool = False, again: bool = False) -> Job:
+        """Start a run, or hand back the one under way.
+
+        ``again`` is for news that arrived after the run under way may already
+        have read the library: one more run is queued behind it (only one,
+        however many such calls come in meanwhile).
+        """
+        with self._run_lock:
+            busy = self.running()
+            if busy is None or dry_run:
+                return self._start_run(dry_run)
+            if again and not self._queued:
+                self._queued = True
+                threading.Thread(target=self._run_after, args=(busy,), daemon=True, name="rssignal-queued").start()
             return busy
 
+    def _run_after(self, job: Job) -> None:
+        while job.finished is None and not self._stop.is_set():
+            self._stop.wait(2)
+        with self._run_lock:
+            self._queued = False
+        if not self._stop.is_set():
+            self.run(again=True)
+
+    def fetched(self, feeds: list[str] | None) -> dict:
+        """fetchit downloaded something for ``feeds``: run, if it is ours.
+
+        No ``feeds`` at all means "something, somewhere", and always runs.
+        """
+        if feeds:
+            ours = {cfg.library_name.strip().casefold() for cfg in load_feeds(self.config_path)}
+            mine = [f for f in feeds if str(f).strip().casefold() in ours]
+            if not mine:
+                return {"started": False, "reason": "none of these feeds is one rssignal sends from"}
+        else:
+            mine = []
+        what = ", ".join(mine) if mine else "the library"
+        job = self.run(again=True)
+        self.note("fetched", f"fetchit downloaded new items for {what}")
+        return {"started": True, "job": job.view()}
+
+    def _start_run(self, dry_run: bool) -> Job:
         def work() -> str:
             try:
                 sent = run_feeds(self.config_path, dry_run=dry_run)
@@ -816,6 +859,14 @@ class Handler(BaseHTTPRequestHandler):
                     attachments = [body["base64_attachment"]]
                 svc.send(str(body.get("message") or ""), body.get("recipients") or [], attachments, via="signal-cli-rest-api")
                 self._json(HTTPStatus.CREATED, {"timestamp": str(int(time.time() * 1000))})
+                return
+            if path == "/api/fetched":
+                if not self._api_ok():
+                    return
+                feeds = self._body().get("feeds")
+                if isinstance(feeds, str):
+                    feeds = [feeds]
+                self._json(HTTPStatus.ACCEPTED, svc.fetched(feeds or None))
                 return
             if path == "/api/send":
                 if not self._api_ok():

@@ -270,3 +270,48 @@ def test_feeds_overview_reads_the_library_and_the_groups(running, own_library):
     (row,) = reply["feeds"]
     assert row["group"] == "group:AAAA1111+bbbb/cc="
     assert row["items"] == 1 and row["waiting"] == 1 and row["newest"] == "Done"
+
+
+def test_fetchit_news_runs_only_for_our_feeds(running, monkeypatch):
+    start, _ = running
+    runs = []
+    gate = threading.Event()
+
+    def fake_run(config, *, dry_run=False):
+        runs.append(time.time())
+        gate.wait(5)
+        return 0
+
+    monkeypatch.setattr(server, "run_feeds", fake_run)
+    base, service = start()
+
+    status, reply = _call(base, "/api/fetched", {"feeds": ["Somebody Else's Show"]})
+    assert status == 202 and reply["started"] is False and not runs
+
+    status, reply = _call(base, "/api/fetched", {"feeds": ["laundry "]})
+    assert status == 202 and reply["started"] is True
+    for _ in range(100):
+        if runs:
+            break
+        threading.Event().wait(0.02)
+    assert len(runs) == 1
+
+    # News during a run queues exactly one more, after it.
+    for _ in range(3):
+        assert _call(base, "/api/fetched", {"feeds": ["Laundry"]})[1]["started"] is True
+    assert len(runs) == 1
+    gate.set()
+    for _ in range(300):
+        if len(runs) == 2 and service.running() is None:
+            break
+        threading.Event().wait(0.02)
+    threading.Event().wait(0.3)
+    assert len(runs) == 2
+
+
+def test_fetchit_news_needs_api_access(running):
+    start, _ = running
+    base, _ = start(gui_from="10.9.9.9", api_from="10.9.9.9", api_token="s3cret")
+    assert _call(base, "/api/fetched", {"feeds": ["Laundry"]})[0] == 403
+    status, reply = _call(base, "/api/fetched", {"feeds": ["Nope"]}, headers={"Authorization": "Bearer s3cret"})
+    assert status == 202 and reply["started"] is False
