@@ -403,8 +403,14 @@ class Service:
     def accounts(self, *, refresh: bool = False) -> list[str]:
         """The linked accounts, asked of signal-cli at most once a minute.
 
-        ``listAccounts`` is a JVM start of its own, and the GUI polls.
+        ``listAccounts`` is a JVM start of its own, and the GUI polls. While the
+        ``jsonRpc`` daemon is up it holds the account's lock, and a one-shot
+        ``listAccounts`` would sit waiting for it — so then the daemon's own
+        account is the answer: it could not have started unlinked.
         """
+        daemon = signal_cli._daemon
+        if daemon is not None and daemon._proc is not None and daemon._proc.poll() is None:
+            return [daemon.account]
         cached = self._accounts_seen
         if cached and not refresh and time.time() - cached[0] < GROUPS_TTL:
             return cached[1]

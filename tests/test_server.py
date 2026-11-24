@@ -215,6 +215,27 @@ def test_the_gui_page_and_status(running):
     assert info["schedule"] == ["06:30"] and info["next_run"]
 
 
+def test_accounts_come_from_a_running_daemon_not_a_blocking_list_accounts(monkeypatch, tmp_path):
+    # A one-shot `listAccounts` waits forever on the lock a live jsonRpc daemon
+    # holds, which left the GUI's status card empty.
+    class LiveProc:
+        def poll(self):
+            return None
+
+    class Daemon:
+        account = "+31600000000"
+        _proc = LiveProc()
+
+    def blocked():
+        raise AssertionError("listAccounts must not run while the daemon is up")
+
+    monkeypatch.setattr(server.signal_cli, "_daemon", Daemon())
+    monkeypatch.setattr(server, "list_accounts", blocked)
+    service = Service(str(tmp_path / "feeds.json"))
+    assert service.accounts() == ["+31600000000"]
+    assert service.accounts(refresh=True) == ["+31600000000"]
+
+
 def test_a_run_from_the_gui_reports_what_it_printed(running, monkeypatch):
     start, _ = running
 

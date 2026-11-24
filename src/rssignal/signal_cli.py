@@ -235,18 +235,28 @@ def find_signal_cli() -> str:
     return path
 
 
-def list_accounts() -> list[str]:
+def list_accounts(*, timeout: float = 60) -> list[str]:
     """Return the E.164 numbers of accounts known to signal-cli.
 
     Parses ``signal-cli listAccounts`` output. ``listAccounts`` is used rather
     than ``receive`` because it has no side effects on the message queue.
+
+    ``listAccounts`` opens every account, and waits — without end — for one
+    another signal-cli (a ``jsonRpc`` daemon) holds; ``timeout`` bounds that.
     """
     binary = find_signal_cli()
-    result = subprocess.run(
-        [binary, "listAccounts"],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [binary, "listAccounts"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise SignalSendError(
+            f"`signal-cli listAccounts` timed out after {timeout}s — another "
+            "signal-cli may be holding the account."
+        )
     if result.returncode != 0:
         raise SignalSendError(
             "`signal-cli listAccounts` failed.",
