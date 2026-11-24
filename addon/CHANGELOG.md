@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.1
+
+- Run as soon as fetchit says it downloaded something
+- Keep the GUI status from hanging on listAccounts while the daemon runs
+
 ## 0.6.0
 
 - rssignal no longer downloads anything. The fetchit add-on reads the feeds and
