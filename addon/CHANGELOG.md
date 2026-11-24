@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0
 
 - rssignal no longer downloads anything. The fetchit add-on reads the feeds and
   files what is new in /media/fetchit; rssignal sends from there. Move each
