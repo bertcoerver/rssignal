@@ -1,91 +1,78 @@
-"""Orchestration: read feeds, work out what's new, and send one message per item.
+"""Orchestration: read each feed from the library, work out what's new, and send it.
 
-This ties the pieces together: :func:`rssignal.feeds.load_feeds` /
-:func:`~rssignal.feeds.parse_feed` produce items, :func:`~rssignal.feeds.apply_filters`
-and :func:`~rssignal.feeds.filter_since` narrow them,
-:func:`~rssignal.feeds.render_message` turns each survivor into text, and it is
-sent with :func:`rssignal.signal_cli.send_msg`. An item carrying audio — decided
-per item by :func:`~rssignal.feeds.is_audio_item`, with nothing to configure —
-downloads its enclosure and sends it as a voice note, plus a link preview card
-whose artwork is downloaded alongside it. Those go out as two messages: Signal
-drops a preview card from any message carrying an attachment. The voice note
-repeats the episode title as its body, so the chat list names the episode instead
-of saying "Voice Message". Two messages is also the one place an item can end up
-half sent, which :mod:`rssignal.pending` exists to finish rather than repeat.
+This ties the pieces together: :func:`rssignal.feeds.load_feeds` names the
+feeds, :func:`rssignal.library.read_feed` reads what fetchit has filed for each
+one, :func:`~rssignal.feeds.apply_filters` and
+:func:`~rssignal.feeds.filter_since` narrow it, :func:`~rssignal.feeds.render_message`
+turns each survivor into text, and it is sent with
+:func:`rssignal.signal_cli.send_msg`.
 
-An item that only *links* to a video — :func:`~rssignal.video.is_video_item`,
-decided per item from the link in the same spirit — has its video fetched and
-attached to the message. That is one message, not two: these items get no
-preview card by default, so nothing is there for the attachment to displace. A
-video item *is* its video, so one that can't be fetched sends nothing: the run
-reports the failure, the watermark and the pace clock roll back together, and
-the next run tries the same item again rather than leaving a bare link behind as
-the only trace of it.
+What an item is, fetchit has decided already, and says so in the item's record.
+An audio item goes out as a voice note, plus a link preview card with the
+item's own picture. Those go out as two messages: Signal drops a preview card
+from any message carrying an attachment. The voice note repeats the episode
+title as its body, so the chat list names the episode instead of saying "Voice
+Message". Two messages is also the one place an item can end up half sent,
+which :mod:`rssignal.pending` exists to finish rather than repeat.
+
+A video item has its file attached to the message. That is one message, not
+two: these items get no preview card by default, so nothing is there for the
+attachment to displace. Text goes out as text plus its link.
 
 Media too big for one Signal message — video or audio — goes out as the fewest
 parts that each fit, one message per part (see :mod:`rssignal.parts`); every
 part after the first is captioned ``Title (k/N)``. More messages are more places
 to be interrupted, and :mod:`rssignal.pending` finishes an item that was, rather
-than repeating what already arrived.
-
-Two answers are permanent, and those do send nothing and stay sent-nothing,
-watermark and all, so they are not reconsidered every run: a video too short to
-be worth a message (a YouTube Short) and one too big even split into
-:data:`~rssignal.parts.MAX_PARTS` parts.
+than repeating what already arrived. A file too big even for
+:data:`~rssignal.parts.MAX_PARTS` parts is stepped over for good, watermark and
+all, so it is not reconsidered every run.
 
 Each feed sends to a Signal group named after it, created on the first send if it
 doesn't exist yet — see :class:`_GroupResolver`.
 
 Feeds are independent of each other, and a run says so: one that fails is
 reported and left for the next run, and the ones after it are processed anyway.
-A run is usually unattended — a scheduled job, an Apple Shortcut — where losing
-every other feed to one bad video is the worst of the possible outcomes.
+A run is usually unattended — a scheduled job — where losing every other feed
+to one bad upload is the worst of the possible outcomes.
 
 How far a feed got is remembered in that group's own description, so a feed is
 never sent twice and running more often costs nothing. See
 :mod:`rssignal.watermark` for why the description, of all places, and
 :func:`_send_prepared` for the order things happen in.
-
-Feeds are *fetched* all at once and *sent* one at a time. Fetching is nearly all
-waiting on other people's servers and no feed's fetch can affect another's, so a
-run waits once instead of twelve times over; see :func:`_prepare_feeds`. Sending
-stays strictly sequential, because that is where the ordering promises above live.
 """
 
 from __future__ import annotations
 
 import fcntl
 import os
-import socket
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Iterator
 
-from . import archive, artwork, cache, pending, timing
-from .download import download_temp
-from .parts import split_temp
+from . import artwork, cache, pending, timing
 from .episodic import allowance, next_release
 from .errorlog import log_exception, log_line
 from .feeds import (
     FeedConfig,
-    FeedError,
     FeedItem,
     ParsedFeed,
-    SourceBlocked,
+    SourceMissing,
+    apply_extracts,
     apply_filters,
     filter_since,
     is_audio_item,
+    is_video_item,
     load_feeds,
     newest,
-    parse_feed,
     preview_fields,
     render_message,
 )
+from .library import read_feed
+from .parts import MAX_BYTES, VideoTooBig, parts_needed, split_temp
 from .signal_cli import (
     GROUP_DESCRIPTION_MAX_CHARS,
     LinkPreview,
@@ -100,15 +87,6 @@ from .signal_cli import (
     send_msg,
     update_group,
 )
-from .video import (
-    VideoGone,
-    VideoTooBig,
-    VideoTooShort,
-    is_video_item,
-    resolve_video,
-    source_image,
-    video_temp,
-)
 from .watermark import (
     compose_description,
     read_pace,
@@ -116,17 +94,6 @@ from .watermark import (
     strip_watermark,
 )
 
-
-# How long any one network read may sit there before it is given up on. This is
-# feedparser's only timeout — it accepts none of its own, so it goes through the
-# default socket timeout or it doesn't happen at all.
-FEED_SOCKET_TIMEOUT = 30
-
-# How many feeds are fetched at once. The work is nearly all waiting on other
-# people's servers, so this is well above the core count on purpose; the ceiling
-# is politeness to those servers rather than anything local.
-DEFAULT_FEED_WORKERS = 8
-FEED_WORKERS_ENV = "RSSIGNAL_FEED_WORKERS"
 
 # Where the "one run at a time" lock lives. Beside the cache rather than beside
 # feeds.json: the repo may sit in a synced folder, and a lock file is the last
@@ -156,10 +123,6 @@ def single_run() -> Iterator[None]:
     :func:`_send_prepared`), so two runs at once both read the same watermark,
     both decide the same items are new, and both send them. Nothing downstream
     can undo that: the duplicate is a real message in a real chat.
-
-    Overlapping is easy to arrange by accident rather than exotic. A run that
-    has videos to fetch takes minutes, and a scheduler firing every fifteen
-    does not ask whether the last one has finished.
 
     The lock is an ``flock`` on a file, which the kernel releases when the
     process ends however it ends — including the kill this is most needed
@@ -209,26 +172,6 @@ class _GroupResolver:
                 self._groups = list_groups()
             return self._groups
 
-    def prime(self) -> None:
-        """Fetch the listing now, so a later :meth:`find` is free.
-
-        Almost all of what this costs is spent waiting rather than working —
-        ``receive`` sits for its whole timeout listening for messages that
-        usually aren't coming — so :func:`run_feeds` starts it alongside the feed
-        fetches rather than before them, and the wait comes out of a window that
-        was going to be spent on the network anyway.
-
-        A failure here is deliberately swallowed. Nothing is cached, so the first
-        :meth:`find` in the sequential phase simply tries again, and the failure
-        surfaces there — attached to a feed, reported like any other feed's
-        failure, instead of coming out of a worker thread with nothing to pin it
-        to.
-        """
-        try:
-            self._listing()
-        except Exception:
-            pass
-
     def find(self, name: str) -> SignalGroup | None:
         """Return the group called ``name``, or ``None`` if there isn't one."""
         return match_group(self._listing(), name)
@@ -242,25 +185,19 @@ class _GroupResolver:
 
         A new group holds only this account, is announcement-only (it exists to
         receive a feed, not to be a chat), and takes the feed's own artwork and
-        blurb as its picture and description. A feed with no artwork of its own
-        — YouTube's — gets its channel's picture instead; see
-        :func:`_group_image`.
+        blurb from the library as its picture and description.
         """
         name = cfg.name
         group = self.find(name)
         if group is not None:
             return group
 
-        with ExitStack() as stack:
-            avatar = _local_image(
-                _group_image(cfg, parsed), stack, name, what="group image"
-            )
-            group = create_group(
-                name,
-                description=parsed.description or None,
-                avatar=avatar or None,
-                announcement_only=True,
-            )
+        group = create_group(
+            name,
+            description=parsed.description or None,
+            avatar=parsed.image or None,
+            announcement_only=True,
+        )
 
         # Creating a group is not something to do quietly: a typo in a feed's
         # name would otherwise leave a stray group behind without a word.
@@ -269,30 +206,12 @@ class _GroupResolver:
         return group
 
 
-def _group_image(cfg: FeedConfig, parsed: ParsedFeed) -> str | None:
-    """The url of the picture a new group for ``cfg`` should have, if any.
-
-    The feed's own artwork when it has some. A YouTube feed never does — the
-    Atom feed describes the videos, not the channel — so the channel is asked
-    for its picture instead. That costs a yt-dlp launch, which is fine for
-    something that happens once per feed, and a failure costs only the picture.
-    """
-    if parsed.image_url:
-        return parsed.image_url
-    try:
-        return source_image(cfg.url)
-    except FeedError as exc:
-        print(f"[{cfg.name}] group image skipped: {exc}", file=sys.stderr)
-        return None
-
-
 def run_feeds(
     config_path: str = "feeds.json",
     *,
     dry_run: bool = False,
     to: str | None = None,
     since: datetime | None = None,
-    refresh_images: bool = False,
 ) -> int:
     """Process every feed in ``config_path`` and send whatever is new.
 
@@ -300,13 +219,15 @@ def run_feeds(
     first send if it doesn't exist. ``to`` overrides that for every feed at once
     and touches no group — the safe way to try a real send against your own
     number. ``since`` overrides every stored watermark, for replaying a stretch
-    of a feed by hand. ``refresh_images`` refreshes every group's picture after
-    sending, rather than leaving it to chance (see :mod:`rssignal.artwork`); like
-    the chance, it does nothing on a dry run or with ``to``.
+    of a feed by hand.
 
     Returns the number of items sent (or, in ``dry_run`` mode, that would be
-    sent). With ``dry_run`` set nothing is sent, downloaded, created, or
-    recorded — each candidate is printed instead.
+    sent). With ``dry_run`` set nothing is sent, created, or recorded — each
+    candidate is printed instead.
+
+    After sending, each feed group's picture is brought in line with the feed's
+    artwork in the library, where that has changed (see :mod:`rssignal.artwork`)
+    — never on a dry run or with ``to``.
 
     A feed that fails does not stop the others: it is reported on stderr and
     skipped, and its watermark is left where it was, so the next run picks it up
@@ -325,13 +246,7 @@ def run_feeds(
     with ExitStack() as outer:
         if not dry_run:
             outer.enter_context(single_run())
-        return _locked_run(
-            config_path,
-            dry_run=dry_run,
-            to=to,
-            since=since,
-            refresh_images=refresh_images,
-        )
+        return _locked_run(config_path, dry_run=dry_run, to=to, since=since)
 
 
 def _locked_run(
@@ -340,26 +255,15 @@ def _locked_run(
     dry_run: bool,
     to: str | None,
     since: datetime | None,
-    refresh_images: bool = False,
 ) -> int:
     """The body of :func:`run_feeds`, with the run lock already held."""
     feeds = load_feeds(config_path)
     resolver = _GroupResolver()
 
-    # feedparser takes no timeout of its own, and one unresponsive host would
-    # otherwise hold the run open with no way out. Set here rather than at import
-    # so it is a property of a run, not of having imported rssignal.
-    socket.setdefaulttimeout(FEED_SOCKET_TIMEOUT)
-
     started = time.monotonic()
     started_wall = time.time()
     kind = " (dry run)" if dry_run else ""
     log_line(f"run started{kind}: {len(feeds)} feed(s)")
-    if not dry_run:
-        # Points TMPDIR at the archive's staging directory, so that the copy
-        # `archive.keep` makes afterwards is a hard link rather than a second
-        # write of the whole file. A dry run downloads nothing and needs neither.
-        archive.prepare()
     try:
         with signal_daemon():
             sent = _run_prepared(
@@ -367,12 +271,8 @@ def _locked_run(
             )
             # After sending, so it never holds an episode up, and inside the
             # daemon, so the uploads don't each pay for a JVM. --to touches no
-            # group and a dry run changes nothing, so neither rolls for it.
-            if (
-                not dry_run
-                and to is None
-                and (refresh_images or artwork.refresh_due())
-            ):
+            # group and a dry run changes nothing, so neither does this.
+            if not dry_run and to is None:
                 _refresh_artwork(feeds, resolver)
     except BaseException as exc:
         # Including KeyboardInterrupt and SystemExit: a run stopped by hand or
@@ -384,22 +284,16 @@ def _locked_run(
         )
         raise
 
-    # After sending, not before: expiry is nobody's hurry, and a run that does
-    # its housekeeping first would spend the time even when it had nothing to do.
-    # A dry run prunes nothing — it is supposed to leave the disk as it found it.
-    expired = 0 if dry_run else archive.prune()
-    aged = f", {expired} archived file(s) expired" if expired else ""
-
     log_line(
         f"run finished in {_elapsed(started, started_wall)}: "
-        f"{sent} item(s) sent{kind}{aged}"
+        f"{sent} item(s) sent{kind}"
         f"{_sleep_note(started, started_wall, sent)}"
     )
     return sent
 
 
 def _refresh_artwork(feeds: list[FeedConfig], resolver: _GroupResolver) -> None:
-    """The occasional group picture refresh, which must never fail a run.
+    """The group picture refresh, which must never fail a run.
 
     Everything that could go wrong for one feed is already contained by
     :func:`~rssignal.artwork.refresh`; this is for what's left — the group
@@ -413,22 +307,20 @@ def _refresh_artwork(feeds: list[FeedConfig], resolver: _GroupResolver) -> None:
         log_exception("group image refresh", exc)
         return
     cache.save()
-    log_line(f"group images refreshed: {changed} updated")
+    if changed:
+        log_line(f"group images refreshed: {changed} updated")
 
 
 def refresh_group_images(config_path: str = "feeds.json", *, dry_run: bool = False) -> int:
-    """Refresh every feed group's picture now, rather than when the dice say.
+    """Bring every feed group's picture in line with the library, now.
 
-    What a run does on its own about once a month (see :mod:`rssignal.artwork`),
-    on demand. Returns how many groups got a new picture — or, with ``dry_run``,
-    how many would have; a dry run downloads the images to compare them but
-    changes nothing.
+    What a run does on its own after sending, on demand. Returns how many groups
+    got a new picture — or, with ``dry_run``, how many would have.
 
     Takes the run lock, like a run: both talk to the same signal-cli account, and
     a second signal-cli can't open an account the first one holds.
     """
     feeds = load_feeds(config_path)
-    socket.setdefaulttimeout(FEED_SOCKET_TIMEOUT)
     with ExitStack() as outer:
         if not dry_run:
             outer.enter_context(single_run())
@@ -467,10 +359,6 @@ def _elapsed(started: float, started_wall: float | None = None) -> str:
     worth having: the first is the run's real cost, and the second is why a run
     that started at 15:00 delivered its messages at 18:37.
 
-    Nothing in the log otherwise tells a suspended run from a fast one — the
-    duration looks healthy, and working out which runs were affected means
-    reading start and finish timestamps by hand.
-
     ``started_wall`` omitted keeps the plain duration, for callers that have no
     second clock to compare against.
     """
@@ -488,13 +376,10 @@ def _sleep_note(
 
     ``0 item(s) sent`` is the same line whether there was nothing to send or
     whether every send died with the network when the machine suspended. Those
-    are opposite things, and on battery the second is the common one: the run
-    wakes for a couple of minutes of DarkWake, drops back to sleep mid-download,
-    and reports a healthy-looking duration and an empty result.
-
-    So a run that slept says which it was. The reassurance at the end is the real
-    guarantee rather than a hope — a feed that fails rolls its watermark back
-    (see :func:`_send_prepared`), so the items are still queued, not lost.
+    are opposite things, so a run that slept says which it was. The reassurance
+    at the end is the real guarantee rather than a hope — a feed that fails
+    rolls its watermark back (see :func:`_send_prepared`), so the items are
+    still queued, not lost.
 
     ``sent`` omitted is the aborted-run case, where the count means nothing.
     """
@@ -516,11 +401,7 @@ def _sleep_note(
 
 
 def _duration(total: int) -> str:
-    """``38s``, ``2m38s``, ``3h37m`` — the two largest units that say anything.
-
-    A suspended run is measured in hours, which is what pulls the hour case in:
-    ``217m`` is a number to convert in your head, not a duration to read.
-    """
+    """``38s``, ``2m38s``, ``3h37m`` — the two largest units that say anything."""
     hours, rest = divmod(max(total, 0), 3600)
     minutes, seconds = divmod(rest, 60)
     if hours:
@@ -536,40 +417,35 @@ def _run_prepared(
     to: str | None,
     since: datetime | None,
 ) -> int:
-    """The body of a run, with one ``signal-cli`` already up and waiting."""
-    # Fetching is the slow part and feeds don't depend on each other, so it all
-    # happens at once; sending stays sequential below. With --to no group is
-    # touched at all, so there is no listing worth priming.
-    #
-    # --since is an explicit replay of a particular stretch of a feed, so it
-    # overrides a pace the same way it overrides a watermark: the gate comes off
-    # and an episodic feed is fetched and sent like any other. A dry run lifts it
-    # too — it is somebody sitting and watching, who is owed the real answer for
-    # a paced feed ("four waiting, next one Thursday") rather than silence.
-    prepared = _prepare_feeds(
-        feeds, resolver, prime=to is None, gate=since is None and not dry_run
-    )
+    """The body of a run, with one ``signal-cli`` already up and waiting.
+
+    --since is an explicit replay of a particular stretch of a feed, so it
+    overrides a pace the same way it overrides a watermark: the gate comes off
+    and an episodic feed is read and sent like any other. A dry run lifts it
+    too — it is somebody sitting and watching, who is owed the real answer for
+    a paced feed ("four waiting, next one Thursday") rather than silence. --to
+    touches no group, so there is no clock to read.
+    """
+    gate = since is None and not dry_run and to is None
 
     sent = 0
     failed = 0
-    blocked = 0
+    missing = 0
     logged: str | None = None
-    for cfg, prep in zip(feeds, prepared):
+    for cfg in feeds:
         try:
+            prep = _prepare_feed(cfg, resolver, gate=gate)
             if prep.error is not None:
                 raise prep.error
             sent += _send_prepared(
                 cfg, prep, resolver, dry_run=dry_run, to=to, since=since
             )
-        except SourceBlocked as exc:
-            # Nothing went wrong, so this is not counted with the failures and
-            # leaves no traceback: the source is deliberately unreachable right
-            # now and the watermark is waiting for the next run. It does get a
-            # line in the log, though — an unattended run throws stderr away, and
-            # "that feed has gone quiet" is a question worth being able to answer
-            # afterwards without guessing at which evenings the block was on.
-            blocked += 1
-            name = cfg.name or cfg.url
+        except SourceMissing as exc:
+            # Nothing went wrong yet: fetchit has not filed anything for this
+            # feed. No traceback, but a line in the log every run — a feed whose
+            # source is misspelled looks exactly like this, and waits for ever.
+            missing += 1
+            name = cfg.name or cfg.library_name
             print(f"[{name}] skipped: {exc}", file=sys.stderr)
             log_line(f"[{name}] skipped: {exc}")
         except Exception as exc:
@@ -581,10 +457,10 @@ def _run_prepared(
         print(
             f"{failed} of {len(feeds)} feed(s) failed{where}.", file=sys.stderr
         )
-    if blocked:
+    if missing:
         print(
-            f"{blocked} of {len(feeds)} feed(s) skipped: source blocked from "
-            "this machine.",
+            f"{missing} of {len(feeds)} feed(s) skipped: nothing in the library "
+            "for them yet.",
             file=sys.stderr,
         )
 
@@ -598,93 +474,53 @@ def _run_prepared(
 def _report_feed_failure(cfg: FeedConfig, exc: Exception) -> str | None:
     """Explain why a feed was given up on, and carry on with the others.
 
-    A feed is a self-contained unit of work: a video that won't fetch, a source
-    that is down, a group that can't be written to are all reasons to lose *that*
-    feed for one run, and no reason at all to lose the ones after it. Whatever
-    went wrong, the next run starts again from the watermark this one didn't
-    move.
+    A feed is a self-contained unit of work: an upload that won't go through or
+    a group that can't be written to are reasons to lose *that* feed for one
+    run, and no reason at all to lose the ones after it. Whatever went wrong,
+    the next run starts again from the watermark this one didn't move.
 
     stderr gets one line, because a run that skips a feed is not a run anyone
-    wants a screenful about, and because stderr is usually nowhere at all — this
-    runs from cron and from Shortcuts. The traceback goes to
-    :mod:`rssignal.errorlog` instead, where it is still there tomorrow. Returns
-    the log's path, for the summary line to point at.
+    wants a screenful about, and because stderr is usually nowhere at all. The
+    traceback goes to :mod:`rssignal.errorlog` instead, where it is still there
+    tomorrow. Returns the log's path, for the summary line to point at.
     """
-    label = cfg.name or cfg.url
+    label = cfg.name or cfg.library_name
     print(f"[{label}] skipped: {exc}", file=sys.stderr)
     return log_exception(f"feed {label!r}", exc)
 
 
 @dataclass
 class _Prepared:
-    """One feed's fetched-and-filtered items, or the exception that stopped it.
-
-    The parallel phase can't report a failure itself — a worker thread has no
-    turn of its own, and a traceback surfacing out of order would belong to no
-    feed in particular. So it carries the exception back instead, and the
-    sequential phase raises it where that feed's turn is, into the same handler
-    that has always dealt with a feed going wrong.
-    """
+    """One feed's items as read and filtered, or the exception that stopped it."""
 
     parsed: ParsedFeed | None = None
     items: list[FeedItem] = field(default_factory=list)
     error: Exception | None = None
 
 
-def _prepare_feeds(
-    feeds: list[FeedConfig], resolver: _GroupResolver, *, prime: bool, gate: bool = True
-) -> list[_Prepared]:
-    """Fetch and filter every feed at once, in ``feeds`` order.
-
-    This is the whole of the parallelism. It is safe to do here and nowhere else
-    because fetching a feed touches nothing shared: it reads its own url, builds
-    its own items, and hands them back. Everything with an ordering requirement —
-    reading a watermark, creating a group, sending, moving the watermark on —
-    stays in the sequential phase, where it always was.
-
-    Results come back in configuration order however the threads finished, so a
-    run's output reads the same as it ever did.
-    """
-    workers = _worker_count(len(feeds))
-    with _whole_lines_stderr():
-        with ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix="rssignal-feed"
-        ) as pool:
-            if prime:
-                pool.submit(resolver.prime)
-            futures = [
-                pool.submit(_prepare_feed, cfg, resolver, gate=gate and prime)
-                for cfg in feeds
-            ]
-            return [future.result() for future in futures]
-
-
 def _prepare_feed(
     cfg: FeedConfig, resolver: _GroupResolver, *, gate: bool
 ) -> _Prepared:
-    """Fetch and filter one feed, catching whatever went wrong. Runs on a worker.
+    """Read and filter one feed from the library, catching whatever went wrong.
 
-    A paced feed with nothing due yet is not fetched at all. That is worth the
-    look it costs: an episodic YouTube feed reads a whole channel's uploads and
-    dates the videos it hasn't seen, and with a run every fifteen minutes and an
-    episode every few days, the overwhelming majority of runs would do all of it
-    only to be told to hold the episode back. See :func:`_holding`.
-
-    Asking means reading the group listing, which :meth:`_GroupResolver.prime` is
-    already fetching in this same pool — ``_listing`` is locked and idempotent, so
-    this waits for that rather than duplicating it.
-
+    A paced feed with nothing due yet is not read at all; see :func:`_holding`.
     ``gate`` is off for the three cases that have no business being rationed:
     ``--to`` (no group, so no clock), ``--since`` (an explicit replay) and
     ``--dry-run`` (somebody watching, who is owed the real answer).
+
+    A :class:`~rssignal.feeds.SourceMissing` is let through rather than
+    caught, so the caller can tell "nothing there yet" from a failure.
     """
     try:
-        with timing.step("feed fetch", cfg.name or cfg.url):
+        with timing.step("library read", cfg.name or cfg.library_name):
             if gate and _holding(cfg, resolver):
                 return _Prepared(parsed=ParsedFeed(items=[]))
-            parsed = parse_feed(cfg)
-            items = apply_filters(parsed.items, cfg.filters)
+            parsed = read_feed(cfg)
+            items = [apply_extracts(item, cfg.extract) for item in parsed.items]
+            items = apply_filters(items, cfg.filters)
         return _Prepared(parsed=parsed, items=items)
+    except SourceMissing:
+        raise
     except Exception as exc:
         return _Prepared(error=exc)
 
@@ -706,66 +542,6 @@ def _holding(cfg: FeedConfig, resolver: _GroupResolver) -> bool:
 def _now() -> datetime:
     """The current moment, in UTC. One place, so a test can move it."""
     return datetime.now(timezone.utc)
-
-
-def _worker_count(feeds: int) -> int:
-    """How many feeds to fetch at once — never more than there are feeds."""
-    try:
-        configured = int(os.environ.get(FEED_WORKERS_ENV, "") or DEFAULT_FEED_WORKERS)
-    except ValueError:
-        configured = DEFAULT_FEED_WORKERS
-    return max(1, min(configured, feeds or 1))
-
-
-@contextmanager
-def _whole_lines_stderr() -> Iterator[None]:
-    """Keep threads from writing over each other's warnings, for this block.
-
-    Several feeds fetching at once means several of them can have something to
-    complain about at once, and ``print`` reaches stderr as more than one write —
-    the text, then the newline — so two threads interleave *within* a line and
-    produce something neither of them said. Buffering each thread's output until
-    it has a full line, and writing that line under a lock, is enough to stop it:
-    a warning may land in a surprising order, but it always lands whole.
-    """
-    real = sys.stderr
-    sys.stderr = _LineSafeStderr(real)  # type: ignore[assignment]
-    try:
-        yield
-    finally:
-        sys.stderr.flush()
-        sys.stderr = real
-
-
-class _LineSafeStderr:
-    """Buffers per thread, emits whole lines under one lock. See above."""
-
-    def __init__(self, target) -> None:
-        self._target = target
-        self._lock = threading.Lock()
-        self._local = threading.local()
-
-    def write(self, text: str) -> int:
-        buffered = getattr(self._local, "buffer", "") + text
-        head, newline, tail = buffered.rpartition("\n")
-        if newline:
-            with self._lock:
-                self._target.write(head + newline)
-                self._target.flush()
-        self._local.buffer = tail
-        return len(text)
-
-    def flush(self) -> None:
-        # A last line with no newline of its own still has to get out.
-        leftover = getattr(self._local, "buffer", "")
-        with self._lock:
-            if leftover:
-                self._target.write(leftover)
-            self._target.flush()
-        self._local.buffer = ""
-
-    def __getattr__(self, name: str):
-        return getattr(self._target, name)
 
 
 def _send_prepared(
@@ -855,9 +631,7 @@ def _send_prepared(
             current if to else _record_progress(group, parsed, item, current, paced)
         )
         try:
-            delivered = _handle_item(
-                cfg, item, recipient, dry_run=False, show=parsed
-            )
+            delivered = _handle_item(cfg, item, recipient, dry_run=False)
         except Exception:
             # The marker promised an item that never arrived. Put the old
             # description back so the next run tries again.
@@ -869,9 +643,7 @@ def _send_prepared(
         # other half of the promise, though, and an item nobody was sent is not
         # a release — so a skip hands the cadence slot back, and the next run
         # offers the episode after it rather than making a paced feed sit out a
-        # day for a Short. Written as a second update rather than folded into
-        # the one above because whether an item is sendable is only known after
-        # it has been looked at, and this is the rare path, not the common one.
+        # day for nothing.
         if not delivered and paced is not None and marked != before:
             marked = _record_progress(group, parsed, item, before, read_pace(before))
         current = marked
@@ -984,102 +756,55 @@ def _handle_item(
     recipient: str,
     *,
     dry_run: bool,
-    show: ParsedFeed | None = None,
 ) -> bool:
     """Send (or, in dry-run, describe) a single item from feed ``cfg``.
 
-    ``show`` is the feed the item came from, for what it says about itself: the
-    archive files an episode of a series under a description of the series.
-
     Returns whether anything actually went to the group. Not every item that
-    gets this far becomes a message — an upload that turns out to be a Short, or
-    a video too big for any quality to fit, is stepped over — and a run that
-    counted those would report items the group never received, which is a worse
-    lie than a quiet evening.
-
-    Raises if a video that ought to be sendable can't be fetched this time,
-    which leaves the item unsent and un-marked for the next run to retry.
+    gets this far becomes a message — a file too big for any number of parts
+    is stepped over — and a run that counted those would report items the
+    group never received, which is a worse lie than a quiet evening.
     """
     is_podcast = is_audio_item(item)
-    # An item with an audio enclosure is already an episode; asking ARTE about
-    # it as well would be a pointless round trip.
     is_video = not is_podcast and is_video_item(item)
     card = preview_fields(item, cfg)
-    label = cfg.name or cfg.url
+    label = cfg.name or cfg.library_name
     # Clipped here rather than left to send_msg, so a dry run reports the text
     # that would actually go out — long show notes are cut, not printed whole.
     text = clip_body(render_message(item, cfg), card["url"] if card else None)
+
+    if (is_podcast or is_video) and not item.media:
+        # fetchit files every audio and video item with its file, so this is an
+        # item somebody built by hand, or whose file has gone. Nothing to attach,
+        # and an episode that arrives as a bare caption is no episode.
+        print(f"[{label}] skipped: {item.title!r} has no file in the library", file=sys.stderr)
+        log_line(f"[{label}] skipped: {item.title!r} has no file in the library")
+        return False
 
     if dry_run:
         first_line = text.splitlines()[0] if text else "(no text)"
         print(f"[{label}] -> {recipient}: {first_line}")
         if card:
             print(f"    preview: {card['title']} <{card['url']}>")
-            if card["image_url"]:
-                print(f"    preview image: {card['image_url']}")
-        if is_podcast:
-            suffix = f" (second message, captioned {item.title!r})" if card else ""
-            print(f"    voice note{suffix}: {item.enclosure_url}")
-        if is_video:
-            # Resolving is a couple of small requests and no download, so a dry
-            # run can report the resolution and size it would really arrive at.
-            try:
-                print(f"    video: {resolve_video(item).describe()}")
-            except (VideoTooShort, VideoTooBig, VideoGone) as exc:
-                print(f"    nothing sent: {exc}")
-                return False
-            except FeedError as exc:
-                # A real run would send nothing and leave the item for the next
-                # one, so a dry run says that rather than counting a message.
-                print(f"    nothing sent: video unavailable ({exc}) — will retry")
-                return False
+            if card["image"]:
+                print(f"    preview image: {card['image']}")
         if is_podcast or is_video:
-            kept = archive.describe(item, feed=label)
-            if kept:
-                print(f"    archived to: {kept}")
+            what = "voice note" if is_podcast else "video"
+            suffix = f" (second message, captioned {item.title!r})" if card and is_podcast else ""
+            print(f"    {what}{suffix}: {_describe_file(item.media)}")
         return True
 
-    if is_video:
-        # Resolved before anything is sent, because the answer can be "don't
-        # send this at all" — a Short is not a message.
-        try:
-            plan = resolve_video(item)
-        except (VideoTooShort, VideoTooBig, VideoGone) as exc:
-            # The watermark has already moved past this item, and stays moved:
-            # a Short does not become worth sending by being looked at again
-            # tomorrow, a two-hour documentary does not fit tomorrow either, and
-            # an expired programme stays expired. But nothing reaches the group,
-            # so this is not a send, and it goes in the log as well as to
-            # stderr — stderr is nowhere at all under a scheduler, and an item
-            # counted as sent that never arrived is a long evening's worth of
-            # wondering why.
-            print(f"[{label}] skipped: {exc}", file=sys.stderr)
-            log_line(f"[{label}] skipped: {exc}")
-            return False
-        # Any other FeedError is left to propagate: a video item is its video,
-        # so one that can't be had right now is an item that hasn't been sent
-        # yet rather than one to paraphrase as a link. The caller rolls the
-        # watermark back — and with it the pace clock — and the next run tries
-        # the same item again.
-
     with ExitStack() as stack:
-        # The whole file, as downloaded: what the archive keeps.
-        full = None
-        if is_podcast:
-            full = stack.enter_context(download_temp(item.enclosure_url))
-        elif is_video:
-            full = stack.enter_context(video_temp(item, plan=plan))
-
         # What Signal gets: the file itself, or — when it is over the limit — as
-        # few parts as will each fit. See :mod:`rssignal.parts`.
+        # few parts as will each fit. See :mod:`rssignal.parts`. The library's
+        # file is never changed: parts are cut into a temporary directory.
         pieces: list[str] = []
-        if full is not None:
+        if is_podcast or is_video:
+            assert item.media is not None
             try:
-                pieces = stack.enter_context(split_temp(full))
+                pieces = stack.enter_context(split_temp(item.media))
             except VideoTooBig as exc:
                 # Too big for even the most parts rssignal will send — which it
-                # would be again next run. Same answer as a video that never had
-                # a fitting quality: nothing goes out, and the item isn't
+                # would be again next run. Nothing goes out, and the item isn't
                 # reconsidered.
                 print(f"[{label}] skipped: {exc}", file=sys.stderr)
                 log_line(f"[{label}] skipped: {exc}")
@@ -1091,7 +816,7 @@ def _handle_item(
                 url=card["url"],
                 title=card["title"],
                 description=card["description"],
-                image=_local_image(card["image_url"], stack, label),
+                image=card["image"],
             )
 
         _send_all(
@@ -1100,39 +825,20 @@ def _handle_item(
             item=item,
             label=label,
         )
-
-        # Still inside the ExitStack, because this links the file rather than
-        # copying it and the temporary name has to still be there to link from.
-        # After the send, not before: an item that failed to go out will come
-        # round again next run, and an archive of things nobody received would
-        # be a confusing thing to browse. Only the media itself — the preview
-        # image from `_local_image` is furniture, not content — and the whole of
-        # it, not the parts it was cut into for Signal's sake.
-        if full is not None:
-            kept = archive.keep(full, feed=label, item=item)
-            # A video is watched in a player, which can show more than a file
-            # name if it is told more. Fetched only now, and only if there is
-            # an archive to put it in: nothing about the send waits on it.
-            if kept and is_video:
-                archive.annotate(
-                    kept,
-                    item,
-                    image=_local_image(
-                        item.image_url, stack, label, what="archive image"
-                    ),
-                )
-                if show is not None:
-                    # Only an episode of a series has one to describe, and its
-                    # picture is only fetched if the series has none yet.
-                    archive.annotate_show(
-                        kept,
-                        item,
-                        description=show.description,
-                        fetch_image=lambda: _local_image(
-                            show.image_url, stack, label, what="series image"
-                        ),
-                    )
     return True
+
+
+def _describe_file(path: str | None) -> str:
+    """``"<path> (~120 MB, in 2 parts)"``, for a dry run."""
+    if not path:
+        return "(no file)"
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return path
+    parts = parts_needed(size, MAX_BYTES)
+    extra = f", in {parts} parts" if parts > 1 else ""
+    return f"{path} (~{size / (1024 * 1024):.0f} MB{extra})"
 
 
 @dataclass(frozen=True)
@@ -1242,20 +948,3 @@ def _send_all(
 
     for note in keys:
         pending.forget(note)
-
-
-def _local_image(
-    url: str | None, stack: ExitStack, label: str, *, what: str = "preview image"
-) -> str:
-    """Download an image, returning its local path or ``""``.
-
-    Artwork is decoration: if it can't be fetched the message (or the group)
-    should still happen, so a failed download degrades to no image.
-    """
-    if not url:
-        return ""
-    try:
-        return stack.enter_context(download_temp(url, default_suffix=".jpg"))
-    except FeedError as exc:
-        print(f"[{label}] {what} skipped: {exc}", file=sys.stderr)
-        return ""

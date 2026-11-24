@@ -27,23 +27,11 @@ fi
 
 bashio::config.require 'account'
 
-# Read the list straight out of the options file rather than through
-# `bashio::config`, which hands back a list as pretty-printed JSON — fine to
-# log, useless to iterate.
-declare -a SLOTS
-mapfile -t SLOTS < <(jq -r '.schedule[]? // empty' /data/options.json)
-
-if [ "${#SLOTS[@]}" -eq 0 ]; then
-    bashio::exit.nok "No times in 'schedule' — the add-on would never run."
-fi
-
-bashio::log.info "Schedule: ${SLOTS[*]} (${TZ:-system timezone})"
-
 # `rssignal doctor` on every start, because there is nowhere else to run it.
 # On a normal host this is the first thing you type after installing; here
 # there is no shell to type it in, so the add-on says it out loud instead. It
-# checks signal-cli, ffmpeg and yt-dlp on PATH, which accounts are linked, the
-# config and the log path — cheap, read-only, and the difference between
+# checks signal-cli and ffmpeg on PATH, which accounts are linked, the library,
+# the config and the log path — cheap, read-only, and the difference between
 # finding out now and finding out at 01:30.
 bashio::log.info "Checking the install..."
 #
@@ -88,71 +76,25 @@ bashio::log.info "Checking the install..."
     bashio::log.info "  ${line}"
 done || true
 
-# Waiting until the next slot to discover whether any of this works is a poor
-# first experience when the next slot may be twelve hours away — and without a
-# shell there is no other way to make a run happen. `dry-run` fetches every
-# feed and sends nothing; `run` is the real thing.
+# From here on one process does everything: `rssignal serve` keeps a single
+# signal-cli open for its whole life, runs the feeds at the scheduled times,
+# serves the GUI (the add-on's sidebar panel, through ingress) and accepts
+# messages to send — Home Assistant's Signal Messenger integration among them.
+# One process, because signal-cli allows one per account: a notification sent
+# through a second one would wait behind a run, or trip over its lock.
 #
-# `run` also refreshes every group's picture, which a scheduled run only does
-# at random about once a month. Restarting the add-on is the moment someone is
-# watching — after an update, or after changing a feed — and the one way to ask
-# for a refresh on a host with no shell to type `rssignal refresh-images` into.
-case "$(bashio::config 'on_start')" in
-    dry-run)
-        bashio::log.info "on_start: dry run (fetches everything, sends nothing)"
-        rssignal-run --dry-run || true
-        ;;
-    run)
-        bashio::log.info "on_start: running now, and refreshing group pictures"
-        rssignal-run --refresh-images || true
-        ;;
-esac
+# The schedule, `on_start` and who may send are read in rssignal-env.sh.
+# shellcheck source=../../../../usr/local/lib/rssignal-env.sh
+source /usr/local/lib/rssignal-env.sh
 
-# Seconds from now until the next slot, today's if one is still to come and
-# tomorrow's earliest otherwise.
-#
-# Computed from absolute epoch seconds rather than by adding up hours, because
-# the arithmetic has to survive the two days a year that are not 24 hours long.
-# `date` knows about those; a loop counting 3600s at a time does not.
-next_wait() {
-    local now soonest=0 when
-    now="$(date +%s)"
+if [ -z "${RSSIGNAL_SCHEDULE}" ]; then
+    bashio::log.warning "No times in 'schedule': feeds run only when asked, from the panel."
+else
+    bashio::log.info "Schedule: ${RSSIGNAL_SCHEDULE} (${TZ:-system timezone})"
+fi
 
-    for slot in "${SLOTS[@]}"; do
-        when="$(date -d "today ${slot}" +%s 2>/dev/null)" || continue
-        if [ "${when}" -le "${now}" ]; then
-            when="$(date -d "tomorrow ${slot}" +%s)"
-        fi
-        if [ "${soonest}" -eq 0 ] || [ "${when}" -lt "${soonest}" ]; then
-            soonest="${when}"
-        fi
-    done
-
-    if [ "${soonest}" -eq 0 ]; then
-        # Every entry failed to parse, which the config schema should have
-        # prevented. Wait an hour rather than spinning.
-        echo 3600
-        return
-    fi
-
-    echo "$(( soonest - now ))"
-}
-
-while true; do
-    wait_for="$(next_wait)"
-    bashio::log.info \
-        "Next run at $(date -d "+${wait_for} seconds" '+%Y-%m-%d %H:%M %Z')."
-
-    sleep "${wait_for}"
-
-    # A failed run is logged and the loop carries on. rssignal is built to be
-    # run again — the watermark of anything it did not manage to send is left
-    # where it was, so the next slot picks up the same items rather than
-    # skipping them. A scheduler that gave up on the first bad night would turn
-    # one unreachable feed into a silent week.
-    rssignal-run || true
-
-    # One second past the slot, so that a run which finished inside the same
-    # minute is not immediately rescheduled onto the slot it just did.
-    sleep 1
-done
+exec rssignal serve \
+    --config "${RSSIGNAL_CONFIG}" \
+    --host 0.0.0.0 \
+    --port 8099 \
+    --on-start "$(bashio::config 'on_start')"

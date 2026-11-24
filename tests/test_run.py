@@ -8,18 +8,19 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from rssignal import archive, pending, run
+from rssignal import pending, run
 from rssignal.feeds import (
     FeedConfig,
     FeedError,
     FeedFilter,
     FeedItem,
     ParsedFeed,
-    SourceBlocked,
+    SourceMissing,
+    is_audio_item,
 )
 from rssignal.run import AlreadyRunning, run_feeds, single_run
 from rssignal.signal_cli import LinkPreview, SignalError, SignalGroup
-from rssignal.video import VideoGone, VideoTooBig, VideoTooShort
+from rssignal.parts import VideoTooBig
 from rssignal.watermark import format_watermark, read_watermark
 
 NOW = datetime(2026, 7, 22, 12, 0, 0, tzinfo=timezone.utc)
@@ -30,19 +31,36 @@ LONG_AGO = format_watermark(NOW - timedelta(days=365))
 
 
 def _stamp(items):
-    """Give undated fixture items increasing publication dates, in feed order.
+    """Give fixture items what the library would: dates, and files.
 
     Undated items are never sent — there is no way to tell whether they are new
     — so a test that isn't about dates would otherwise send nothing. Increasing
     in list order means the chronological send order matches how the test wrote
     them.
+
+    An item with an audio enclosure is filed by fetchit with its file, and its
+    picture beside it; a fixture written as a feed item gets both, at
+    ``/tmp/fake-<name>``, so a test can say where they are without making them.
     """
     return [
-        item
-        if item.published is not None
-        else dataclasses.replace(item, published=NOW + timedelta(seconds=i))
+        _as_filed(
+            item
+            if item.published is not None
+            else dataclasses.replace(item, published=NOW + timedelta(seconds=i))
+        )
         for i, item in enumerate(items)
     ]
+
+
+def _as_filed(item):
+    """``item`` as the library holds it: kind, media and image filled in."""
+    if item.kind is None and is_audio_item(item) and item.media is None:
+        name = item.enclosure_url.rsplit("/", 1)[-1]
+        item = dataclasses.replace(item, kind="audio", media=f"/tmp/fake-{name}")
+    if item.image is None and item.image_url:
+        name = item.image_url.rsplit("/", 1)[-1]
+        item = dataclasses.replace(item, image=f"/tmp/fake-{name}")
+    return item
 
 
 def _patch_feeds(
@@ -56,9 +74,9 @@ def _patch_feeds(
     monkeypatch.setattr(run, "load_feeds", lambda path: configs)
     monkeypatch.setattr(
         run,
-        "parse_feed",
+        "read_feed",
         lambda cfg: ParsedFeed(
-            items=_stamp(items_by_url[cfg.url]), image_url=image, description=blurb
+            items=_stamp(items_by_url[cfg.source]), image=image, description=blurb
         ),
     )
     if groups is None:
@@ -131,7 +149,7 @@ def _capture_sends(monkeypatch):
 
 
 def test_run_regular_sends_text_per_item(monkeypatch):
-    cfg = FeedConfig(url="https://a", name="Blog")
+    cfg = FeedConfig(source="https://a", name="Blog")
     items = [
         FeedItem(title="One", description="d1", link="https://a/1"),
         FeedItem(title="Two", description="d2", link="https://a/2"),
@@ -146,20 +164,13 @@ def test_run_regular_sends_text_per_item(monkeypatch):
     assert all(s["voice_note"] is False for s in sends)
 
 
-def test_run_podcast_downloads_and_sends_voice_note(monkeypatch):
-    cfg = FeedConfig(url="https://a", name="Pod")
+def test_run_podcast_sends_its_file_as_a_voice_note(monkeypatch):
+    cfg = FeedConfig(source="https://a", name="Pod")
     item = FeedItem(
         title="Ep", description="notes", enclosure_url="https://a/ep.mp3"
     )
     _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
     sends = _capture_sends(monkeypatch)
-
-    @contextmanager
-    def fake_download(url, **kwargs):
-        assert url == "https://a/ep.mp3"
-        yield "/tmp/fake-ep.mp3"
-
-    monkeypatch.setattr(run, "download_temp", fake_download)
 
     count = run_feeds("feeds.json")
 
@@ -171,7 +182,7 @@ def test_run_podcast_downloads_and_sends_voice_note(monkeypatch):
 
 
 def test_run_podcast_without_enclosure_falls_back_to_text(monkeypatch):
-    cfg = FeedConfig(url="https://a", name="Pod")
+    cfg = FeedConfig(source="https://a", name="Pod")
     item = FeedItem(title="Ep", description="notes", enclosure_url=None)
     _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
     sends = _capture_sends(monkeypatch)
@@ -187,48 +198,21 @@ ARTE_LINK = "https://www.arte.tv/fr/videos/127395-052-A/le-dessous-des-images/"
 YOUTUBE_LINK = "https://www.youtube.com/watch?v=BFcjfKZ0BeI"
 
 
-class _FakePlan:
-    """What resolve_video would hand back, without asking anyone anything."""
-
-    def describe(self):
-        return "640x360, ~63 MB"
-
-    def fetch(self, into, *, timeout):  # pragma: no cover - video_temp is faked
-        raise AssertionError("video_temp is faked; fetch should never run")
-
-
-def _patch_video(monkeypatch, *, fail=None, resolve_fail=None, path="/tmp/fake.mp4"):
-    """Stand in for the video fetch, recording the items it was asked about."""
-    seen = []
-
-    def fake_resolve(item, **kwargs):
-        if resolve_fail is not None:
-            raise resolve_fail
-        return _FakePlan()
-
-    @contextmanager
-    def fake_video_temp(item, **kwargs):
-        seen.append(item.link)
-        if fail is not None:
-            raise fail
-        yield path
-
-    monkeypatch.setattr(run, "resolve_video", fake_resolve)
-    monkeypatch.setattr(run, "video_temp", fake_video_temp)
-    return seen
+def _video(title="Le drapeau", media="/tmp/fake.mp4", **fields):
+    """A video item as fetchit files it: the video is a file in the library."""
+    return FeedItem(
+        title=title, description="d", link=ARTE_LINK, kind="video", media=media, **fields
+    )
 
 
 def test_run_video_item_attaches_the_video(monkeypatch):
-    cfg = FeedConfig(url="https://a", name="Arte")
-    item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
-    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    cfg = FeedConfig(source="https://a", name="Arte")
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [_video()]})
     sends = _capture_sends(monkeypatch)
-    seen = _patch_video(monkeypatch)
 
     count = run_feeds("feeds.json")
 
     assert count == 1
-    assert seen == [ARTE_LINK]
     # One message, not two: no preview card means nothing for the attachment
     # to displace.
     assert len(sends) == 1
@@ -239,114 +223,36 @@ def test_run_video_item_attaches_the_video(monkeypatch):
     assert sends[0]["text"] == f"Le drapeau\n\nd\n\n{ARTE_LINK}"
 
 
-def test_run_video_failure_sends_nothing_and_retries(monkeypatch):
-    """A video item is its video: no video, no message, and no watermark."""
-    cfg = FeedConfig(url="https://a", name="Arte")
-    item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
-    calls = _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
-    sends = _capture_sends(monkeypatch)
-    _patch_video(monkeypatch, resolve_fail=FeedError("expired rights"))
-
-    count = run_feeds("feeds.json")
-
-    # The text alone would be a message the group can't watch, so it doesn't go.
-    assert sends == []
-    assert count == 0
-    # The marker went up before the send and came back down after it failed, so
-    # the next run offers the same item again.
-    assert calls["updated"][-1]["description"] == LONG_AGO
-
-
-def test_run_ordinary_link_is_not_treated_as_video(monkeypatch):
-    cfg = FeedConfig(url="https://a", name="Blog")
-    item = FeedItem(title="One", description="d", link="https://a/1")
+def test_run_text_item_goes_out_as_text(monkeypatch):
+    cfg = FeedConfig(source="https://a", name="Blog")
+    item = FeedItem(title="One", description="d", link=ARTE_LINK, kind="text")
     _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
     sends = _capture_sends(monkeypatch)
-    seen = _patch_video(monkeypatch)
 
     run_feeds("feeds.json")
 
-    assert seen == []
     assert sends[0]["attachments"] is None
+    assert sends[0]["text"].endswith(ARTE_LINK)
 
 
-def test_run_audio_enclosure_wins_over_a_video_link(monkeypatch):
-    """An episode is an episode: no point asking ARTE about it as well."""
-    cfg = FeedConfig(url="https://a", name="Pod")
-    item = FeedItem(
-        title="Ep", description="d", link=ARTE_LINK, enclosure_url="https://a/ep.mp3"
-    )
-    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
-    _capture_sends(monkeypatch)
-    seen = _patch_video(monkeypatch)
-
-    @contextmanager
-    def fake_download(url, **kwargs):
-        yield "/tmp/fake-ep.mp3"
-
-    monkeypatch.setattr(run, "download_temp", fake_download)
-
-    run_feeds("feeds.json")
-
-    assert seen == []
-
-
-def test_run_video_download_failure_sends_nothing_and_retries(monkeypatch):
-    """Resolving worked and the download didn't; same answer, same retry."""
-    cfg = FeedConfig(url="https://a", name="Arte")
-    item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
-    calls = _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+def test_run_steps_over_a_video_whose_file_is_gone(monkeypatch, capsys):
+    """fetchit files every video with its file; one without has nothing to send."""
+    cfg = FeedConfig(source="https://a", name="Arte")
+    later = FeedItem(title="Next", description="d", link="https://a/text", kind="text")
+    calls = _patch_feeds(monkeypatch, [cfg], {"https://a": [_video(media=None), later]})
     sends = _capture_sends(monkeypatch)
-    _patch_video(monkeypatch, fail=FeedError("ffmpeg failed: 403"))
-
-    assert run_feeds("feeds.json") == 0
-    assert sends == []
-    assert calls["updated"][-1]["description"] == LONG_AGO
-
-
-def test_run_too_big_video_is_stepped_over_rather_than_retried(monkeypatch, capsys):
-    """No quality fits, and none will tomorrow: nothing sent, nothing retried."""
-    cfg = FeedConfig(url="https://a", name="Arte")
-    item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
-    calls = _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
-    sends = _capture_sends(monkeypatch)
-    _patch_video(monkeypatch, resolve_fail=VideoTooBig("even 640x360 is 210 MB"))
-
-    assert run_feeds("feeds.json") == 0
-    assert sends == []
-    assert "skipped: even 640x360 is 210 MB" in capsys.readouterr().err
-    # Unlike a failure, the watermark stands: retrying would decide the same.
-    assert calls["updated"][-1]["description"] != LONG_AGO
-
-
-def test_run_expired_video_is_stepped_over_and_the_next_one_sent(
-    monkeypatch, capsys
-):
-    """An expired programme must not hold every later episode behind it."""
-    cfg = FeedConfig(url="https://a", name="Arte")
-    gone = FeedItem(title="Expired", description="d", link=ARTE_LINK)
-    after = FeedItem(title="Next week", description="d", link="https://a/text")
-    calls = _patch_feeds(monkeypatch, [cfg], {"https://a": [gone, after]})
-    sends = _capture_sends(monkeypatch)
-    _patch_video(
-        monkeypatch,
-        resolve_fail=VideoGone("125533-026-A is no longer on ARTE: its rights have expired"),
-    )
 
     assert run_feeds("feeds.json") == 1
-    assert len(sends) == 1
-    assert "Next week" in sends[0]["text"]
-    assert "skipped: 125533-026-A is no longer on ARTE" in capsys.readouterr().err
+    assert [s["text"].splitlines()[0] for s in sends] == ["Next"]
+    assert "has no file in the library" in capsys.readouterr().err
     assert calls["updated"][-1]["description"] != LONG_AGO
 
 
 def test_run_video_too_big_even_split_is_stepped_over(monkeypatch, capsys):
     """The estimate fit and the file didn't, by more than parts can absorb."""
-    cfg = FeedConfig(url="https://a", name="Arte")
-    item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
-    calls = _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    cfg = FeedConfig(source="https://a", name="Arte")
+    calls = _patch_feeds(monkeypatch, [cfg], {"https://a": [_video()]})
     sends = _capture_sends(monkeypatch)
-    _patch_video(monkeypatch)
 
     @contextmanager
     def too_big(path, **kwargs):
@@ -361,79 +267,20 @@ def test_run_video_too_big_even_split_is_stepped_over(monkeypatch, capsys):
     assert calls["updated"][-1]["description"] != LONG_AGO
 
 
-def test_run_too_short_video_sends_nothing_at_all(monkeypatch, capsys, error_log):
-    """A Short is not a message — and its watermark stands, so it stays gone."""
-    cfg = FeedConfig(url="https://a", name="Tube")
-    item = FeedItem(title="A Short", description="d", link=YOUTUBE_LINK)
-    calls = _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
-    sends = _capture_sends(monkeypatch)
-    seen = _patch_video(monkeypatch, resolve_fail=VideoTooShort("47s — a Short"))
-
-    count = run_feeds("feeds.json")
-
-    assert sends == []
-    # Not downloaded either: refused before anything was fetched.
-    assert seen == []
-    assert "skipped: 47s — a Short" in capsys.readouterr().err
-    # The watermark stands, which is what stops it being reconsidered — but
-    # nothing reached the group, so the run does not claim to have sent it.
-    assert calls["updated"]
-    assert count == 0
-    # And the reason is in the log, because stderr is nowhere under a scheduler
-    # and a silent skip is exactly what someone comes to the log to find.
-    assert "[Tube] skipped: 47s — a Short" in error_log.read_text()
-
-
-def test_run_dry_run_reports_the_video_quality(monkeypatch, capsys):
-    cfg = FeedConfig(url="https://a", name="Arte")
-    item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
-    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
-    monkeypatch.setattr(run, "resolve_video", lambda item: _FakePlan())
+def test_run_dry_run_reports_the_video_file_and_its_size(monkeypatch, capsys, tmp_path):
+    video = tmp_path / "ep.mp4"
+    video.write_bytes(b"x" * (3 * 1024 * 1024))
+    cfg = FeedConfig(source="https://a", name="Arte")
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [_video(media=str(video))]})
 
     run_feeds("feeds.json", dry_run=True)
 
-    assert "video: 640x360, ~63 MB" in capsys.readouterr().out
-
-
-def test_run_dry_run_reports_a_video_it_would_not_send(monkeypatch, capsys):
-    cfg = FeedConfig(url="https://a", name="Tube")
-    item = FeedItem(title="A Short", description="d", link=YOUTUBE_LINK)
-    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
-
-    def boom(item):
-        raise VideoTooShort("47s — a Short")
-
-    monkeypatch.setattr(run, "resolve_video", boom)
-
-    count = run_feeds("feeds.json", dry_run=True)
-
-    assert "nothing sent: 47s — a Short" in capsys.readouterr().out
-    # Described but not counted, so the number a dry run reports is the number
-    # a real run would send rather than the number it would look at.
-    assert count == 0
-
-
-def test_run_dry_run_reports_an_unavailable_video(monkeypatch, capsys):
-    cfg = FeedConfig(url="https://a", name="Arte")
-    item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
-    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
-
-    def boom(item):
-        raise FeedError("expired rights")
-
-    monkeypatch.setattr(run, "resolve_video", boom)
-
-    count = run_feeds("feeds.json", dry_run=True)
-
-    # A real run would send nothing and come back to it, so neither the message
-    # nor the count may suggest otherwise.
-    assert "nothing sent: video unavailable (expired rights)" in capsys.readouterr().out
-    assert count == 0
+    assert f"video: {video} (~3 MB)" in capsys.readouterr().out
 
 
 def test_run_uses_message_template(monkeypatch):
     cfg = FeedConfig(
-        url="https://a",
+        source="https://a",
         name="Blog",
         message_template="📰 {title} [{feed_name}]\n\n{link}",
     )
@@ -448,7 +295,7 @@ def test_run_uses_message_template(monkeypatch):
 
 def test_run_applies_field_filters(monkeypatch):
     cfg = FeedConfig(
-        url="https://a",
+        source="https://a",
         name="Blog",
         filters=(FeedFilter("title", "excludes", ("sponsored",)),),
     )
@@ -476,32 +323,22 @@ _EPISODE = FeedItem(
 )
 
 
-def _fake_downloads(monkeypatch, fail_on=None):
-    """Patch download_temp, recording urls and optionally failing on one."""
-    got = []
-
-    @contextmanager
-    def fake_download(url, **kwargs):
-        got.append(url)
-        if url == fail_on:
-            raise FeedError(f"Could not download {url!r}: nope")
-        yield f"/tmp/fake-{url.rsplit('/', 1)[-1]}"
-
-    monkeypatch.setattr(run, "download_temp", fake_download)
-    return got
+def _fake_downloads(monkeypatch):
+    """Nothing to download any more: the library has the files. Kept so the
+    tests read as they did; :func:`_as_filed` says where the files are."""
+    return []
 
 
 def test_run_podcast_splits_card_and_voice_note(monkeypatch):
     # Signal drops a preview card from a message that has an attachment, so the
     # card and the audio have to be two messages.
-    cfg = FeedConfig(url="https://a", name="Pod")
+    cfg = FeedConfig(source="https://a", name="Pod")
     _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
     sends = _capture_sends(monkeypatch)
-    downloaded = _fake_downloads(monkeypatch)
+    _fake_downloads(monkeypatch)
 
     count = run_feeds("feeds.json")
 
-    assert downloaded == ["https://a/ep.mp3", "https://a/ep.jpg"]
     assert count == 1  # one item, even though it took two messages
     assert len(sends) == 2
 
@@ -529,7 +366,7 @@ def test_run_decides_per_item_within_one_feed(monkeypatch):
     # A show that posts the occasional written note. There is no feed-level
     # setting to get this wrong: the note keeps its link and sends no audio.
     note = FeedItem(title="A note", description="words", link="https://a/note")
-    cfg = FeedConfig(url="https://a", name="Pod")
+    cfg = FeedConfig(source="https://a", name="Pod")
     _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE, note]})
     sends = _capture_sends(monkeypatch)
     _fake_downloads(monkeypatch)
@@ -549,7 +386,7 @@ def test_run_decides_per_item_within_one_feed(monkeypatch):
 
 
 def test_run_podcast_without_a_card_stays_one_message(monkeypatch):
-    cfg = FeedConfig(url="https://a", name="Pod", link_preview=False)
+    cfg = FeedConfig(source="https://a", name="Pod", link_preview=False)
     _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
     sends = _capture_sends(monkeypatch)
     _fake_downloads(monkeypatch)
@@ -561,24 +398,8 @@ def test_run_podcast_without_a_card_stays_one_message(monkeypatch):
     assert sends[0]["text"].startswith("Ep")
 
 
-def test_run_sends_without_artwork_when_its_download_fails(monkeypatch, capsys):
-    cfg = FeedConfig(url="https://a", name="Pod")
-    _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
-    sends = _capture_sends(monkeypatch)
-    _fake_downloads(monkeypatch, fail_on="https://a/ep.jpg")
-
-    count = run_feeds("feeds.json")
-
-    # The episode still goes out; only the card's image is lost.
-    assert count == 1
-    assert sends[0]["preview"].image == ""
-    assert sends[0]["preview"].title == "Ep"
-    assert sends[1]["attachments"] == ["/tmp/fake-ep.mp3"]
-    assert "preview image skipped" in capsys.readouterr().err
-
-
 def test_run_regular_feed_sends_no_preview(monkeypatch):
-    cfg = FeedConfig(url="https://a", name="Blog")
+    cfg = FeedConfig(source="https://a", name="Blog")
     item = FeedItem(title="One", description="d1", link="https://a/1")
     _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
     sends = _capture_sends(monkeypatch)
@@ -588,25 +409,33 @@ def test_run_regular_feed_sends_no_preview(monkeypatch):
     assert sends[0]["preview"] is None
 
 
-def test_run_dry_run_describes_preview_without_downloading(monkeypatch, capsys):
-    cfg = FeedConfig(url="https://a", name="Pod")
+def test_run_dry_run_describes_the_preview(monkeypatch, capsys):
+    cfg = FeedConfig(source="https://a", name="Pod")
     _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
-    _capture_sends(monkeypatch)
-
-    def fail(url, **kwargs):
-        raise AssertionError("dry run must not download")
-
-    monkeypatch.setattr(run, "download_temp", fail)
+    sends = _capture_sends(monkeypatch)
 
     run_feeds("feeds.json", dry_run=True)
 
     out = capsys.readouterr().out
+    assert sends == []
     assert "preview: Ep <https://a/ep.mp3>" in out
-    assert "preview image: https://a/ep.jpg" in out
+    assert "preview image: /tmp/fake-ep.jpg" in out
+    assert "voice note (second message, captioned 'Ep'): /tmp/fake-ep.mp3" in out
+
+
+def test_run_sends_a_card_without_a_picture_when_the_item_has_none(monkeypatch):
+    cfg = FeedConfig(source="https://a", name="Pod")
+    item = dataclasses.replace(_EPISODE, image_url=None)
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    sends = _capture_sends(monkeypatch)
+
+    assert run_feeds("feeds.json") == 1
+    assert sends[0]["preview"].image == ""
+    assert sends[0]["preview"].title == "Ep"
 
 
 def test_run_dry_run_sends_nothing(monkeypatch, capsys):
-    cfg = FeedConfig(url="https://a", name="Blog")
+    cfg = FeedConfig(source="https://a", name="Blog")
     item = FeedItem(title="One", description="d1", link="https://a/1")
     _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
     sends = _capture_sends(monkeypatch)
@@ -624,7 +453,7 @@ _POST = FeedItem(title="One", description="d1", link="https://a/1")
 
 
 def _blog(name="Blog", **kwargs):
-    return FeedConfig(url="https://a", name=name, **kwargs)
+    return FeedConfig(source="https://a", name=name, **kwargs)
 
 
 def test_run_sends_to_the_group_named_after_the_feed(monkeypatch):
@@ -676,88 +505,18 @@ def test_run_uses_the_feed_artwork_as_the_group_image(monkeypatch):
         monkeypatch,
         [_blog()],
         {"https://a": [_POST]},
-        image="https://a/show.jpg",
+        image="/library/shows/Blog/poster.jpg",
         groups=[],
     )
     _capture_sends(monkeypatch)
-    downloaded = _fake_downloads(monkeypatch)
 
     run_feeds("feeds.json")
 
-    assert downloaded == ["https://a/show.jpg"]
-    assert calls["created"][0]["avatar"] == "/tmp/fake-show.jpg"
+    assert calls["created"][0]["avatar"] == "/library/shows/Blog/poster.jpg"
 
 
-def test_run_creates_the_group_without_an_image_when_the_download_fails(
-    monkeypatch, capsys
-):
-    calls = _patch_feeds(
-        monkeypatch,
-        [_blog()],
-        {"https://a": [_POST]},
-        image="https://a/show.jpg",
-        groups=[],
-    )
-    _capture_sends(monkeypatch)
-    _fake_downloads(monkeypatch, fail_on="https://a/show.jpg")
-
-    run_feeds("feeds.json")
-
-    # Artwork is decoration; losing it must not cost you the group.
-    assert calls["created"][0]["avatar"] is None
-    assert "group image skipped" in capsys.readouterr().err
-
-
-def test_run_gives_a_youtube_group_its_channel_picture(monkeypatch):
-    # YouTube's Atom feed has no artwork, so the channel is asked instead.
-    cfg = FeedConfig(url="https://www.youtube.com/@chan", name="Chan")
-    calls = _patch_feeds(monkeypatch, [cfg], {cfg.url: [_POST]}, groups=[])
-    _capture_sends(monkeypatch)
-    downloaded = _fake_downloads(monkeypatch)
-    asked = []
-    monkeypatch.setattr(
-        run, "source_image", lambda url: asked.append(url) or "https://yt3/avatar.jpg"
-    )
-
-    run_feeds("feeds.json")
-
-    assert asked == ["https://www.youtube.com/@chan"]
-    assert downloaded == ["https://yt3/avatar.jpg"]
-    assert calls["created"][0]["avatar"] == "/tmp/fake-avatar.jpg"
-
-
-def test_run_prefers_the_feed_artwork_to_asking_the_source(monkeypatch):
-    _patch_feeds(
-        monkeypatch, [_blog()], {"https://a": [_POST]}, image="https://a/show.jpg", groups=[]
-    )
-    _capture_sends(monkeypatch)
-    _fake_downloads(monkeypatch)
-    monkeypatch.setattr(run, "source_image", lambda url: pytest.fail("asked"))
-
-    run_feeds("feeds.json")
-
-
-def test_run_creates_a_youtube_group_without_a_picture_it_cannot_get(
-    monkeypatch, capsys
-):
-    cfg = FeedConfig(url="https://www.youtube.com/@chan", name="Chan")
-    calls = _patch_feeds(monkeypatch, [cfg], {cfg.url: [_POST]}, groups=[])
-    _capture_sends(monkeypatch)
-
-    def fail(url):
-        raise FeedError("yt-dlp failed: bot check")
-
-    monkeypatch.setattr(run, "source_image", fail)
-
-    run_feeds("feeds.json")
-
-    assert calls["created"][0]["avatar"] is None
-    assert "[Chan] group image skipped: yt-dlp failed" in capsys.readouterr().err
-
-
-def _patch_refresh(monkeypatch, *, due=True):
+def _patch_refresh(monkeypatch):
     refreshed = []
-    monkeypatch.setattr(run.artwork, "refresh_due", lambda: due)
     monkeypatch.setattr(
         run.artwork,
         "refresh",
@@ -769,7 +528,7 @@ def _patch_refresh(monkeypatch, *, due=True):
     return refreshed
 
 
-def test_run_refreshes_group_images_when_the_dice_say_so(monkeypatch):
+def test_run_refreshes_group_images_after_sending(monkeypatch):
     _patch_feeds(monkeypatch, [_blog()], {"https://a": [_POST]})
     _capture_sends(monkeypatch)
     refreshed = _patch_refresh(monkeypatch)
@@ -777,37 +536,6 @@ def test_run_refreshes_group_images_when_the_dice_say_so(monkeypatch):
     run_feeds("feeds.json")
 
     assert refreshed == [(["Blog"], ["Blog"])]
-
-
-def test_run_refresh_images_refreshes_whatever_the_dice_say(monkeypatch):
-    _patch_feeds(monkeypatch, [_blog()], {"https://a": [_POST]})
-    _capture_sends(monkeypatch)
-    refreshed = _patch_refresh(monkeypatch, due=False)
-
-    run_feeds("feeds.json", refresh_images=True)
-
-    assert refreshed == [(["Blog"], ["Blog"])]
-
-
-@pytest.mark.parametrize("kwargs", [{"dry_run": True}, {"to": "+31600000000"}])
-def test_run_refresh_images_still_changes_nothing_dry_or_with_to(monkeypatch, kwargs):
-    _patch_feeds(monkeypatch, [_blog()], {"https://a": [_POST]})
-    _capture_sends(monkeypatch)
-    refreshed = _patch_refresh(monkeypatch)
-
-    run_feeds("feeds.json", refresh_images=True, **kwargs)
-
-    assert refreshed == []
-
-
-def test_run_refreshes_nothing_on_most_runs(monkeypatch):
-    _patch_feeds(monkeypatch, [_blog()], {"https://a": [_POST]})
-    _capture_sends(monkeypatch)
-    refreshed = _patch_refresh(monkeypatch, due=False)
-
-    run_feeds("feeds.json")
-
-    assert refreshed == []
 
 
 def test_run_refresh_includes_a_group_created_this_run(monkeypatch):
@@ -834,7 +562,6 @@ def test_run_never_refreshes_on_a_dry_run_or_with_to(monkeypatch, kwargs):
 def test_a_failed_refresh_does_not_fail_the_run(monkeypatch, capsys):
     _patch_feeds(monkeypatch, [_blog()], {"https://a": [_POST]})
     sends = _capture_sends(monkeypatch)
-    monkeypatch.setattr(run.artwork, "refresh_due", lambda: True)
 
     def boom(feeds, groups, **kw):
         raise SignalError("listGroups fell over")
@@ -876,7 +603,7 @@ def test_run_refreshes_even_when_a_stale_group_matches(monkeypatch):
 
 
 def test_run_lists_groups_once_for_several_feeds(monkeypatch):
-    feeds = [_blog("Blog"), FeedConfig(url="https://b", name="Other")]
+    feeds = [_blog("Blog"), FeedConfig(source="https://b", name="Other")]
     calls = _patch_feeds(
         monkeypatch,
         feeds,
@@ -1369,15 +1096,15 @@ def test_run_recording_failure_does_not_fail_the_run(monkeypatch, capsys):
 # interesting question about a feed that fails is what happens to the ones
 # after it.
 
-_BROKEN = FeedConfig(url="https://broken", name="Broken")
-_FINE = FeedConfig(url="https://fine", name="Fine")
+_BROKEN = FeedConfig(source="https://broken", name="Broken")
+_FINE = FeedConfig(source="https://fine", name="Fine")
 
 
 def _patch_two_feeds(monkeypatch, parse):
     """Configure Broken and Fine, in that order, parsed by ``parse``."""
     configs = [_BROKEN, _FINE]
     monkeypatch.setattr(run, "load_feeds", lambda path: configs)
-    monkeypatch.setattr(run, "parse_feed", parse)
+    monkeypatch.setattr(run, "read_feed", parse)
     return _patch_groups(
         monkeypatch,
         [
@@ -1388,7 +1115,7 @@ def _patch_two_feeds(monkeypatch, parse):
 
 
 def _one_item(cfg):
-    return ParsedFeed(items=_stamp([FeedItem(title=cfg.name, description="d", link=f"{cfg.url}/1")]))
+    return ParsedFeed(items=_stamp([FeedItem(title=cfg.name, description="d", link=f"{cfg.source}/1")]))
 
 
 def test_run_carries_on_after_a_feed_fails_to_parse(monkeypatch, capsys):
@@ -1407,15 +1134,15 @@ def test_run_carries_on_after_a_feed_fails_to_parse(monkeypatch, capsys):
     assert "1 of 2 feed(s) failed" in err
 
 
-def test_run_reports_a_blocked_source_as_a_skip_not_a_failure(
+def test_run_reports_a_feed_with_nothing_in_the_library_as_a_skip(
     monkeypatch, capsys, error_log
 ):
-    # A DNS profile that closes YouTube during the day is not a fault: the other
+    # A feed fetchit hasn't filed anything for yet is not a fault: the other
     # feeds go, the line says why, and no traceback is written. The log itself
     # exists either way — every run marks its own start and end in it.
     def parse(cfg):
         if cfg is _BROKEN:
-            raise SourceBlocked("youtube.com is not reachable from here")
+            raise SourceMissing("the library has nothing for 'Broken' yet")
         return _one_item(cfg)
 
     _patch_two_feeds(monkeypatch, parse)
@@ -1425,18 +1152,18 @@ def test_run_reports_a_blocked_source_as_a_skip_not_a_failure(
     assert [s["text"].splitlines()[0] for s in sends] == ["Fine"]
 
     err = capsys.readouterr().err
-    assert "[Broken] skipped: youtube.com is not reachable from here" in err
-    assert "1 of 2 feed(s) skipped: source blocked" in err
+    assert "[Broken] skipped: the library has nothing for 'Broken' yet" in err
+    assert "1 of 2 feed(s) skipped: nothing in the library" in err
     assert "failed" not in err
     assert "Traceback" not in error_log.read_text()
 
 
-def test_run_logs_which_feeds_were_blocked(monkeypatch, error_log):
-    # stderr is thrown away by a scheduled run, and "why has that feed gone
-    # quiet?" is asked days later. One stamped line, no traceback.
+def test_run_logs_which_feeds_had_nothing(monkeypatch, error_log):
+    # A misspelled source looks exactly like a feed fetchit hasn't reached yet,
+    # and waits for ever — so every run says so where somebody will look.
     def parse(cfg):
         if cfg is _BROKEN:
-            raise SourceBlocked("youtube.com is not reachable from here")
+            raise SourceMissing("the library has nothing for 'Broken' yet")
         return _one_item(cfg)
 
     _patch_two_feeds(monkeypatch, parse)
@@ -1445,7 +1172,7 @@ def test_run_logs_which_feeds_were_blocked(monkeypatch, error_log):
     run_feeds("feeds.json")
 
     logged = error_log.read_text()
-    assert "[Broken] skipped: youtube.com is not reachable from here" in logged
+    assert "[Broken] skipped: the library has nothing for 'Broken' yet" in logged
     assert "Traceback" not in logged
 
 
@@ -1781,7 +1508,7 @@ def _half_failing_sends(monkeypatch, *, fail_voice_notes):
 
 
 def test_run_sends_only_the_missing_half_after_a_failed_voice_note(monkeypatch):
-    cfg = FeedConfig(url="https://a", name="Pod")
+    cfg = FeedConfig(source="https://a", name="Pod")
     _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
     _fake_downloads(monkeypatch)
     failing = [True]
@@ -1802,7 +1529,7 @@ def test_run_sends_only_the_missing_half_after_a_failed_voice_note(monkeypatch):
 
 
 def test_run_says_it_is_finishing_a_half_sent_item(monkeypatch, capsys):
-    cfg = FeedConfig(url="https://a", name="Pod")
+    cfg = FeedConfig(source="https://a", name="Pod")
     _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
     _fake_downloads(monkeypatch)
     failing = [True]
@@ -1821,7 +1548,7 @@ def test_run_says_it_is_finishing_a_half_sent_item(monkeypatch, capsys):
 def test_run_owes_nothing_once_both_halves_are_out(monkeypatch):
     # The note is cleared by the voice note landing, so an episode replayed with
     # --since gets its card again rather than arriving as a bare audio file.
-    cfg = FeedConfig(url="https://a", name="Pod")
+    cfg = FeedConfig(source="https://a", name="Pod")
     _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
     _fake_downloads(monkeypatch)
     sends = _half_failing_sends(monkeypatch, fail_voice_notes=[False])
@@ -1845,7 +1572,7 @@ def test_run_owes_nothing_for_a_different_item(monkeypatch):
         enclosure_url="https://a/ep2.mp3",
         image_url="https://a/ep.jpg",
     )
-    cfg = FeedConfig(url="https://a", name="Pod")
+    cfg = FeedConfig(source="https://a", name="Pod")
     _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
     _fake_downloads(monkeypatch)
     failing = [True]
@@ -1864,7 +1591,7 @@ def test_run_owes_nothing_for_a_different_item(monkeypatch):
 def test_run_writes_off_a_debt_that_is_never_paid(monkeypatch):
     # An episode whose audio can never be sent would otherwise suppress its own
     # card for good. After the TTL the item is treated as new again.
-    cfg = FeedConfig(url="https://a", name="Pod")
+    cfg = FeedConfig(source="https://a", name="Pod")
     _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
     _fake_downloads(monkeypatch)
     failing = [True]
@@ -1890,285 +1617,13 @@ def test_run_sends_normally_when_the_note_cannot_be_written(monkeypatch, tmp_pat
     blocked = tmp_path / "in-the-way"
     blocked.write_text("not a directory")
     monkeypatch.setenv(pending.PENDING_ENV, str(blocked / "pending.json"))
-    cfg = FeedConfig(url="https://a", name="Pod")
+    cfg = FeedConfig(source="https://a", name="Pod")
     _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
     _fake_downloads(monkeypatch)
     sends = _capture_sends(monkeypatch)
 
     assert run_feeds("feeds.json") == 1
     assert [s["voice_note"] for s in sends] == [False, True]
-
-
-# --- the media archive ------------------------------------------------------
-#
-# rssignal deletes everything it downloads the moment it has been uploaded.
-# `rssignal.archive` puts a second, lasting name on the file first, when
-# RSSIGNAL_MEDIA_DIR says where. These are about the wiring in `_handle_item`:
-# that it happens at all, that it happens only after a successful send, and
-# that it is over before the temporary file goes away.
-
-
-@pytest.fixture
-def media(tmp_path, monkeypatch):
-    """Switch archiving on, into a directory of this test's own."""
-    root = tmp_path / "media"
-    monkeypatch.setenv(archive.MEDIA_DIR_ENV, str(root))
-    return root
-
-
-def _real_downloads(monkeypatch, tmp_path):
-    """Patch download_temp with one that makes a real file and deletes it after.
-
-    The archive links the file rather than naming it, so unlike
-    :func:`_fake_downloads` these tests need bytes actually on disk — and need
-    the temporary name to really go away, which is the thing the archive exists
-    to survive.
-    """
-    scratch = tmp_path / "scratch"
-    scratch.mkdir()
-
-    @contextmanager
-    def fake_download(url, **kwargs):
-        path = scratch / url.rsplit("/", 1)[-1]
-        path.write_bytes(b"the-bytes-of-" + url.encode())
-        try:
-            yield str(path)
-        finally:
-            path.unlink(missing_ok=True)
-
-    monkeypatch.setattr(run, "download_temp", fake_download)
-
-
-def _archived(root):
-    """Every archived file, as paths relative to the archive root."""
-    return sorted(
-        os.path.relpath(os.path.join(dirpath, name), root)
-        for dirpath, _dirs, files in os.walk(root)
-        for name in files
-    )
-
-
-def test_run_archives_the_episode_it_sent(media, tmp_path, monkeypatch):
-    cfg = FeedConfig(url="https://a", name="Pod")
-    item = FeedItem(
-        title="Ep One",
-        description="notes",
-        enclosure_url="https://a/ep.mp3",
-        published=datetime(2026, 3, 4, tzinfo=timezone.utc),
-    )
-    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
-    _capture_sends(monkeypatch)
-    _real_downloads(monkeypatch, tmp_path)
-
-    assert run_feeds("feeds.json") == 1
-
-    assert _archived(media) == [os.path.join("pod", "2026-03-04-ep-one.mp3")]
-    with open(media / "pod" / "2026-03-04-ep-one.mp3", "rb") as fh:
-        assert fh.read() == b"the-bytes-of-https://a/ep.mp3"
-
-
-def test_run_archives_the_audio_but_not_the_preview_image(media, tmp_path, monkeypatch):
-    # The card image is furniture. A media browser full of thumbnails filed
-    # alongside the episodes would be worse than one with none.
-    cfg = FeedConfig(url="https://a", name="Pod")
-    _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
-    _capture_sends(monkeypatch)
-    _real_downloads(monkeypatch, tmp_path)
-
-    run_feeds("feeds.json")
-
-    assert [os.path.splitext(p)[1] for p in _archived(media)] == [".mp3"]
-
-
-def _video_item(**fields):
-    return FeedItem(
-        title="Le drapeau",
-        description="Ce qu'une image raconte.",
-        link=ARTE_LINK,
-        published=datetime(2026, 3, 4, tzinfo=timezone.utc),
-        **fields,
-    )
-
-
-def test_run_describes_an_archived_video_for_a_player(media, tmp_path, monkeypatch):
-    # A video is watched in something that can show a title, a synopsis and a
-    # picture — but only if they are filed beside it under its name.
-    cfg = FeedConfig(url="https://a", name="Arte")
-    item = _video_item(image_url="https://a/still.jpg")
-    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
-    _capture_sends(monkeypatch)
-    _real_downloads(monkeypatch, tmp_path)
-    video = tmp_path / "fetched.mp4"
-    video.write_bytes(b"video")
-    _patch_video(monkeypatch, path=str(video))
-
-    assert run_feeds("feeds.json") == 1
-
-    stem = os.path.join("arte", "2026-03-04-le-drapeau")
-    assert _archived(media) == [stem + ".jpg", stem + ".mp4", stem + ".xml"]
-    with open(media / (stem + ".jpg"), "rb") as fh:
-        assert fh.read() == b"the-bytes-of-https://a/still.jpg"
-    with open(media / (stem + ".xml"), encoding="utf-8") as fh:
-        assert "<title>Le drapeau</title>" in fh.read()
-
-
-def test_run_describes_a_video_that_has_no_picture(media, tmp_path, monkeypatch):
-    cfg = FeedConfig(url="https://a", name="Arte")
-    _patch_feeds(monkeypatch, [cfg], {"https://a": [_video_item()]})
-    _capture_sends(monkeypatch)
-    video = tmp_path / "fetched.mp4"
-    video.write_bytes(b"video")
-    _patch_video(monkeypatch, path=str(video))
-
-    assert run_feeds("feeds.json") == 1
-
-    stem = os.path.join("arte", "2026-03-04-le-drapeau")
-    assert _archived(media) == [stem + ".mp4", stem + ".xml"]
-
-
-def test_run_files_an_episode_of_a_series_as_one(media, tmp_path, monkeypatch):
-    # An item that knows its season and episode is laid out, and described, the
-    # way a media server builds a series from — with the feed's own description
-    # and artwork for the series itself.
-    cfg = FeedConfig(url="https://a", name="Bureau Buitenland")
-    item = _video_item(
-        image_url="https://a/still.jpg",
-        extra={"season": "2", "episode": "28", "show_title": "Bureau Buitenland"},
-    )
-    _patch_feeds(
-        monkeypatch,
-        [cfg],
-        {"https://a": [item]},
-        image="https://a/show.jpg",
-        blurb="De wereld.",
-    )
-    _capture_sends(monkeypatch)
-    _real_downloads(monkeypatch, tmp_path)
-    video = tmp_path / "fetched.mp4"
-    video.write_bytes(b"video")
-    _patch_video(monkeypatch, path=str(video))
-
-    assert run_feeds("feeds.json") == 1
-
-    show = "bureau-buitenland"
-    stem = os.path.join(show, "Season 02", "bureau-buitenland-s02e28")
-    assert _archived(media) == [
-        stem + ".jpg",
-        stem + ".mp4",
-        stem + ".nfo",
-        stem + ".xml",
-        os.path.join(show, "fanart.jpg"),
-        os.path.join(show, "poster.jpg"),
-        os.path.join(show, "tvshow.nfo"),
-    ]
-    with open(media / show / "poster.jpg", "rb") as fh:
-        assert fh.read() == b"the-bytes-of-https://a/show.jpg"
-    with open(media / show / "tvshow.nfo", encoding="utf-8") as fh:
-        assert "<plot>De wereld.</plot>" in fh.read()
-
-
-def test_run_fetches_no_picture_when_nothing_is_archived(monkeypatch):
-    cfg = FeedConfig(url="https://a", name="Arte")
-    item = _video_item(image_url="https://a/still.jpg")
-    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
-    _capture_sends(monkeypatch)
-    _patch_video(monkeypatch)
-
-    def no_downloads(url, **kwargs):
-        raise AssertionError(f"downloaded {url} with no archive to put it in")
-
-    monkeypatch.setattr(run, "download_temp", no_downloads)
-
-    assert run_feeds("feeds.json") == 1
-
-
-def test_run_archives_nothing_when_the_send_fails(media, tmp_path, monkeypatch):
-    cfg = FeedConfig(url="https://a", name="Pod")
-    item = FeedItem(title="Ep", description="d", enclosure_url="https://a/ep.mp3")
-    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
-    _real_downloads(monkeypatch, tmp_path)
-
-    def fail(*_args, **_kwargs):
-        raise SignalError("send failed")
-
-    monkeypatch.setattr(run, "send_msg", fail)
-
-    run_feeds("feeds.json")
-
-    # The item will come round again next run; an archive of things nobody
-    # received would make the folder a poor record of what was sent.
-    assert not os.path.exists(media) or _archived(media) == []
-
-
-def test_dry_run_archives_nothing(media, tmp_path, monkeypatch):
-    cfg = FeedConfig(url="https://a", name="Pod")
-    item = FeedItem(title="Ep", description="d", enclosure_url="https://a/ep.mp3")
-    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
-    _real_downloads(monkeypatch, tmp_path)
-
-    run_feeds("feeds.json", dry_run=True)
-
-    assert not os.path.exists(media) or _archived(media) == []
-
-
-def test_dry_run_says_where_the_episode_would_be_archived(
-    media, monkeypatch, capsys
-):
-    cfg = FeedConfig(url="https://a", name="Pod")
-    item = FeedItem(
-        title="Ep One",
-        description="d",
-        enclosure_url="https://a/ep.mp3",
-        published=datetime(2026, 3, 4, tzinfo=timezone.utc),
-    )
-    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
-
-    run_feeds("feeds.json", dry_run=True)
-
-    out = capsys.readouterr().out
-    assert os.path.join("pod", "2026-03-04-ep-one.*") in out
-
-
-def test_a_run_with_archiving_off_says_nothing_about_it(monkeypatch, capsys):
-    cfg = FeedConfig(url="https://a", name="Pod")
-    item = FeedItem(title="Ep", description="d", enclosure_url="https://a/ep.mp3")
-    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
-
-    run_feeds("feeds.json", dry_run=True)
-
-    assert "archived to" not in capsys.readouterr().out
-
-
-def test_run_expires_old_archived_files(media, tmp_path, monkeypatch):
-    cfg = FeedConfig(url="https://a", name="Pod")
-    item = FeedItem(title="Ep", description="d", enclosure_url="https://a/ep.mp3")
-    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
-    _capture_sends(monkeypatch)
-    _real_downloads(monkeypatch, tmp_path)
-
-    stale = media / "old-show" / "2020-01-01-ancient.mp3"
-    stale.parent.mkdir(parents=True)
-    stale.write_bytes(b"ancient")
-    old = time.time() - 30 * 86400
-    os.utime(stale, (old, old))
-
-    run_feeds("feeds.json")
-
-    assert not stale.exists()
-    # The run's own episode is new, so it stays.
-    assert len(_archived(media)) == 1
-
-
-def test_run_points_tmpdir_at_the_staging_directory(media, monkeypatch):
-    cfg = FeedConfig(url="https://a", name="Blog")
-    _patch_feeds(monkeypatch, [cfg], {"https://a": []})
-    _capture_sends(monkeypatch)
-
-    run_feeds("feeds.json")
-
-    # Which is what lets `archive.keep` link instead of copy: downloads land on
-    # the same filesystem as the archive they are about to be linked into.
-    assert os.environ["TMPDIR"] == str(media / archive.STAGING_NAME)
 
 
 # --- sending in parts -------------------------------------------------------
@@ -2192,11 +1647,9 @@ def _patch_split(monkeypatch, pieces):
 
 
 def test_run_sends_a_video_in_parts(monkeypatch):
-    cfg = FeedConfig(url="https://a", name="Arte")
-    item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
-    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    cfg = FeedConfig(source="https://a", name="Arte")
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [_video()]})
     sends = _capture_sends(monkeypatch)
-    _patch_video(monkeypatch)
     split = _patch_split(monkeypatch, ["/tmp/p1.mp4", "/tmp/p2.mp4"])
 
     assert run_feeds("feeds.json") == 1
@@ -2210,7 +1663,7 @@ def test_run_sends_a_video_in_parts(monkeypatch):
 
 
 def test_run_sends_a_long_episode_as_several_voice_notes(monkeypatch):
-    cfg = FeedConfig(url="https://a", name="Pod")
+    cfg = FeedConfig(source="https://a", name="Pod")
     _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
     sends = _capture_sends(monkeypatch)
     _fake_downloads(monkeypatch)
@@ -2229,7 +1682,7 @@ def test_run_sends_a_long_episode_as_several_voice_notes(monkeypatch):
 
 
 def test_run_sends_parts_without_a_card_as_text_first(monkeypatch):
-    cfg = FeedConfig(url="https://a", name="Pod", link_preview=False)
+    cfg = FeedConfig(source="https://a", name="Pod", link_preview=False)
     _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
     sends = _capture_sends(monkeypatch)
     _fake_downloads(monkeypatch)
@@ -2246,10 +1699,9 @@ def test_run_sends_parts_without_a_card_as_text_first(monkeypatch):
 
 
 def test_run_resends_only_the_parts_that_did_not_go_out(monkeypatch, capsys):
-    cfg = FeedConfig(url="https://a", name="Arte")
-    item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
+    cfg = FeedConfig(source="https://a", name="Arte")
+    item = _video()
     calls = _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
-    _patch_video(monkeypatch)
     _patch_split(monkeypatch, ["/tmp/p1.mp4", "/tmp/p2.mp4", "/tmp/p3.mp4"])
     failing = [True]
     sends = []
@@ -2281,10 +1733,9 @@ def test_run_resends_only_the_parts_that_did_not_go_out(monkeypatch, capsys):
 def test_run_forgets_the_parts_once_all_are_out(monkeypatch):
     # Replayed with --since, the item goes out whole again rather than as
     # whatever a stale note says is missing.
-    cfg = FeedConfig(url="https://a", name="Arte")
-    item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
+    cfg = FeedConfig(source="https://a", name="Arte")
+    item = _video()
     _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
-    _patch_video(monkeypatch)
     _patch_split(monkeypatch, ["/tmp/p1.mp4", "/tmp/p2.mp4"])
     sends = _capture_sends(monkeypatch)
 
@@ -2296,35 +1747,8 @@ def test_run_forgets_the_parts_once_all_are_out(monkeypatch):
     assert [s["attachments"] for s in sends] == [["/tmp/p1.mp4"], ["/tmp/p2.mp4"]]
 
 
-def test_run_archives_the_whole_file_not_its_parts(media, tmp_path, monkeypatch):
-    cfg = FeedConfig(url="https://a", name="Pod")
-    item = FeedItem(
-        title="Ep One",
-        description="notes",
-        enclosure_url="https://a/ep.mp3",
-        published=datetime(2026, 3, 4, tzinfo=timezone.utc),
-    )
-    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
-    sends = _capture_sends(monkeypatch)
-    _real_downloads(monkeypatch, tmp_path)
-    pieces = tmp_path / "pieces"
-    pieces.mkdir()
-    for k in (1, 2):
-        (pieces / f"ep.part{k}.mp3").write_bytes(b"half")
-    _patch_split(monkeypatch, [str(pieces / "ep.part1.mp3"), str(pieces / "ep.part2.mp3")])
-
-    assert run_feeds("feeds.json") == 1
-
-    # Sent as its two parts…
-    assert [len(s["attachments"]) for s in sends] == [1, 1]
-    # …and kept as the one file it was.
-    assert _archived(media) == [os.path.join("pod", "2026-03-04-ep-one.mp3")]
-    with open(media / "pod" / "2026-03-04-ep-one.mp3", "rb") as fh:
-        assert fh.read() == b"the-bytes-of-https://a/ep.mp3"
-
-
 def test_run_steps_over_an_episode_too_big_even_in_parts(monkeypatch, capsys):
-    cfg = FeedConfig(url="https://a", name="Pod")
+    cfg = FeedConfig(source="https://a", name="Pod")
     calls = _patch_feeds(monkeypatch, [cfg], {"https://a": [_EPISODE]})
     sends = _capture_sends(monkeypatch)
     _fake_downloads(monkeypatch)
@@ -2342,17 +1766,13 @@ def test_run_steps_over_an_episode_too_big_even_in_parts(monkeypatch, capsys):
     assert calls["updated"][-1]["description"] != LONG_AGO
 
 
-def test_run_dry_run_reports_the_parts(monkeypatch, capsys):
-    cfg = FeedConfig(url="https://a", name="Arte")
-    item = FeedItem(title="Le drapeau", description="d", link=ARTE_LINK)
-    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
-
-    class InParts(_FakePlan):
-        def describe(self):
-            return "360p, ~105 MB, in 2 parts"
-
-    monkeypatch.setattr(run, "resolve_video", lambda item: InParts())
+def test_run_dry_run_reports_the_parts(monkeypatch, capsys, tmp_path):
+    video = tmp_path / "ep.mp4"
+    with open(video, "wb") as fh:
+        fh.truncate(105 * 1024 * 1024)  # sparse: the size is what is read
+    cfg = FeedConfig(source="https://a", name="Arte")
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [_video(media=str(video))]})
 
     run_feeds("feeds.json", dry_run=True)
 
-    assert "video: 360p, ~105 MB, in 2 parts" in capsys.readouterr().out
+    assert f"video: {video} (~105 MB, in 2 parts)" in capsys.readouterr().out

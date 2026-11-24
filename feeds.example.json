@@ -2,35 +2,26 @@
   "feeds": [
     {
       "name": "Some Blog",
-      "url": "https://example.com/rss",
-      "message_template": "📰 {title}\n\n{description}\n\n{link}",
-      "title_excludes": ["sponsored", "newsletter roundup"]
+      "message_template": "📰 {title}\n\n{description}\n\n{link}"
     },
     {
       "name": "Some Podcast",
-      "url": "https://example.com/podcast.rss",
       "extract": {
         "episode_id": { "from": "link", "pattern": "/file/[^/]+/(\\d+)/" }
       },
       "preview_url": "https://example.com/listen/{episode_id}",
-      "preview_title": "🎧 {title}",
-      "title_contains": ["interview", "special"]
+      "preview_title": "🎧 {title}"
     },
     {
-      "name": "Some YouTube Channel",
-      "url": "https://www.youtube.com/@example",
-      "duration_seconds_min": "7:00",
-      "duration_seconds_max": "30:00",
-      "published_weekday_contains": ["Tuesday", "Wednesday", "Thursday", "Friday"]
+      "name": "Daily Show",
+      "source": "The Daily Show"
     },
     {
-      "name": "Bureau Buitenland",
-      "url": "https://npo.nl/start/serie/bureau-buitenland/afleveringen"
+      "name": "Bureau Buitenland (NPO)"
     },
     {
-      "name": "Some Series From The Start",
-      "url": "https://www.youtube.com/@example",
-      "episodic": "2-weekly",
+      "name": "3Blue1Brown",
+      "episodic": "daily",
       "start": "2019-01-01"
     }
   ]

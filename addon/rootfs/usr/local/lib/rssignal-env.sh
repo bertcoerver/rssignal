@@ -53,19 +53,22 @@ export RSSIGNAL_LOG="/data/rssignal.log"
 RSSIGNAL_ACCOUNT="$(bashio::config 'account')"
 export RSSIGNAL_ACCOUNT
 
-# /media is the folder Home Assistant's Media browser shows. rssignal links
-# each episode it sends into here and expires them on the schedule below; with
-# RSSIGNAL_MEDIA_DIR unset it would delete every download as it always has.
-export RSSIGNAL_MEDIA_DIR="/media/rssignal"
-RSSIGNAL_MEDIA_KEEP_DAYS="$(bashio::config 'media_keep_days')"
-export RSSIGNAL_MEDIA_KEEP_DAYS
+# The library the fetchit add-on fills, under /media. Every feed's items come
+# from here; rssignal downloads nothing itself.
+RSSIGNAL_LIBRARY="$(bashio::config 'library')"
+export RSSIGNAL_LIBRARY
 
-# A run refreshes every feed group's picture on one run in N, at random (see
-# rssignal.artwork). N is only "about once a month" for a given number of runs
-# a day, and the schedule says how many that is — so it is worked out here
-# rather than left at the default, which assumes fifteen.
-runs_per_day="$(jq -r '.schedule[]? // empty' /data/options.json | grep -c . || true)"
-export RSSIGNAL_ARTWORK_REFRESH_ONE_IN="$(( ${runs_per_day:-0} * 30 ))"
+# `rssignal serve`: when to run, and who may use it. The GUI answers only
+# Home Assistant's ingress proxy (the Supervisor, 172.30.32.2), which has
+# checked who you are before a request gets here. Sending answers the
+# addresses in `api_allow` — Home Assistant itself is 172.30.32.1 — or anyone
+# with `api_token`. No port is published, so nothing outside Home Assistant's
+# own network can reach either.
+RSSIGNAL_SCHEDULE="$(jq -r '(.schedule // []) | join(",")' /data/options.json)"
+RSSIGNAL_API_FROM="$(jq -r '(.api_allow // []) | join(",")' /data/options.json)"
+RSSIGNAL_API_TOKEN="$(jq -r '.api_token // ""' /data/options.json)"
+export RSSIGNAL_SCHEDULE RSSIGNAL_API_FROM RSSIGNAL_API_TOKEN
+export RSSIGNAL_GUI_FROM="172.30.32.2"
 
 # feeds.json lives on the host at /addon_configs/<slug>/, so it can be edited
 # with the File Editor or over Samba without rebuilding anything.

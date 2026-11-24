@@ -40,7 +40,7 @@ ENV JAVA_HOME=/opt/java \
     # only appears once a run is over is no use while the run is going.
     PYTHONUNBUFFERED=1
 
-# ffmpeg is for ARTE (an HLS remux, stream-copy only) and for yt-dlp's muxing.
+# ffmpeg is for cutting a file too big for one Signal message into parts.
 # zip/unzip are for the libsignal splice. python3-venv because Debian's Python
 # is externally managed and rssignal has no business in the system site-packages.
 RUN apt-get update \
@@ -81,7 +81,7 @@ RUN chmod +x /usr/local/bin/install-signal-cli \
        LIBSIGNAL_VERSION="${LIBSIGNAL_VERSION}" \
        install-signal-cli
 
-# rssignal and yt-dlp in their own venv, from the source in this checkout — the
+# rssignal in its own venv, from the source in this checkout — the
 # commit the release workflow is building, and nothing fetched from elsewhere.
 # There is no .git in the context (see .dockerignore), so setuptools-scm cannot
 # read a version from the tags and is told it instead.
@@ -91,7 +91,7 @@ RUN set -eux; \
     python3 -m venv /opt/venv; \
     /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
     SETUPTOOLS_SCM_PRETEND_VERSION="${BUILD_VERSION}" \
-        /opt/venv/bin/pip install --no-cache-dir "/tmp/rssignal[video]"; \
+        /opt/venv/bin/pip install --no-cache-dir "/tmp/rssignal"; \
     rm -rf /tmp/rssignal; \
     ln -sf /opt/venv/bin/rssignal /usr/local/bin/rssignal; \
     rssignal --help > /dev/null
@@ -108,7 +108,7 @@ RUN chmod +x \
 
 LABEL \
     io.hass.name="rssignal" \
-    io.hass.description="Forward RSS feeds to Signal" \
+    io.hass.description="Send what fetchit downloads to Signal" \
     io.hass.type="addon" \
     io.hass.arch="${BUILD_ARCH}" \
     io.hass.version="${BUILD_VERSION}" \

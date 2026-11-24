@@ -1,19 +1,24 @@
 # rssignal
 
-An RSS feed reader for Signal.
+Send what is new in your feeds to Signal.
 
-rssignal parses RSS feeds and forwards items as Signal text messages. It sends
-by shelling out to the [`signal-cli`](https://github.com/AsamK/signal-cli)
-command-line tool, so messages come from your own linked Signal account.
+rssignal sends each new item of a feed to a Signal group named after the feed:
+a podcast episode as a voice note with a preview card, a video as an
+attachment, an article as text with its link. It sends by shelling out to the
+[`signal-cli`](https://github.com/AsamK/signal-cli) command-line tool, so
+messages come from your own linked Signal account.
 
-> **Status:** early. Signal setup, message sending, one auto-created group per
-> feed, feed parsing/sending, message templates, per-field filters, extracted
-> fields, link previews, and send-once-only work.
-> The cloud service (POST-triggered) comes next.
+It downloads nothing itself. [fetchit](https://github.com/bertcoerver/fetchit)
+reads the feeds — RSS and podcasts, ARTE, NPO Start, YouTube, Bayam — and files
+what is new in a library on disk; rssignal reads that library and sends from it.
+Which feeds are read, what is worth downloading and at what quality is fetchit's
+config. Which group a feed goes to, what a message looks like and at what pace a
+series is released is rssignal's.
 
 ## Requirements
 
-- Python 3.13+ (installs `feedparser` and `Pillow`)
+- Python 3.13+ (installs `Pillow`)
+- A library filled by [fetchit](https://github.com/bertcoerver/fetchit)
 - `signal-cli` on your PATH:
   ```bash
   brew install signal-cli        # macOS
@@ -22,15 +27,10 @@ command-line tool, so messages come from your own linked Signal account.
   ```bash
   brew install qrencode
   ```
-- Optional, only for feeds whose items link to a video (see
-  [video items](#video-items)), and for podcast episodes too big for one Signal
-  message (see [splitting](#quality-and-splitting-what-doesnt-fit)):
+- Optional, only for files too big for one Signal message (see
+  [splitting](#splitting-what-doesnt-fit)):
   ```bash
   brew install ffmpeg
-  ```
-- Optional, only for YouTube feeds:
-  ```bash
-  pip install rssignal[video]   # yt-dlp
   ```
 
 signal-cli stores its account state in `~/.local/share/signal-cli` by default.
@@ -60,6 +60,8 @@ this repository to the Add-on Store and install rssignal from there — see
    - `RSSIGNAL_RECIPIENT` — default recipient for `send`; use your own number for
      a note-to-self, or a `group:<id>` from `rssignal groups`. Optional, and not
      used by `run` — feeds send to the group named after them.
+   - `RSSIGNAL_LIBRARY` — the folder fetchit downloads into. Optional; defaults
+     to `~/fetchit`, which is fetchit's default too.
 
 2. Link this machine to your Signal account (acts like Signal Desktop):
    ```bash
@@ -141,9 +143,45 @@ send_msg("hello from rssignal")                       # uses configured recipien
 send_msg("hi there", recipient="+31611111111")        # explicit recipient
 ```
 
+## Running as a service: a GUI, and sending for other things
+
+```bash
+RSSIGNAL_SCHEDULE=01:30,06:30,15:00 rssignal serve      # http://127.0.0.1:8099/
+```
+
+`rssignal serve` stays running. It keeps one `signal-cli` open for its whole life
+(signal-cli allows one process per account, so a second one would wait behind a
+run or trip over its lock), runs the feeds at the times in `RSSIGNAL_SCHEDULE`,
+and serves on one port:
+
+- **A GUI** at `/`: whether the account is linked, every feed with its group, how
+  much of it is waiting and how far it has been sent, run / dry run / picture
+  refresh buttons with their output, a form to send a message, recent activity,
+  the log, and linking a Signal account by QR code.
+- **`POST /api/send`** with `{"to": "Laundry", "message": "..."}` — `to` a group's
+  name, a number, `group:<id>` or a list of them; `attachments` a list of base64
+  strings or `data:` URIs. Answers `201`, or a JSON `{"error": ...}`.
+- **`GET /v1/about`, `POST /v2/send`**: what Home Assistant's built-in
+  [Signal Messenger](https://www.home-assistant.io/integrations/signal_messenger/)
+  integration calls, so it can use rssignal as its `url` — see
+  [the add-on's docs](addon/DOCS.md#notifications-from-home-assistant).
+
+Only this machine may use either, unless told otherwise:
+
+| Variable | Default | |
+|---|---|---|
+| `RSSIGNAL_SCHEDULE` | (none) | Local times to run at, comma-separated. None: only when asked. |
+| `RSSIGNAL_GUI_FROM` | `127.0.0.1,::1` | Addresses or networks that may use the GUI. |
+| `RSSIGNAL_API_FROM` | `127.0.0.1,::1` | Addresses or networks that may send. |
+| `RSSIGNAL_API_TOKEN` | (none) | A bearer token that lets any address send. |
+
+`--host 0.0.0.0` listens beyond this machine; `--on-start run` runs once at
+start. While it is up, use its buttons rather than `rssignal run` in a shell,
+which would start a second signal-cli for the same account.
+
 ## Feeds
 
-Describe the feeds to follow in a JSON config (git-ignored):
+Describe the feeds to send in a JSON config (git-ignored):
 
 ```bash
 cp feeds.example.json feeds.json
@@ -153,263 +191,82 @@ Each feed entry supports:
 
 | Key                 | Required | Description                                                            |
 | ------------------- | -------- | ---------------------------------------------------------------------- |
-| `url`               | yes      | The RSS/Atom feed URL, or an ARTE collection page, an NPO Start series, or a YouTube channel. See [video items](#video-items). |
 | `name`              | yes      | The Signal group this feed sends to. Also `{feed_name}` in templates.  |
+| `source`            | no       | The feed in the library to send from — its `name` in fetchit.json. Defaults to `name`. |
 | `message_template`  | no       | Message text with `{field}` placeholders. Omit for the built-in layout. |
 | `extract`           | no       | Define new fields by regex against existing ones. See below.           |
 | `link_preview`      | no       | Send a link preview card. Defaults to on for items with audio, off for the rest. |
 | `preview_url`       | no       | Template for the card's link. Defaults to `{link}`.                    |
 | `preview_title`     | no       | Template for the card's title. Defaults to `{title}`.                  |
 | `preview_description` | no     | Template for the card's text. Omit for a card with no description.     |
-| `episodic`          | no       | Follow this feed from the beginning, at a set pace. See [episodic feeds](#episodic-feeds). |
+| `episodic`          | no       | Send this feed from the beginning, at a set pace. See [episodic feeds](#episodic-feeds). |
 | `start`             | no       | Where an episodic feed begins, e.g. `"2019-01-01"`. Episodic feeds only. |
 | `refresh_image`     | no       | `false` leaves this feed's group picture alone. See [keeping group pictures current](#keeping-group-pictures-current). |
-| `<field>_contains`  | no       | Keep items whose field contains any of these terms.                    |
-| `<field>_excludes`  | no       | Drop items whose field contains any of these terms.                    |
-| `<field>_matches`   | no       | Keep items whose field matches any of these regexes.                   |
+| `<field>_contains`  | no       | Send only items whose field contains any of these terms.               |
+| `<field>_excludes`  | no       | Don't send items whose field contains any of these terms.              |
+| `<field>_matches`   | no       | Send only items whose field matches any of these regexes.              |
+
+A feed with the same name in both configs needs nothing but its `name` here:
+
+```json
+{"feeds": [{"name": "Le Dessous des Images"}, {"name": "Bureau Buitenland"}]}
+```
 
 Unknown keys are rejected, so a typo like `title_contain` is an error rather than a
-silently ignored setting. There is no recency setting: see
+silently ignored setting. A `url` — or any other key about downloading, like
+`since` or `quality` — is rejected with a pointer to fetchit.json, which is where
+it belongs now. There is no recency setting either: see
 [what rssignal remembers](#what-rssignal-remembers).
 
-There is no setting for what kind of feed it is, either. rssignal decides that per
-*item*: one whose enclosure is audio goes out as a voice note with a preview card,
-one that links to a video it can fetch goes out with the video attached, anything
-else as text plus its link. This is checked per item rather than per feed on
-purpose — a podcast that occasionally posts a written note gets that note as a
-readable message with a working link, instead of a linkless stub. If you disagree
-about the card, `link_preview` overrides it either way.
+Filters here decide what is *sent*, on top of fetchit's, which decide what is
+downloaded. Most belong in fetchit — there is no point downloading what will never
+be sent — but a filter here is the way to keep everything for Jellyfin and send
+only some of it.
 
-### Video items
+### Audio, video and text
 
-Some feeds are about video but carry none: the item links to a player page and the
-video lives somewhere else entirely. rssignal recognises three kinds of link and
-attaches the video to the message — **ARTE** programmes
-(`https://www.arte.tv/<lang>/videos/<programme-id>/…`), **NPO Start** episodes
-(`https://npo.nl/start/afspelen/<episode>`) and **YouTube** videos
-(`watch?v=…`, `youtu.be/…`, `/shorts/…`). Nothing to configure; the link in the
-item is enough.
+What an item is, fetchit has decided already, per item: it files a podcast
+episode as audio, an ARTE programme, NPO episode or YouTube video as video, and
+anything else as text. rssignal sends each accordingly:
 
-All three can also be followed without finding a feed first.
+- **Audio** goes out as a voice note, after a [preview card](#link-previews)
+  showing the episode's title and its own picture.
+- **Video** goes out as the message's attachment: one message, with the title,
+  the description and the link as its text.
+- **Text** goes out as the title, the description and the link.
 
-#### ARTE
+A podcast that occasionally posts a written note gets that note as a readable
+message with a working link, instead of a linkless stub.
 
-ARTE publishes no RSS, so you don't need one either: point `url` straight at a
-show's collection page and rssignal reads its episodes directly.
+#### Splitting what doesn't fit
 
-```json
-{
-  "name": "Le Dessous des Images",
-  "url": "https://www.arte.tv/fr/videos/RC-023176/le-dessous-des-images/"
-}
-```
+This needs **ffmpeg** on your PATH (`brew install ffmpeg`).
 
-This is worth preferring over a third-party feed generator pointed at the same
-page. The generator scrapes what the page renders — the site's furniture instead of
-the synopsis — and stamps every item with the moment it scraped rather than when
-the episode aired, which is the one thing rssignal needs to tell new from old.
-Read directly, each episode arrives with its own title, its real synopsis, its
-artwork, and the date it became available.
-
-A collection lists the show's entire back catalogue, which has no dates attached;
-rssignal looks up the newest dozen individually and leaves the rest undated, so
-they are never sent. That is deliberate — a new group shouldn't open with a hundred
-videos — and it costs a handful of small requests per run rather than one per
-episode.
-
-#### NPO Start (via Downloadgemist)
-
-NPO publishes no RSS for its television either. Point `url` at a series:
-
-```json
-{
-  "name": "Bureau Buitenland",
-  "url": "https://npo.nl/start/serie/bureau-buitenland/afleveringen"
-}
-```
-
-The episodes come from the series page itself, which carries each one's title,
-synopsis, artwork, length and first broadcast — one request per run, to npo.nl.
-That url follows the **newest season**: when season 3 starts, the feed moves on
-with it. To stay on one season, name it:
-`…/bureau-buitenland/afleveringen/seizoen-2`.
-
-The video is fetched through [downloadgemist.nl](https://downloadgemist.nl), which
-knows how to get it out of NPO's player. It is a free, hobby-run site, so rssignal
-asks it for as little as it can:
-
-- **Only for a new episode.** Following the series never touches Downloadgemist;
-  sending an episode costs a handful of small requests and one download.
-- **The site's own pause.** Its page makes you wait as long as an episode lasts
-  before the next download, and so does rssignal — a second new episode waits for
-  a later run rather than going straight after the first.
-- **Backing off.** An episode that fails is left alone for an hour, then two, then
-  four, up to a day, without a single request in between. One that has failed for
-  three days is given up on, so it can't hold its feed's later episodes back.
-- **Dry runs only look.** `--dry-run` asks what qualities there are, which is how
-  it can tell you the size — never for the file itself.
-
-A 25-minute episode is about 120 MB at the lowest quality on offer, which is over
-Signal's limit — but 256 kbps of that is sound, so it has its
-[soundtrack slimmed](#quality-and-splitting-what-doesnt-fit) rather than being cut
-in two, and arrives as one message of about 91 MB. The dry run sizes the download
-from the bitrates Downloadgemist lists, before any of that, so it still counts two:
-
-```bash
-rssignal run --dry-run
-# [Bureau Buitenland] -> group:Bureau Buitenland=: 26.000 sancties tegen Rusland, …
-#     video: 360p, ~105 MB, in 2 parts
-```
-
-#### YouTube
-
-Point `url` at a channel — any of the forms YouTube hands out:
-
-```json
-{
-  "name": "Veritasium",
-  "url": "https://www.youtube.com/@veritasium"
-}
-```
-
-No API key is involved. YouTube publishes an Atom feed for every channel, at an
-address nobody would guess, and rssignal swaps the channel page for it — so a
-YouTube feed is a perfectly ordinary feed and filters, templates and extracts all
-work on it. A `/channel/UC…` url is rewritten on the spot; the `@handle`, `/c/` and
-`/user/` forms cost one small yt-dlp call to find the channel's id.
-
-That feed carries the **last 15 uploads**, which is plenty to follow a channel and
-no use for backfilling one.
-
-The feed endpoint also has outages of its own, answering every channel with an
-HTML error page for hours while the rest of YouTube works fine. When that
-happens rssignal lists the same 15 uploads from the channel's uploads playlist
-through yt-dlp instead, and dates each one. The dates match the feed's to the
-second, so switching over and back neither resends nor skips anything. The first
-such run costs a yt-dlp launch per video (about half a minute a channel); dates
-are kept, so later runs pay only for new uploads. Items read this way have no
-`description`.
-
-The one thing it doesn't say is how long a video is, which is exactly what a
-channel mixing clips with full episodes has to be filtered on — so rssignal asks
-yt-dlp for the channel's listing and puts a `duration_seconds` field on each item.
-That's one small request per feed, not one per video, and it makes a length filter
-ordinary:
-
-```json
-{
-  "name": "The Daily Show",
-  "url": "https://www.youtube.com/@TheDailyShow",
-  "duration_seconds_min": "7:00",
-  "duration_seconds_max": "30:00",
-  "published_weekday_contains": ["Tuesday", "Wednesday", "Thursday", "Friday"]
-}
-```
-
-An upload the listing doesn't cover — a Short, which lives on its own tab — gets no
-duration, and a length filter therefore drops it. Without yt-dlp, no item gets one:
-that's a warning on stderr, and a length filter then keeps nothing.
-
-Downloads need **yt-dlp** (`pip install rssignal[video]`), which in turn uses
-ffmpeg. Uploads shorter than 90 seconds are treated as Shorts and dropped
-entirely — no message, and they aren't reconsidered on the next run.
-
-#### When YouTube asks you to confirm you're not a bot
-
-```
-[The Daily Show] skipped: yt-dlp failed: ERROR: [youtube] 14j9b34VCJI:
-Sign in to confirm you're not a bot.
-```
-
-YouTube blocks requests it can't attribute to a signed-in session, and gets
-stricter about it the more a machine asks — so this tends to show up on a server,
-on a VPN, or after a few runs in a row. The only thing it accepts is real cookies
-from an account. Two ways to hand them over, both off by default:
-
-```bash
-# Read them out of a browser you are logged into, by name:
-RSSIGNAL_YOUTUBE_COOKIES_FROM_BROWSER=firefox
-
-# …or point at a cookies.txt export:
-RSSIGNAL_YOUTUBE_COOKIES=~/.config/rssignal/youtube-cookies.txt
-```
-
-Either goes in your environment or `.env`, and applies to every yt-dlp call —
-the downloads and the listing that fills in durations, which YouTube challenges
-the same way. If both are set the file wins.
-
-A profile can be named where there are several: `firefox:default-release`. Firefox
-is the path of least resistance on macOS; Chrome and Safari encrypt their cookie
-stores and will prompt for keychain access, which is no use from a cron job. On a
-headless server there is no browser to read at all — export a cookies.txt from
-your desktop (a Netscape-format cookie extension does this) and copy it over.
-
-Use a throwaway Google account rather than your own: the cookies are a live
-session, so the file is a credential — keep it out of the repo, and expect to
-refresh it every few months when the session expires.
-
-#### Quality, and splitting what doesn't fit
-
-This needs **ffmpeg** on your PATH (`brew install ffmpeg`). Only video feeds, and
-podcasts with very long episodes, do — so it stays optional, and `rssignal doctor`
-reports whether it and yt-dlp are there without failing.
-
-Every source offers the same video at several qualities, and Signal refuses an
-attachment over 100 MB. rssignal's rule, for every source:
-
-> **The fewest messages possible, then the best quality that fits in that many.**
-
-So a video that fits one message arrives as one, at the sharpest quality that
-fits — a ten-minute ARTE episode typically at 640x360, a ten-minute YouTube video
-at 720p. One whose smallest quality is, say, 105 MB goes out in two parts, and
-within those two parts' 190 MB it goes up to the sharpest quality that still fits —
-not three parts at 1080p. Sizes come from the reported file sizes where there are
-any and from bitrate times duration where there aren't; how many parts a file
-really becomes is decided once it has downloaded, from its actual size, so an
-estimate that ran low costs a part rather than the episode.
-
-The picture is never re-encoded. Streams are copied, and splitting is a copy too,
-cut at equal lengths on the nearest keyframe — seconds of work, not the half hour
-a Raspberry Pi would spend re-encoding. Each part after the first is captioned
-with where it falls, `Title (2/3)`.
+Signal refuses an attachment over 100 MB, so a file bigger than 95 MB goes out
+in as few parts as will each fit, one message per part. Each part after the
+first is captioned with where it falls, `Title (2/3)`. The picture is never
+re-encoded: splitting is a stream copy, cut at equal lengths on the nearest
+keyframe — seconds of work, not the half hour a Raspberry Pi would spend
+re-encoding.
 
 The sound is the one thing that is re-encoded, and only when that alone saves a
-message. Sound is quick to encode where picture is not, and in a lean video it is
-a good share of the file — so a video that landed a little over the limit has its
-soundtrack brought down to 96 kbps AAC, or to 64 if it takes that, and arrives
-whole. One that would need as many messages either way is left exactly as it
-came, and so is every podcast: an episode is its sound.
+message: a video that landed a little over the limit has its soundtrack brought
+down to 96 kbps AAC, or to 64 if it takes that, and arrives whole. The file in
+the library is never touched; the parts are cut into a temporary folder.
 
-Check what an item would arrive at before sending anything:
+Something too big even for four parts (about 380 MB) is stepped over for good,
+watermark and all, so it doesn't block the items behind it.
+
+How many parts a video becomes depends on the quality fetchit downloaded it at.
+For a feed sent to Signal, give it `"quality": {"part_size_mb": 95}` in
+fetchit.json: the fewest 95 MB parts possible, then the best quality that fits
+in that many. Check what a run would send:
 
 ```bash
 rssignal run --dry-run
 # [Le Dessous des Images] -> group:Le Dessous des Images=: La bataille du drapeau
-#     video: 640x360, ~63 MB
+#     video: /media/fetchit/shows/…/Le Dessous des Images - S2026E072301 - La bataille du drapeau.mp4 (~63 MB)
 ```
-
-Podcasts follow the same rule with nothing to choose: an episode over 95 MB is
-cut into as many voice notes as it needs, after the preview card.
-
-If the video can't be had — expired rights, ffmpeg or yt-dlp missing, YouTube
-asking for a login — nothing goes out at all. A video item is its video, so the run
-reports the failure and leaves the item where it is: the watermark rolls back, the
-pace clock with it, and the next run tries the same item again. A feed whose source
-stays broken therefore stays put rather than quietly filling the group with links.
-A failure *between* parts is the same, except that the next run sends only the
-parts that didn't arrive.
-
-The exception is something too big even for four parts (about 380 MB), which is
-the one failure that won't read differently tomorrow. That one is stepped over like
-a Short — nothing sent, watermark and all — so it doesn't block the items behind
-it. So is an ARTE programme that has been listed for a week with no video behind
-it: ARTE sometimes opens a rights window for a rerun and never supplies the video,
-and waiting on it would hold up every episode after it until the window closed.
-
-Unlike a voice note, a video that fits one message goes out as a single message:
-these items get no preview card by default, so there's nothing for the attachment
-to displace. The [media archive](addon/DOCS.md#the-media-archive), when it is on,
-keeps the whole file rather than its parts.
 
 ### Episodic feeds
 
@@ -420,7 +277,6 @@ take it in is the order it was made.
 ```json
 {
   "name": "Last Week Tonight",
-  "url": "https://www.youtube.com/@LastWeekTonight",
   "episodic": "2-weekly",
   "start": "2019-01-01"
 }
@@ -463,43 +319,30 @@ Worth knowing:
   so tomorrow's run at the same time is seconds short of a day. Held strictly, a
   `"daily"` feed whose source is only reachable at one run a day would send every
   other day.
-- **A paced feed with nothing due isn't even fetched**, which is most runs.
+- **A paced feed with nothing due isn't even read**, which is most runs.
 - **`--dry-run` always tells you where a series stands** — how many episodes are
   waiting and when the next one is due — rather than going quiet.
 - **`--since` overrides the pace**, being an explicit replay. **`--to` touches no
   group**, so it has no clock to read: it sends the next episode and changes
   nothing.
 
-#### The YouTube back catalogue
+#### Where the back catalogue comes from
 
-A YouTube channel's Atom feed carries only its newest 15 uploads, which is no use
-to a series that starts at the beginning. For an episodic feed rssignal reads the
-channel's **uploads playlist** instead, through yt-dlp and with no API key: one
-request returns the whole channel in order, a thousand videos in a few seconds,
-and it is kept for a week.
+An episodic feed can only release what is in the library, and a feed newly
+followed by fetchit starts at its newest item. So the back catalogue is fetchit's
+to download: give the feed a `since` in fetchit.json, no later than this feed's
+`start`, and a `max_per_day` in step with the cadence here:
 
-That listing has titles and durations but **no dates**, so each video's
-publication time is looked up individually — expensive, and therefore rationed:
-25 a run, remembered permanently. A long channel is fully dated within a day of
-ordinary runs, and after that a series costs about two lookups a week.
+```json
+{"name": "3Blue1Brown", "url": "https://www.youtube.com/@3blue1brown",
+ "since": "2019-01-01", "max_per_day": 1}
+```
 
-Until it *is* fully dated, the feed is offered only the part of the archive that
-is, and none of the newest 15. That is not caution for its own sake: undated items
-are never sent, so letting a video from last week past would move the watermark
-years ahead and quietly skip everything in between.
-
-Two things to expect from archive items specifically:
-
-- **`description_contains` / `description_excludes` don't apply to them.** A
-  playlist listing carries no description. Title and duration filters work
-  normally, and the newest 15 have descriptions as always.
-- **Videos rssignal can't have are skipped** — age-gated, private, members-only,
-  removed. It couldn't have downloaded them either. (An age-gated video would
-  otherwise be a wall the series never got past.)
-
-ARTE collection feeds can be marked `episodic` too, but ARTE only dates the newest
-12 programmes in a collection and undated items are never sent — so such a feed is
-capped at those 12 rather than reaching back through the archive.
+`max_per_day` keeps fetchit a step ahead of the series rather than racing
+through the whole archive and having episodes pruned by `keep_days` before they
+are sent. For a YouTube channel, fetchit reads the uploads playlist for this,
+with no API key; it dates the videos 25 a run, so a long channel takes a day or so
+before its oldest episodes are in the library.
 
 ### One group per feed
 
@@ -521,9 +364,9 @@ description. Both are channel-level — an episode's own image and notes stay on
 message, where they belong. Invite people from Signal on your phone; rssignal never
 adds anyone.
 
-YouTube's feed is the one that carries no artwork, so for a YouTube feed rssignal
-asks yt-dlp for the channel's avatar instead — one extra call, once, when the
-group is created.
+The artwork is the feed's in the library — a series' `poster.jpg`, a podcast's
+`cover.jpg` — which fetchit fetched from the source; for YouTube, the channel's
+avatar.
 
 It also starts with **disappearing messages set to one week**
 (`GROUP_EXPIRATION_SECONDS`). A feed group is a stream, not an archive: left
@@ -563,52 +406,27 @@ setting either fails you get a warning on stderr and still keep the group.
 
 #### Keeping group pictures current
 
-Podcasts rebrand and channels change their avatar, so every so often a run also
-fetches each feed's artwork again and puts it on the feed's group. It does this
-by chance: one run in 450, which at fifteen runs a day is **about once a month**.
-A dice roll needs no state kept anywhere, and a run that misses its turn simply
-leaves it to one of the next few hundred. It happens after the run has sent
-everything, so it never holds an episode up, and never on a `--dry-run` or with
-`--to`.
+Podcasts rebrand and channels change their avatar. fetchit keeps the library's
+artwork in step with the source, and after every run rssignal puts the library's
+artwork on the feed's group — but only where it actually changed.
 
 Changing a group's picture is not silent: everyone in the group sees "changed the
 group picture". So rssignal remembers what it last put on each group (by content,
-in the cache) and uploads only when the artwork is actually different. That means
-a picture you set by hand survives until the source's artwork changes. The very
-first refresh has nothing remembered yet, so it sets every group's picture once;
-that is also what gives a YouTube group created before rssignal knew how to fetch
-channel avatars its picture.
+in the cache) and uploads only when the artwork is different. The very first run
+has nothing remembered yet, so it sets every group's picture once.
 
-Only groups that already exist are touched. A feed whose source has no artwork
-leaves its group's picture alone. A feed whose source is down, or whose image
-won't download, is reported and skipped, and it doesn't stop the others.
+Only groups that already exist are touched. A feed with no artwork in the library
+leaves its group's picture alone. Set `"refresh_image": false` to leave a group's
+picture alone whatever the library holds — or, better, set it on the feed in
+fetchit.json, for a source like ARTE's *Le Dessous des Cartes* whose "artwork" is a
+still from the current episode.
 
-Some sources have no fixed artwork to keep in step with. ARTE's picture for *Le
-Dessous des Cartes* is a still from the current episode, so it is a different
-image every week and every refresh changes the group's picture. Set
-`"refresh_image": false` on a feed like that: its group keeps the picture it
-has — the one it was created with, or one you set by hand — and the refresh
-skips it.
-
-To change how often it runs, set how many runs there are between refreshes on
-average, or `0` to turn it off:
+To do it right now, or see what it would change:
 
 ```bash
-RSSIGNAL_ARTWORK_REFRESH_ONE_IN=90     # at 3 runs a day, about once a month
-```
-
-The Home Assistant add-on sets this from its `schedule`: 30 times the number of
-run times, so once a month whatever the schedule is.
-
-To refresh right now:
-
-```bash
-rssignal refresh-images --dry-run   # which groups would change
+rssignal refresh-images --dry-run
 rssignal refresh-images
-rssignal run --refresh-images       # or as part of a run, after sending
 ```
-
-The add-on does the last one whenever it starts with `on_start: run`.
 
 > **Note:** deleting a group *chat* in the Signal app does not leave the group —
 > it only removes the conversation from your list. rssignal still sees it and will
@@ -656,14 +474,15 @@ where the link is left out because the enclosure itself is attached.
 
 ### Discovering fields
 
-Which fields exist depends on the feed — most publish more than the standard few.
-The `fields` command samples a real item and lists what you can use:
+Which fields exist depends on the feed — most publish more than the standard few,
+and fetchit keeps every one of them in the item's record. The `fields` command
+samples a real item from the library and lists what you can use:
 
 ```bash
 rssignal fields                                  # first feed in feeds.json
-rssignal fields --feed "Some Podcast"            # by name or URL
-rssignal fields --url https://example.com/rss    # not yet in the config
-rssignal fields --item 3                         # sample the 3rd item
+rssignal fields --feed "Some Podcast"            # by name or source
+rssignal fields --source "Some Podcast"          # a feed in the library, not yet in the config
+rssignal fields --item 3                         # sample the 3rd newest item
 ```
 
 ```
@@ -714,7 +533,7 @@ groups. From there it behaves like any other field: usable in `message_template`
 `preview_*` templates, as a filter target, and listed by `rssignal fields`. Remember JSON
 needs backslashes doubled (`\\d`, not `\d`).
 
-Rules read the item as it came off the feed, so they can't chain into one another, and an
+Rules read the item as it is in the library, so they can't chain into one another, and an
 extracted name can never shadow a built-in field like `title`. A pattern that doesn't
 match yields an empty field rather than an error — check yours with `rssignal fields`
 before relying on it.
@@ -785,8 +604,7 @@ rssignal run --config other.json
 would have to be created — worth reading before the first real run. It refreshes
 the group list like a real run does, so its answer is the one a real run gets.
 
-An item whose enclosure is audio has it downloaded and sent with
-`signal-cli --voice-note`. Depending on the file's codec, Signal may show it as
+An audio item's file is sent from the library with `signal-cli --voice-note`. Depending on the file's codec, Signal may show it as
 a regular audio attachment rather than an in-app voice note.
 
 ### Link previews
@@ -830,11 +648,10 @@ the description plus the URL. The card carries no description unless you ask for
 one with `preview_description`. A `message_template` is never touched — if you
 wrote the layout, you decide what is in it.
 
-The card's artwork comes from `image_url`: the episode's own `<itunes:image>` or
-`<media:thumbnail>`. The show's channel artwork is deliberately *not* a fallback —
-the same logo on every episode tells you nothing — so an episode without its own
-image gets a card without one. Artwork is downloaded per item; if that download
-fails the episode is still sent, just without the image.
+The card's artwork is the episode's own picture, which fetchit keeps beside it in
+the library (from the feed's `<itunes:image>` or `<media:thumbnail>`). The show's
+channel artwork is deliberately *not* a fallback — the same logo on every episode
+tells you nothing — so an episode without its own image gets a card without one.
 
 Artwork is sent at its original size. Unlike a group avatar, a preview image has
 no size limit worth working around — and Signal lays out a large one as a
@@ -878,104 +695,28 @@ Use a `message_template` if you would rather choose what gets sent than have the
 end of it trimmed — `{description}` is the field that tends to be long.
 `--dry-run` prints the body as it would actually be sent, already shortened.
 
-## Keeping what was sent
+## The library
 
-By default rssignal keeps nothing it downloads. An episode exists on disk for as
-long as it takes to upload it and is deleted in a `finally` — the Signal message
-is the only copy, which is the right default for a bridge between a feed and a
-chat app.
+rssignal reads the library and never writes to it. A feed's items are the
+`.json` records in its folders under `shows/`, `podcasts/` and `articles/`,
+matched by the `name` in each folder's `feed.json`; an item's file and picture are
+named in its record. fetchit moves a record into place only once everything it
+describes is there, so rssignal never sends half an item, however the two runs
+overlap. See [fetchit's README](https://github.com/bertcoerver/fetchit#the-library)
+for the layout.
 
-Set `RSSIGNAL_MEDIA_DIR` and it keeps a copy as well:
+How long things stay in the library is fetchit's `keep_days`. An item pruned before
+it was sent is not sent: give a slow feed — an episodic one above all — a
+`keep_days` long enough, or a `max_per_day` in step with its cadence.
 
-```bash
-export RSSIGNAL_MEDIA_DIR=/media/rssignal
-export RSSIGNAL_MEDIA_KEEP_DAYS=14        # 0 keeps everything
-```
-
-Each episode that goes out is filed under the feed it came from:
-
-```
-/media/rssignal/le-dessous-des-images/2026-07-23-la-bataille-du-drapeau.mp4
-/media/rssignal/3blue1brown/2026-07-21-but-what-is-a-fourier-series.mp4
-```
-
-and deleted again after `RSSIGNAL_MEDIA_KEEP_DAYS`. That is counted from when
-the file was *archived*, not when the item was published — an [episodic
-feed](#episodic-feeds) releases a back catalogue years after it went up, and a
-fortnight that had expired before the episode arrived would be a strange kind of
-archive.
-
-**It costs no extra writes.** The file is hard-linked rather than copied, so the
-bytes already on disk simply gain a second name and the temporary one goes away
-as it always did. A hard link only works within one filesystem, which is why a
-run points `TMPDIR` at `<media dir>/.staging` — downloads land next to the
-archive they are about to be linked into. The leading dot keeps half-finished
-downloads out of a media browser; anything left there by a run that was killed
-partway is cleared by the next run's expiry pass.
-
-Only the media itself is kept — the preview card's image is furniture, not
-content. Nothing is archived until after the item has actually been sent, so the
-folder is a record of what arrived rather than of what was attempted.
-
-**A video is filed with its description.** A slug is enough for a file listing
-and not much to look at on a television, so each archived video gets two small
-files beside it, under its own name:
+A feed with nothing in the library yet is skipped with one line, not a failure:
 
 ```
-/media/rssignal/le-dessous-des-images/2026-07-23-la-bataille-du-drapeau.mp4
-/media/rssignal/le-dessous-des-images/2026-07-23-la-bataille-du-drapeau.xml
-/media/rssignal/le-dessous-des-images/2026-07-23-la-bataille-du-drapeau.jpg
+[Bureau Buitenland] skipped: the library at /media/fetchit has nothing for 'Bureau Buitenland' yet. …
 ```
 
-The `.xml` holds the title, synopsis, date and genres as the source gave them,
-in the format [Infuse](https://support.firecore.com/hc/en-us/articles/4405042929559-Overriding-Artwork-and-Metadata)
-reads for a video it can't look up; the `.jpg` is the episode's own picture.
-Share the folder over SMB, add it to Infuse, and the feed's folder shows each
-episode with its still and its real title instead of a file name. They expire
-together with the video. Audio gets neither: nothing that plays a podcast from
-a folder reads them.
-
-**An episode of a series is filed as one.** A source that says which episode of
-which season an item is — NPO does — gets the layout a media server builds a
-series from, instead of the dated one:
-
-```
-/media/rssignal/bureau-buitenland/tvshow.nfo
-/media/rssignal/bureau-buitenland/poster.jpg
-/media/rssignal/bureau-buitenland/fanart.jpg
-/media/rssignal/bureau-buitenland/Season 02/bureau-buitenland-s02e28.mp4
-/media/rssignal/bureau-buitenland/Season 02/bureau-buitenland-s02e28.nfo
-/media/rssignal/bureau-buitenland/Season 02/bureau-buitenland-s02e28.xml
-/media/rssignal/bureau-buitenland/Season 02/bureau-buitenland-s02e28.jpg
-```
-
-The two `.nfo` files are the Kodi kind, which [Jellyfin](https://jellyfin.org)
-and [Emby](https://emby.media) read: the episode's says its season, number,
-title, synopsis, air date, length, genres and broadcaster, and `tvshow.nfo` names
-and describes the series. Both are marked locked, so the server takes them as
-they are rather than searching online for a series of that name — a daily
-broadcast is in no database, and the nearest match is someone else's programme.
-Point a server's TV library at the folder and the feed appears as a series with
-seasons; Infuse, connected to that server instead of to the share, shows the
-same.
-
-This is the only way to get seasons into Infuse for such a show. On its own it
-builds a series only out of what it finds on TMDB, and its `.xml` has no word
-for a season or an episode — so the number lives in the `.nfo`, and the `.xml`
-is still written for browsing the share directly.
-
-`poster.jpg` and `fanart.jpg` are both the series' own artwork, fetched once.
-That picture is as wide as a television and a poster is meant to be tall, so
-replace `poster.jpg` with a better one if you have it: a picture that is already
-there is never overwritten. An episode sent a second time replaces its file
-rather than gaining a `-2`, which a server would read as another episode.
-
-Unset, none of this happens and nothing changes. The directory is as disposable
-as the cache: rssignal still keeps no local state that decides what gets sent.
-That lives in the group description, which is the next section.
-
-This was built for [the Home Assistant add-on](addon/DOCS.md), where the
-directory is the folder Home Assistant's Media browser shows.
+That is a feed fetchit hasn't reached yet — or one whose `source` doesn't match
+any feed in fetchit.json, so it says so every run, in the log too.
 
 ## What rssignal remembers
 
@@ -1055,14 +796,7 @@ Worth knowing:
   the failures are on stderr, ending with a `N of M feed(s) failed` line.
   Only something that leaves no feeds to run at all — an unreadable
   `feeds.json` — exits non-zero.
-- **A network blip is retried, not lost.** A read that fails for a reason the
-  network caused — a name that won't resolve, a refused connection, a reset
-  mid-download — is tried again up to three times, two and four seconds apart.
-  A laptop that has just woken up is the usual cause, and it is usually gone by
-  the second attempt. A feed whose XML simply doesn't parse is not retried:
-  it won't parse any better in two seconds.
-
-  Sending is retried on the same terms. Signal resetting the connection partway
+- **A network blip is retried, not lost.** Signal resetting the connection partway
   through an upload (`Connection reset (PushNetworkException)`) is common enough
   on a long podcast episode, and it costs the feed its whole run: the marker
   doesn't move, so the next run downloads and uploads the same episode again to
@@ -1098,65 +832,8 @@ Worth knowing:
   the daemon is retired for the rest of the run rather than rediscovered, feed by
   feed, by everything after it. It is not restarted: one that died once mid-run
   has not earned the rest of it, and the slow path is known to work.
-- **A source blocked on purpose is a skip, not a failure.** See below.
-
-## Blocked sources
-
-If a network-level filter closes a source off from this machine — a NextDNS
-profile that only opens YouTube at night, a firewall rule, a scheduled
-block — reading its feed is not a failure and rssignal doesn't treat it as
-one.
-
-Before a YouTube feed is read, its host is probed with a single HEAD request
-(the cheap equivalent of `curl -sI https://www.youtube.com/`, five-second
-timeout, no retry). If nothing answers, the feed is skipped with one line:
-
-```
-[Last Week Tonight] skipped: https://www.youtube.com/ is not reachable from here
-— a DNS or firewall block, not a broken feed. Skipping until it lifts.
-1 of 12 feed(s) skipped: source blocked from this machine.
-```
-
-Nothing is written to the error log, the skip is counted separately from the
-failures, and the feed's marker stays where it was — so the next run inside the
-open window sends everything that appeared while it was closed, having lost
-nothing.
-
-The probe exists because YouTube is read through yt-dlp, several requests deep,
-each willing to wait a minute: without it a blocked run spends minutes per feed
-arriving at what one request answers immediately. An HTTP error status counts as
-reachable — a 403 or a 404 is the host answering, which is all that's being
-asked. Sources read over plain HTTP (ARTE, ordinary RSS) announce an unreachable
-host quickly enough on their own and are not probed.
-
-Not every filter refuses the connection, though. Some answer it, with a block
-page — and a block page passes the probe, because something *did* reply. What
-arrives where the feed should be is then a page of HTML, which fails to parse in
-a way that describes its first stray angle bracket and explains nothing:
-
-```
-FeedError: Could not read feed 'https://www.youtube.com/feeds/videos.xml?...':
-<unknown>:3:11: not well-formed (invalid token)
-```
-
-So a response that announces itself as `text/html` is read as a blocked source
-rather than a broken feed, and gets the same one-line skip:
-
-```
-[Last Week Tonight] skipped: https://www.youtube.com/feeds/videos.xml?… answered
-with HTTP 403 text/html rather than a feed — a block page, a captive portal or a sign-in
-wall standing in front of the source, not a broken feed. Skipping until it lifts.
-```
-
-The HTTP status is in the message because it tells the two apart: a filter's
-block page tends to come back as a 200 or a 403, and a 404 or a 500 is the
-source's own error page. A YouTube channel feed doesn't get this skip unless the
-[yt-dlp listing](#youtube) that stands in for its feed fails too.
-
-Only HTML is treated this way. A feed served as `text/plain`, or with a content
-type nobody ever configured, gets the benefit of the doubt and the traceback —
-the question being asked is not "is this a valid feed media type" but "is this
-so clearly a web page that the parse error underneath it is beside the point".
+- **A feed with nothing in the library is a skip, not a failure.** See
+  [the library](#the-library).
 
 ## The error log
 
@@ -1240,8 +917,9 @@ regardless.
 
 The real answer to all of the above is not to schedule a background job on a
 laptop. [`addon/`](addon/DOCS.md) is a Home Assistant add-on that runs rssignal
-on a Raspberry Pi: a JRE, ffmpeg, yt-dlp and a signal-cli with a working native
-library, on a timer, on a machine that is always on.
+on a Raspberry Pi: a JRE, ffmpeg and a signal-cli with a working native
+library, on a timer, on a machine that is always on — next to the fetchit add-on,
+which fills the library it sends from.
 
 Moving is nearly free, because rssignal keeps its place in each feed
 [in the group description](#what-rssignal-remembers) rather than on disk. Link
@@ -1258,74 +936,36 @@ mistaken for a kill.
 
 ### Why has that feed gone quiet?
 
-A feed skipped because its source is [blocked](#blocked-sources) is not a failure
-and writes no traceback, but it does get a line of its own, naming the feed:
-
-```
-2026-08-06 20:14:11 +0200  [Last Week Tonight] skipped: https://www.youtube.com/ is not reachable from here — a DNS or firewall block, not a broken feed. Skipping until it lifts.
-```
-
-Which is the difference between "my YouTube feeds are broken" and "my YouTube
-feeds only arrive after 21:00, because that is when the DNS profile opens" — a
-question asked days later, long after the stderr those runs printed to went
-nowhere. Nothing was missed: the feed's watermark hasn't moved, and the items
-arrive on the first run after the block lifts.
+A feed skipped because the library has nothing for it is not a failure and writes
+no traceback, but it does get a line of its own, naming the feed. If that line
+keeps coming, check that fetchit has the feed (its own log says whether it was
+blocked or failed), and that the names match.
 
 ## How fast a run is
 
-A run does as little as it can get away with, in as few waits as it can.
-
-**Feeds are fetched all at once.** Feeds don't depend on each other, and fetching
-one is nearly all waiting on somebody else's server, so a run waits once instead
-of once per feed. Sending stays strictly sequential — that is where the ordering
-promises live (the watermark goes up, then the item goes out, in that order,
-per item). `RSSIGNAL_FEED_WORKERS` sets how many at once; the default is 8.
+A run reads the library — files on the same disk — so almost all of its time is
+Signal's.
 
 **One `signal-cli` per run, not one per message.** Every `signal-cli` command
 starts a JVM, which costs about a second and a half, and a podcast episode used
-to spend three of them. A run now keeps a single `signal-cli jsonRpc` process
-alive and talks to it over a pipe: the second call costs a round trip instead.
-Set `RSSIGNAL_DAEMON=0` to go back to one process per call — slower, but it is
-the path rssignal used for years, and the first thing to try if sending ever
-misbehaves.
+to spend three of them. A run keeps a single `signal-cli jsonRpc` process alive
+and talks to it over a pipe: the second call costs a round trip instead. Set
+`RSSIGNAL_DAEMON=0` to go back to one process per call — slower, but the first
+thing to try if sending ever misbehaves.
 
-**A paced feed with nothing due isn't fetched at all.** An
-[episodic](#episodic-feeds) YouTube feed reads a whole channel's uploads and dates
-the videos it hasn't seen; at one episode every few days and a run every fifteen
-minutes, almost every run would do all of that only to be told to hold the episode
-back. So the clock is read first, and on the runs where nothing is due the feed
-costs nothing.
+**A paced feed with nothing due isn't read at all.**
 
-**Answers that can't change are remembered.** An ARTE programme's air date, the
-channel a YouTube `@handle` names, when a given video went up, the order a
-channel's uploads come in, the ETag a feed last handed out, and the picture last
-put on each group are kept in a cache file, so a run stops re-deriving
-yesterday's answer:
-
-```
-~/.cache/rssignal/cache.json     # or $RSSIGNAL_CACHE
-```
-
-Nothing in it decides *what gets sent* — that is the group description, and only
-the group description. Deleting the cache costs one slow run and changes nothing
-else, which is a property worth keeping: if something ever needs remembering that
-*would* change what goes out, it does not belong in there. (Exactly one thing
-does — the unsent half of a two-message episode — and it lives in its own file,
-`pending.json`, beside the cache rather than inside it. Losing that one costs a
-duplicated card, never a lost item.)
-
-Measured on twelve feeds with nothing new to send, which is what a scheduled run
-almost always is: **33.8s → 5.1s**.
+The cache (`~/.cache/rssignal/cache.json`, or `$RSSIGNAL_CACHE`) holds only the
+picture last put on each group. Nothing in it decides what gets sent; deleting it
+costs at most one redundant picture upload per group. `pending.json` beside it
+holds the unsent half of a two-message episode, and losing it costs a duplicated
+card, never a lost item.
 
 To see where a run's time actually goes:
 
 ```bash
 rssignal run --dry-run --timings
 ```
-
-It prints each step as it finishes and totals them by kind at the end. The
-totals can add up to more than the wall clock — that is the parallelism, and
-comparing the two is the quickest way to see how much of it there is.
 
 ## Development
 

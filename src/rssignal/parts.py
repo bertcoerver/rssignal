@@ -1,21 +1,17 @@
 """Send what doesn't fit in one attachment as several: as few as possible.
 
-Signal refuses an attachment over 100 MB, and that used to be the end of the
-matter — a video no quality of which fitted was skipped for good, and a long
-podcast episode failed at upload every run. Splitting the file and sending the
+Signal refuses an attachment over 100 MB. Splitting the file and sending the
 pieces as consecutive messages keeps the episode, at the cost of a seam or two.
 
-The rule, for every source and for audio as well as video:
-
-    **the fewest parts possible, then the best quality that fits in that many.**
-
-So a video whose smallest rung is 105 MB is two parts, and within those two
-parts' 190 MB it goes up to the sharpest rung that still fits — not three parts
-of 1080p, and not two parts of the rung that only needed one. Quality is chosen
-before downloading by :func:`choose`, from each source's own size estimates;
-how many parts it actually becomes is decided after, by :func:`split`, from the
-size of the file that landed. An estimate that ran low therefore costs one more
-part, never the episode.
+Which quality a video was downloaded at is fetchit's choice, made per feed
+(its ``quality`` setting). For a feed that goes to Signal the one to pick is
+``"part_size_mb": 95``: **the fewest parts possible, then the best quality
+that fits in that many**, worked out before downloading from each source's own
+size estimates. How many parts the file actually becomes is decided here, by
+:func:`split`, from the size of the file that landed — so an estimate that ran
+low costs one more part, never the episode. A feed downloaded at full quality
+for a media server works too; it just arrives in more parts, or not at all
+past :data:`MAX_PARTS`.
 
 Splitting is a stream copy, cut at equal lengths with ffmpeg's segment muxer.
 The picture is never re-encoded — on a Raspberry Pi that is the difference
@@ -40,20 +36,27 @@ import re
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, TypeVar
 
 from . import timing
 from .errorlog import log_line
 from .feeds import FeedError
-from .video import VIDEO_MAX_BYTES, VideoTooBig
 
-T = TypeVar("T")
+# Signal rejects an attachment over 100 MB outright, and the limit is per
+# attachment, whatever is in it: audio gets the same budget as video. Set below
+# 100 because a part is cut at a keyframe near, not at, the size asked for.
+MAX_BYTES = 95 * 1024 * 1024
 
-# Signal's limit is per attachment, whatever is in it: audio gets the same
-# budget as video.
-MAX_BYTES = VIDEO_MAX_BYTES
+
+class VideoTooBig(FeedError):
+    """Raised for a file that is too big even for :data:`MAX_PARTS` parts.
+
+    A permanent answer, told apart from a plain ``FeedError`` because a caller
+    that retries every failure would otherwise spend every run re-deciding it,
+    and never reach the items behind it: a two-hour documentary is not 380 MB
+    tomorrow either.
+    """
 
 # Past this many parts an item is still too big, and skipped for good. Four
 # parts is ~380 MB: a two-hour documentary at 360p, or a three-hour podcast at
@@ -88,35 +91,6 @@ def parts_needed(size: int, max_bytes: int = MAX_BYTES) -> int:
     return max(1, math.ceil(size / max_bytes))
 
 
-def choose(
-    candidates: Sequence[T],
-    *,
-    size: Callable[[T], int],
-    rank: Callable[[T], Any],
-    max_bytes: int = MAX_BYTES,
-    max_parts: int = MAX_PARTS,
-) -> tuple[T, int] | None:
-    """Pick ``(candidate, parts)``: the fewest parts, then the best in them.
-
-    ``size`` estimates a candidate's bytes and ``rank`` orders them best-last.
-    ``None`` means even the smallest needs more than ``max_parts``; the caller
-    says why in its own words, since it knows what the candidates were.
-    """
-    if not candidates:
-        return None
-    parts = parts_needed(min(size(c) for c in candidates), max_bytes)
-    if parts > max_parts:
-        return None
-    budget = parts * max_bytes
-    fitting = [c for c in candidates if size(c) <= budget]
-    return max(fitting, key=rank), parts
-
-
-def in_parts(parts: int) -> str:
-    """The suffix a dry run adds to a plan's description: ``", in 2 parts"``."""
-    return f", in {parts} parts" if parts > 1 else ""
-
-
 def too_big(what: str, smallest: int, *, max_bytes: int = MAX_BYTES) -> VideoTooBig:
     """The :class:`VideoTooBig` for ``what`` whose smallest option is ``smallest``."""
     mb = 1024 * 1024
@@ -142,7 +116,7 @@ def split_temp(
     its own temporary directory, which goes away when the ``with`` block ends —
     ``path`` itself is the caller's and is left alone.
 
-    Raises :class:`~rssignal.video.VideoTooBig` if even ``max_parts`` parts
+    Raises :class:`VideoTooBig` if even ``max_parts`` parts
     would each be over the limit, and :class:`~rssignal.feeds.FeedError` if
     ffmpeg is missing or fails.
     """

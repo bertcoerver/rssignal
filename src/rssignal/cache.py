@@ -4,36 +4,21 @@ Strictly a speed cache, and the distinction matters: nothing here is ever
 consulted to decide *what to send*. How far a feed got is remembered in its
 Signal group's description and nowhere else (see :mod:`rssignal.watermark`),
 which is what lets rssignal run from anywhere, on a machine that keeps no state,
-and still never send an item twice. Deleting this file costs one slow run and
-changes nothing about the outcome of it. That property is worth protecting: if
-something ever needs to be cached that *would* change what gets sent, it does
-not belong in here. One thing does, and doesn't — see :mod:`rssignal.pending`,
-which keeps its own file beside this one.
+and still never send an item twice. Deleting this file costs at most a
+redundant upload and changes nothing about what is sent. That property is worth
+protecting: if something ever needs to be cached that *would* change what gets
+sent, it does not belong in here. One thing does, and doesn't — see
+:mod:`rssignal.pending`, which keeps its own file beside this one.
 
-What it holds is the work a run repeats for no reason. An ARTE programme's
-rights window began when it began; a YouTube ``@handle`` has named the same
-channel since it was created; a video went up when it went up; a feed that has
-not changed will say so if it is asked with the ETag it gave out last time.
-Re-deriving those cost a run some forty HTTP round trips and a couple of yt-dlp
-launches, every fifteen minutes, to arrive back at yesterday's answer.
+Since fetchit took over reading the feeds, what is left is small: the picture
+rssignal last put on each group (:mod:`rssignal.artwork`), so a group is only
+told "changed the group picture" when it really did.
 
-The YouTube entries an episodic feed leans on (:mod:`rssignal.episodic`) are a
-closer call than the rest, because that feed's items are built out of them — but
-they stay on the right side of the line, and it is worth being able to say why.
-Neither is a record of what rssignal *did*: one is the order YouTube lists a
-channel's uploads in, the other is when each of them went up, and both come back
-identical when they are asked for again. Deleting them costs a slow run and one
-long listing, and the same episode goes out either way.
-
-Entries are namespaced and carry the time they were stored, so each kind of
-answer can be trusted for as long as it deserves — see the ``*_TTL`` constants.
-The whole file is read once at the start of a run and written once at the end,
-because a run is short and the alternative is a hundred small writes; it is held
-under a lock because feeds are fetched in parallel (:func:`rssignal.run._prepare_feeds`).
+Entries are namespaced and carry the time they were stored. The whole file is
+read once at the start of a run and written once at the end.
 
 Corruption is not an error condition. An unreadable, truncated or half-written
-cache is treated as an empty one and simply refilled — the only cost is the slow
-run it was there to avoid.
+cache is treated as an empty one and simply refilled.
 """
 
 from __future__ import annotations
@@ -49,45 +34,6 @@ from typing import Any
 # directory rather than beside feeds.json, because that is the directory whose
 # whole contract is "safe to delete, will be rebuilt".
 CACHE_ENV = "RSSIGNAL_CACHE"
-
-# An ARTE programme's rights window began on a fixed date; it is not going to
-# begin on a different one. Kept indefinitely.
-ARTE_PUBLISHED_TTL = None
-
-# A programme that gave up no date is asked again before long: the usual reason
-# is that its rights window has not been published yet, which is a temporary
-# state, and caching "no" for a month would keep a real episode out of the feed
-# permanently.
-ARTE_UNDATED_TTL = 6 * 60 * 60
-
-# A @handle points at one channel for the life of the channel. Re-checked
-# eventually only so that a handle changing hands is not permanent.
-YOUTUBE_CHANNEL_TTL = 90 * 24 * 60 * 60
-
-# Durations for a channel's latest uploads — the one thing here that genuinely
-# goes stale, since the "latest fifteen" moves. Short enough that a new upload is
-# never held back by more than one run's worth of time.
-YOUTUBE_DURATIONS_TTL = 60 * 60
-
-# A channel's uploads playlist, in order: what an episodic YouTube feed walks
-# (see :mod:`rssignal.episodic`). It grows at the newest end and never reorders
-# behind that, so a week-old copy is a week-old copy of a correct answer, and
-# re-reading it costs a single request that returns a thousand videos.
-YOUTUBE_UPLOADS_TTL = 7 * 24 * 60 * 60
-
-# When a particular video went up. Fixed for the life of the video, and dear to
-# ask for — one yt-dlp launch each, because the playlist listing doesn't carry
-# dates. Kept indefinitely, like ARTE's.
-YOUTUBE_PUBLISHED_TTL = None
-
-# A video rssignal has been told it cannot have: age-gated, private,
-# members-only, removed. Unlike ARTE's undated programmes this is kept for good,
-# and the asymmetry is deliberate. Skipping such a video moves the watermark past
-# it; if it were asked about again later and answered, its date would be behind
-# that watermark and it would never be sent — a silently missing episode, which
-# is the one outcome worth ruling out. A video we cannot read the date of is one
-# we could not have downloaded either, so nothing is lost by it being final.
-YOUTUBE_UNDATED_TTL = None
 
 _lock = threading.Lock()
 _data: dict[str, dict[str, Any]] | None = None

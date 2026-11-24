@@ -30,26 +30,6 @@ if ! bashio::fs.file_exists "${CONFIG}"; then
     exit 1
 fi
 
-# --- yt-dlp ------------------------------------------------------------------
-#
-# YouTube changes its extraction often enough that a yt-dlp pinned at image
-# build time stops working within weeks; the macOS wrapper runs
-# `brew upgrade yt-dlp` on every run for the same reason. Once a day is plenty,
-# and the stamp keeps the other two runs of the day from paying for it.
-if bashio::config.true 'update_yt_dlp'; then
-    stamp="/data/.yt-dlp-updated"
-    if [ ! -f "${stamp}" ] || [ "$(find "${stamp}" -mtime +0 2>/dev/null)" ]; then
-        bashio::log.info "Updating yt-dlp..."
-        if /opt/venv/bin/pip install --no-cache-dir --quiet --upgrade yt-dlp; then
-            touch "${stamp}"
-        else
-            # A failed upgrade is not a reason to skip the run: the yt-dlp
-            # already installed worked yesterday and will probably do today.
-            bashio::log.warning "yt-dlp update failed; using the installed one."
-        fi
-    fi
-fi
-
 # --- go ----------------------------------------------------------------------
 
 bashio::log.info "Starting rssignal run..."
