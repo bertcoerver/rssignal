@@ -207,13 +207,11 @@ async function loadFeeds(refresh = false) {
     const {feeds} = await api("api/feeds" + (refresh ? "?refresh=1" : ""));
     if (!feeds.length) { $("feeds").innerHTML = `<tr><td colspan="6" class="muted">No feeds in the config.</td></tr>`; return; }
     $("feeds").innerHTML = feeds.map(f => {
-      const name = esc(f.name) + (f.source !== f.name ? `<br><span class="muted">from ${esc(f.source)}</span>` : "")
-        + (f.episodic ? `<br><span class="pill muted">episodic · ${esc(f.episodic)}</span>` : "");
+      const name = esc(f.name) + (f.source !== f.name ? `<br><span class="muted">from ${esc(f.source)}</span>` : "");
       const group = f.group ? `<span class="ok">✓</span>` : `<span class="muted">created on first send</span>`;
       const waiting = f.waiting ? `<b>${f.waiting}</b>` : "0";
-      const next = f.next_episode ? `<br><span class="muted">next: ${f.next_episode === "now" ? "now" : esc(when(f.next_episode))}</span>` : "";
       const newest = f.note ? `<span class="warn">${esc(f.note)}</span>` : `${esc(f.newest || "—")}<br><span class="muted">${esc(f.newest_date || "")}</span>`;
-      return `<tr><td>${name}</td><td>${group}</td><td class="num">${f.items}</td><td class="num">${waiting}${next}</td><td>${esc(when(f.watermark))}</td><td>${newest}</td></tr>`;
+      return `<tr><td>${name}</td><td>${group}</td><td class="num">${f.items}</td><td class="num">${waiting}</td><td>${esc(when(f.watermark))}</td><td>${newest}</td></tr>`;
     }).join("");
   } catch (e) {
     $("feeds").innerHTML = `<tr><td colspan="6" class="bad">${esc(e.message)}</td></tr>`;

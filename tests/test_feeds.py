@@ -55,6 +55,13 @@ def test_load_feeds_url_is_refused_with_where_it_went(tmp_path):
         load_feeds(path)
 
 
+@pytest.mark.parametrize("raw", [{"episodic": "daily"}, {"start": "2019-01-01"}])
+def test_load_feeds_pacing_is_refused_and_pointed_at_fetchit(tmp_path, raw):
+    path = _write_config(tmp_path, {"feeds": [{"name": "F", **raw}]})
+    with pytest.raises(FeedError, match="max_per_day"):
+        load_feeds(path)
+
+
 @pytest.mark.parametrize("key", ["since", "max_per_run", "quality", "keep_days"])
 def test_load_feeds_download_settings_belong_in_fetchit(tmp_path, key):
     path = _write_config(tmp_path, {"feeds": [{"name": "F", key: 1}]})

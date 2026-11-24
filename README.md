@@ -12,8 +12,8 @@ It downloads nothing itself. [fetchit](https://github.com/bertcoerver/fetchit)
 reads the feeds — RSS and podcasts, ARTE, NPO Start, YouTube, Bayam — and files
 what is new in a library on disk; rssignal reads that library and sends from it.
 Which feeds are read, what is worth downloading and at what quality is fetchit's
-config. Which group a feed goes to, what a message looks like and at what pace a
-series is released is rssignal's.
+config, and so is pacing a series (`max_per_day`). Which group a feed goes to
+and what a message looks like is rssignal's.
 
 ## Requirements
 
@@ -203,8 +203,6 @@ Each feed entry supports:
 | `preview_url`       | no       | Template for the card's link. Defaults to `{link}`.                    |
 | `preview_title`     | no       | Template for the card's title. Defaults to `{title}`.                  |
 | `preview_description` | no     | Template for the card's text. Omit for a card with no description.     |
-| `episodic`          | no       | Send this feed from the beginning, at a set pace. See [episodic feeds](#episodic-feeds). |
-| `start`             | no       | Where an episodic feed begins, e.g. `"2019-01-01"`. Episodic feeds only. |
 | `refresh_image`     | no       | `false` leaves this feed's group picture alone. See [keeping group pictures current](#keeping-group-pictures-current). |
 | `<field>_contains`  | no       | Send only items whose field contains any of these terms.               |
 | `<field>_excludes`  | no       | Don't send items whose field contains any of these terms.              |
@@ -272,81 +270,23 @@ rssignal run --dry-run
 #     video: /media/fetchit/shows/…/Le Dessous des Images - S2026E072301 - La bataille du drapeau.mp4 (~63 MB)
 ```
 
-### Episodic feeds
+### Series and back catalogues
 
-Most feeds are tickers: what matters is what arrived since you last looked. A
-series is the other thing — its back catalogue *is* the point, and the order to
-take it in is the order it was made.
-
-```json
-{
-  "name": "Last Week Tonight",
-  "episodic": "2-weekly",
-  "start": "2019-01-01"
-}
-```
-
-`episodic` changes two things. The feed starts at its **oldest** item instead of
-its newest, and it is **paced**: you get one episode every so often rather than
-the whole archive at once.
-
-The cadence reads as a rate and is applied as an interval — `"2-weekly"` is two a
-week, which is one every three and a half days. That is deliberate: two episodes
-dumped every Monday is not what anyone means by "two a week".
-
-| Cadence      | One episode every |
-| ------------ | ----------------- |
-| `"daily"`    | 24 hours          |
-| `"2-daily"`  | 12 hours          |
-| `"weekly"`   | 7 days            |
-| `"2-weekly"` | 3.5 days          |
-| `"monthly"`  | 30 days           |
-| `true`       | no pacing at all — the whole catalogue, in one run |
-
-A month is 30 days, so that a rate divides into equal intervals. `true` is the
-honest primitive underneath the rest; on a feed with a real archive it will send
-the lot, so the string forms are the ones to reach for.
-
-`start` says where the series begins, for a back catalogue you don't want all of.
-It acts as the watermark the feed would have had, so everything published before
-it counts as already behind you. Without it a series opens at the source's very
-first item — which for a channel with nine hundred videos is a long way back.
-
-Worth knowing:
-
-- **There is no catch-up.** A machine that was off for a fortnight releases one
-  episode and picks the rhythm back up. It does not owe you four — sending four at
-  once is the avalanche the pace was set to avoid, and the queue isn't going
-  anywhere.
-- **An episode may go out up to four hours early** (at most a quarter of the
-  interval). The clock starts when an episode is sent, a few seconds into its run,
-  so tomorrow's run at the same time is seconds short of a day. Held strictly, a
-  `"daily"` feed whose source is only reachable at one run a day would send every
-  other day.
-- **A paced feed with nothing due isn't even read**, which is most runs.
-- **`--dry-run` always tells you where a series stands** — how many episodes are
-  waiting and when the next one is due — rather than going quiet.
-- **`--since` overrides the pace**, being an explicit replay. **`--to` touches no
-  group**, so it has no clock to read: it sends the next episode and changes
-  nothing.
-
-#### Where the back catalogue comes from
-
-An episodic feed can only release what is in the library, and a feed newly
-followed by fetchit starts at its newest item. So the back catalogue is fetchit's
-to download: give the feed a `since` in fetchit.json, no later than this feed's
-`start`, and a `max_per_day` in step with the cadence here:
+rssignal sends whatever fetchit files, as it arrives; it does not pace anything.
+To work through a series from the start, one episode a day, let fetchit drip it
+into the library: give the feed a `since` and a `max_per_day` in fetchit.json.
 
 ```json
 {"name": "3Blue1Brown", "url": "https://www.youtube.com/@3blue1brown",
  "since": "2019-01-01", "max_per_day": 1}
 ```
 
-`max_per_day` keeps fetchit a step ahead of the series rather than racing
-through the whole archive and having episodes pruned by `keep_days` before they
-are sent. For a YouTube channel, fetchit reads the uploads playlist for this,
-with no API key; it dates the videos 25 a run, so a long channel takes a day or so
-before its oldest episodes are in the library.
+fetchit downloads oldest first, so each day's episode lands in order and
+rssignal sends it on. Earlier versions had an `episodic` cadence and a `start`
+date here instead; a feeds.json that still has either is refused with a message
+saying so. Drop both: the watermark the group already carries says how far the
+feed got, and the next run carries on from there — sending, at once, anything
+fetchit filed beyond it.
 
 ### One group per feed
 
@@ -710,8 +650,8 @@ overlap. See [fetchit's README](https://github.com/bertcoerver/fetchit#the-libra
 for the layout.
 
 How long things stay in the library is fetchit's `keep_days`. An item pruned before
-it was sent is not sent: give a slow feed — an episodic one above all — a
-`keep_days` long enough, or a `max_per_day` in step with its cadence.
+it was sent is not sent, so keep `keep_days` longer than the gap between
+rssignal's runs.
 
 A feed with nothing in the library yet is skipped with one line, not a failure:
 
@@ -750,33 +690,21 @@ new machine, and nothing is resent.
 also leaves one *"You changed the group description"* line above it in that group.
 Runs with nothing new write nothing and stay completely silent.
 
-An [episodic feed](#episodic-feeds) keeps a second marker beside the first:
-
-```
-Every episode of a show, from the start.
-
-[rssignal 2014-05-04T22:30:00+00:00]
-[rssignal-paced 2026-08-08T09:12:44+00:00]
-```
-
-That one is a wall-clock time — the moment the last episode was released — and it
-is the only thing a pace can be measured from. The two answer different questions,
-and neither can be worked out from the other: how far through the series we are,
-and when we were last given a piece of it. Both are written in the same update, so
-they cannot disagree.
+A group from an older version may also carry a `[rssignal-paced …]` line, from
+when rssignal paced feeds itself. It is ignored, and dropped the next time the
+description is written.
 
 Worth knowing:
 
 - **A feed with no marker yet sends exactly one item** — the newest. A new group
-  doesn't open with the whole back catalogue. (An episodic feed opens at the
-  *oldest* item instead, and then only one at a time.)
+  doesn't open with the whole back catalogue.
 - **Items with no publication date are never sent.** There is no way to tell
   whether they are new.
 - **Your own edits survive.** Rewrite a group's description in Signal and rssignal
   moves the markers around your text instead of pasting the feed's blurb back over
   it. Delete the marker and the feed's newest item is sent once more.
 - **`--to` touches no group**, so it neither reads nor moves any marker. It sends
-  the newest item, every time — or, for an episodic feed, the next episode.
+  the newest item, every time.
 - **`--since` replays**, ignoring what the groups remember:
 
   ```bash
@@ -956,8 +884,6 @@ to spend three of them. A run keeps a single `signal-cli jsonRpc` process alive
 and talks to it over a pipe: the second call costs a round trip instead. Set
 `RSSIGNAL_DAEMON=0` to go back to one process per call — slower, but the first
 thing to try if sending ever misbehaves.
-
-**A paced feed with nothing due isn't read at all.**
 
 The cache (`~/.cache/rssignal/cache.json`, or `$RSSIGNAL_CACHE`) holds only the
 picture last put on each group. Nothing in it decides what gets sent; deleting it

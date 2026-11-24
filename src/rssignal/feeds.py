@@ -14,7 +14,6 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
-from .episodic import Cadence, parse_cadence
 
 # Extensions that mark an enclosure as audio when its declared type doesn't.
 AUDIO_SUFFIXES = (
@@ -64,8 +63,6 @@ KNOWN_KEYS = (
     "preview_url",
     "preview_title",
     "preview_description",
-    "episodic",
-    "start",
     "refresh_image",
 )
 
@@ -151,11 +148,6 @@ class FeedConfig:
     fetchit's config. Left empty, it is ``name``: one name for the feed in
     both places, which is the usual case. See :attr:`library_name`.
 
-    ``episodic`` set makes this a series rather than a ticker: oldest item first,
-    released at the cadence's pace. ``start`` is where that walk begins, for a
-    back catalogue you don't want all of — it acts as the watermark the feed
-    would have had, so everything published before it is behind us already.
-
     ``refresh_image`` off leaves the group's picture as it is when pictures are
     refreshed (see :mod:`rssignal.artwork`).
     """
@@ -169,8 +161,6 @@ class FeedConfig:
     preview_url: str | None = None
     preview_title: str | None = None
     preview_description: str | None = None
-    episodic: Cadence | None = None
-    start: datetime | None = None
     refresh_image: bool = True
 
     @property
@@ -324,15 +314,6 @@ def _build_feed_config(raw: object, index: int) -> FeedConfig:
             raise FeedError(f"{where} {key} must be a string.")
         previews[key] = value
 
-    episodic = None
-    if raw.get("episodic") is not None:
-        try:
-            episodic = parse_cadence(raw["episodic"], where)
-        except ValueError as exc:
-            raise FeedError(str(exc)) from exc
-
-    start = _build_start(raw.get("start"), where, episodic)
-
     return FeedConfig(
         source=source.strip() if isinstance(source, str) else "",
         name=name.strip(),
@@ -340,45 +321,9 @@ def _build_feed_config(raw: object, index: int) -> FeedConfig:
         filters=_build_filters(raw, where),
         extract=_build_extracts(raw.get("extract"), where),
         link_preview=link_preview,
-        episodic=episodic,
-        start=start,
         refresh_image=refresh_image,
         **previews,
     )
-
-
-def _build_start(raw: object, where: str, episodic: Cadence | None) -> datetime | None:
-    """Validate the ``start`` date an episodic feed begins its walk at.
-
-    Only meaningful on an episodic feed: on a ticker the first run sends the
-    newest item and everything before it is behind us by definition, so a
-    ``start`` there would be a setting that quietly did nothing.
-
-    A bare date means midnight UTC, which is what somebody writing ``2019-01-01``
-    means by it. The stamp is compared against feed timestamps, so it has to be
-    aware; a naive one is read as UTC, as everywhere else here.
-    """
-    if raw is None:
-        return None
-    if episodic is None:
-        raise FeedError(
-            f"{where} has a \"start\" but is not \"episodic\". start says where a "
-            "series begins; a feed without a cadence starts at its newest item "
-            "and moves forward, so there is nothing for it to say. Add "
-            "\"episodic\", or drop \"start\" and replay with `rssignal run "
-            "--since` instead."
-        )
-    if not isinstance(raw, str):
-        raise FeedError(f"{where} start must be a date like \"2019-01-01\".")
-
-    try:
-        when = datetime.fromisoformat(raw.strip())
-    except ValueError as exc:
-        raise FeedError(
-            f"{where} start {raw!r} is not a date rssignal can read. Use "
-            "\"2019-01-01\", or a full \"2019-01-01T12:00:00+00:00\"."
-        ) from exc
-    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
 
 
 def _build_extracts(raw: object, where: str) -> tuple[FieldExtract, ...]:
@@ -439,6 +384,13 @@ def _build_filters(raw: dict, where: str) -> tuple[FeedFilter, ...]:
                 "decides what is worth downloading — to a feed of the same name "
                 "in fetchit.json (or give it another name there, and set "
                 "\"source\" here to that name). Then drop the key."
+            )
+        if key in ("episodic", "start"):
+            raise FeedError(
+                f"{where} still has {key!r}. rssignal no longer paces feeds: it "
+                "sends whatever fetchit files, as it arrives. To drip a back "
+                "catalogue, give the feed \"since\" and \"max_per_day\" in "
+                "fetchit.json instead. Then drop the key here."
             )
         if key in FETCHIT_KEYS:
             raise FeedError(

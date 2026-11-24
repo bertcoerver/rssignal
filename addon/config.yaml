@@ -73,9 +73,8 @@ schema:
   # which is how you check a new feeds.json; `run` sends for real. Both exist
   # because there is no shell here to run them from.
   on_start: list(wait|dry-run|run)
-  # Local times to run at, HH:MM. Empty runs only when asked, from the panel. Keep three or so spread across the day: the
-  # `EARLY` allowance in rssignal.episodic is sized for runs a few hours apart,
-  # and a single daily run would make a "daily" feed drift to every other day.
+  # Local times to run at, HH:MM. Empty runs only when asked, from the panel, or
+  # when fetchit says it downloaded something (its `notify` option).
   schedule:
     - match(^([01][0-9]|2[0-3]):[0-5][0-9]$)
   # The library the fetchit add-on downloads into. Put this add-on's runs a

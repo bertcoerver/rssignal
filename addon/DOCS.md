@@ -179,15 +179,12 @@ descriptions that hold the watermarks.
 
 ### About the schedule
 
-Keep three or so runs spread across the day rather than one. rssignal paces
-episodic feeds by comparing the time since the last release against the feed's
-cadence, with a four-hour tolerance (`EARLY` in `rssignal/episodic.py`) sized
-for exactly this: without it, a run at 06:30 today is a few seconds short of 24
-hours after the run at 06:30 yesterday, and a `daily` feed quietly becomes an
-every-other-day one.
-
-Running more often is harmless — nothing is ever sent twice, and a run with
-nothing to do takes a few seconds — but there is little to gain.
+With fetchit's `notify` pointed at rssignal (see
+[below](#runs-as-soon-as-fetchit-downloads-apifetched)), rssignal runs as soon as
+something lands, and the schedule is only the safety net; one or two times a
+day are plenty. Without it, put the runs a little after fetchit's. Running more
+often is harmless — nothing is ever sent twice, and a run with nothing to do
+takes a few seconds.
 
 Put the times a little after fetchit's (its defaults are 01:00, 06:00 and
 14:30), so each run finds what the last download brought. Nothing breaks if
@@ -200,7 +197,7 @@ Changing the schedule takes effect when the add-on restarts.
 Once started, the add-on is **rssignal** in Home Assistant's sidebar (or **Open
 Web UI** on its page). It shows whether the account is linked and when the next
 run is; every feed with its group, how many of its items are waiting, how far it
-has been sent, and when an episodic feed's next episode is due; what was sent
+has been sent; what was sent
 recently, by a run, by Home Assistant or by hand; and the log. Buttons start a
 run, a dry run or a group picture refresh now, with what it printed shown as it
 goes; a form sends a message to any group or number.
@@ -386,8 +383,7 @@ restart:
 Set it back to `wait` afterwards, or every restart will fire a run.
 
 `dry-run` is the one to use after editing `feeds.json`: it reads every feed
-from the library — and deliberately lifts the pacing gate that normally holds
-episodic feeds back — without sending anything.
+from the library without sending anything.
 
 Longer-term evidence lives in `/data/rssignal.log`, which records the start and
 end of every run and the full traceback of every failure. A "started" line with

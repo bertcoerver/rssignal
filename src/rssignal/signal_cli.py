@@ -27,7 +27,7 @@ from PIL import Image, UnidentifiedImageError
 
 from . import timing
 from .config import ConfigError, get_config
-from .watermark import compose_description, read_pace, read_watermark, shorten
+from .watermark import compose_description, read_watermark, shorten
 
 # Signal silently drops a group avatar that is too large: the upload is accepted,
 # signal-cli exits 0, and the group simply keeps no picture. 1400x1400 is dropped,
@@ -884,17 +884,10 @@ def _clip(text: str, limit: int = GROUP_DESCRIPTION_MAX_CHARS) -> str:
     front of it: the marker is what the next run reads to know how far the feed
     got, so losing it would silently resend items. The blurb is shortened
     instead. See :mod:`rssignal.watermark`.
-
-    An episodic feed's pace marker is carried through the same way, and has to
-    be read back out explicitly: recomposing strips *both* markers off the blurb
-    before re-appending, so anything not named here is not shortened but
-    dropped. Losing this one is quiet and expensive — a feed with no pace marker
-    reads as one that has never released anything, so every run would consider
-    an episode due and the whole back catalogue would go out one run at a time.
     """
     mark = read_watermark(text)
     if mark is not None:
-        return compose_description(text, mark, limit=limit, paced=read_pace(text))
+        return compose_description(text, mark, limit=limit)
     return shorten(text, limit)
 
 

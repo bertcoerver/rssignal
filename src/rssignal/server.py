@@ -62,7 +62,6 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import __version__, signal_cli
 from .config import ConfigError, get_config
-from .episodic import next_release
 from .errorlog import log_exception, log_line, log_path
 from .feeds import (
     FeedError,
@@ -83,7 +82,7 @@ from .signal_cli import (
     match_group,
     send_msg,
 )
-from .watermark import read_pace, read_watermark
+from .watermark import read_watermark
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8099
@@ -597,10 +596,9 @@ class Service:
             group_error = None
         except SignalError as exc:
             groups, group_error = [], str(exc)
-        now = datetime.now(timezone.utc)
         out = []
         for cfg in feeds:
-            row: dict = {"name": cfg.name, "source": cfg.library_name, "episodic": cfg.episodic.describe() if cfg.episodic else None}
+            row: dict = {"name": cfg.name, "source": cfg.library_name}
             group = match_group(groups, cfg.name)
             row["group"] = group.recipient if group else None
             if group_error:
@@ -622,16 +620,10 @@ class Service:
             dated = filter_since(items, None)
             row["newest"] = dated[-1].title if dated else None
             row["newest_date"] = dated[-1].published.date().isoformat() if dated else None
-            start = mark or cfg.start
-            if start is not None:
-                row["waiting"] = len(filter_since(items, start))
+            if mark is not None:
+                row["waiting"] = len(filter_since(items, mark))
             else:
-                row["waiting"] = len(dated) if cfg.episodic else min(1, len(dated))
-            if cfg.episodic and group is not None:
-                due = next_release(cfg.episodic, read_pace(group.description))
-                row["next_episode"] = (
-                    "now" if due is None or due <= now else due.astimezone().isoformat(timespec="minutes")
-                )
+                row["waiting"] = min(1, len(dated))
             out.append(row)
         return out
 
