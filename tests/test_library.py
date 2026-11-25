@@ -118,3 +118,62 @@ def test_feed_image_is_the_artwork_feed_json_names(own_library):
     assert feed_image(FeedConfig(name="Pod")) is None
     (folder / "cover.jpg").write_bytes(b"jpg")
     assert feed_image(FeedConfig(name="Pod")) == str(folder / "cover.jpg")
+
+
+# --- a post with pictures in it ----------------------------------------------
+
+
+def _post(own_library, *, missing=()):
+    blog = _feed(own_library, "articles", "Blog Les Acanthes")
+    stem = "2026-11-10 - Journée pHARe"
+    for name in (f"{stem}-1.jpg", f"{stem}-2.jpg"):
+        if name not in missing:
+            (blog / name).write_bytes(b"jpg")
+    _record(
+        blog,
+        stem,
+        id="eprimo:19cea87a",
+        title="Journée pHARe",
+        description="Un débat.\n\nPuis.",
+        published="2026-11-10T17:56:07+00:00",
+        link="https://ent.e-primo.fr/blog/id/b/post/p",
+        image=f"{stem}-1.jpg",
+        body=[
+            {"type": "heading", "text": "Atelier 1"},
+            {"type": "text", "text": "Un débat."},
+            {"type": "image", "file": f"{stem}-1.jpg"},
+            {"type": "hologram", "data": "from a newer fetchit"},
+            {"type": "text", "text": "  "},
+            {"type": "text", "text": "Puis."},
+            {"type": "image", "file": f"{stem}-2.jpg"},
+        ],
+    )
+    return blog, stem
+
+
+def test_a_post_is_read_with_its_body_in_order(own_library):
+    blog, stem = _post(own_library)
+
+    (item,) = read_feed(FeedConfig(name="Blog Les Acanthes")).items
+
+    assert item.kind == "text"
+    assert item.image == str(blog / f"{stem}-1.jpg")
+    assert item.body == (
+        {"type": "heading", "text": "Atelier 1"},
+        {"type": "text", "text": "Un débat."},
+        {"type": "image", "path": str(blog / f"{stem}-1.jpg")},
+        {"type": "text", "text": "Puis."},
+        {"type": "image", "path": str(blog / f"{stem}-2.jpg")},
+    )
+
+
+def test_a_post_missing_one_of_its_photos_is_not_sent_half(own_library):
+    _post(own_library, missing=("2026-11-10 - Journée pHARe-2.jpg",))
+    assert read_feed(FeedConfig(name="Blog Les Acanthes")).items == []
+
+
+def test_an_item_without_a_body_has_the_empty_one(own_library):
+    blog = _feed(own_library, "articles", "Blog")
+    _record(blog, "2026-11-10 - Note", published="2026-11-10T17:56:07+00:00")
+    (item,) = read_feed(FeedConfig(name="Blog")).items
+    assert item.body == ()

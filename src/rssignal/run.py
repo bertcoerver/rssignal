@@ -19,6 +19,10 @@ A video item has its file attached to the message. That is one message, not
 two: these items get no preview card by default, so nothing is there for the
 attachment to displace. Text goes out as text plus its link.
 
+A post with pictures in it — a blog post fetchit filed with a body — goes out
+as it reads: each stretch of text is one message, with the photos that follow it
+attached, so the chat scrolls like the post does. See :func:`_body_messages`.
+
 Media too big for one Signal message — video or audio — goes out as the fewest
 parts that each fit, one message per part (see :mod:`rssignal.parts`); every
 part after the first is captioned ``Title (k/N)``. More messages are more places
@@ -74,6 +78,7 @@ from .library import read_feed
 from .parts import MAX_BYTES, VideoTooBig, parts_needed, split_temp
 from .signal_cli import (
     GROUP_DESCRIPTION_MAX_CHARS,
+    MESSAGE_MAX_BYTES,
     LinkPreview,
     SignalError,
     SignalGroup,
@@ -673,6 +678,9 @@ def _handle_item(
     # that would actually go out — long show notes are cut, not printed whole.
     text = clip_body(render_message(item, cfg), card["url"] if card else None)
 
+    if item.body:
+        return _handle_post(item, recipient, label, dry_run=dry_run)
+
     if (is_podcast or is_video) and not item.media:
         # fetchit files every audio and video item with its file, so this is an
         # item somebody built by hand, or whose file has gone. Nothing to attach,
@@ -727,6 +735,136 @@ def _handle_item(
             label=label,
         )
     return True
+
+
+# Signal shows a message's pictures as one album, and takes no more than this
+# many in a message.
+MAX_ATTACHMENTS = 32
+
+
+def _handle_post(item: FeedItem, recipient: str, label: str, *, dry_run: bool) -> bool:
+    """Send (or describe) an item that has a body — see :func:`_body_messages`.
+
+    Its layout is its own: a ``message_template`` and a preview card are for
+    items that are a title and a link, and Signal drops a card from a message
+    carrying an attachment anyway.
+    """
+    with ExitStack() as stack:
+        ready: list[dict] = []
+        for block in item.body:
+            path = block.get("path")
+            if not path:
+                ready.append(block)
+                continue
+            if dry_run:
+                ready.append({**block, "paths": [path]})
+                continue
+            try:
+                # A video over the limit goes as parts; a photo never is.
+                ready.append({**block, "paths": stack.enter_context(split_temp(path))})
+            except VideoTooBig as exc:
+                print(f"[{label}] {item.title!r}: a file left out: {exc}", file=sys.stderr)
+                log_line(f"[{label}] {item.title!r}: a file left out: {exc}")
+
+        messages = _body_messages(item, ready)
+        if dry_run:
+            print(f"[{label}] -> {recipient}: {item.title} ({len(messages)} message(s))")
+            for message in messages:
+                first_line = message.text.splitlines()[0] if message.text else "(no text)"
+                files = f"  [{len(message.attachments)} file(s)]" if message.attachments else ""
+                print(f"    {first_line[:70]}{files}")
+            return True
+        _send_all(messages, recipient=recipient, item=item, label=label)
+    return True
+
+
+def _body_messages(item: FeedItem, blocks: list[dict]) -> list[_Message]:
+    """The messages a post goes out as: each stretch of text with the files after it.
+
+    A post is written as text, then the photos it was about, then more text.
+    Cut where text follows a photo, each piece is a message that reads the way
+    Signal shows one — pictures on top, their caption below — and the chat as a
+    whole reads in the post's own order. The first message opens with the
+    title; the last one closes with the link.
+
+    Text over Signal's limit for a message is carried over to another, cut
+    between paragraphs, and the files go with the last of them. More files than
+    a message takes go on in further messages, captioned with the title so the
+    chat list never reads "Photo".
+
+    ``blocks`` is the body with each file block's ``paths`` set: what to attach
+    for it, which is more than one file only for a video sent in parts.
+    """
+    sections: list[tuple[list[str], list[str]]] = []
+    text: list[str] = []
+    files: list[str] = []
+    for block in blocks:
+        if block.get("paths"):
+            files.extend(block["paths"])
+            continue
+        if files:
+            sections.append((text, files))
+            text, files = [], []
+        if block.get("text"):
+            text.append(block["text"])
+    if text or files:
+        sections.append((text, files))
+    if not sections:
+        sections.append(([], []))
+
+    sections[0][0].insert(0, item.title)
+    if item.link:
+        sections[-1][0].append(item.link)
+
+    messages: list[_Message] = []
+    for paragraphs, attached in sections:
+        chunks = _chunks(paragraphs, MESSAGE_MAX_BYTES) or [""]
+        groups = [attached[i:i + MAX_ATTACHMENTS] for i in range(0, len(attached), MAX_ATTACHMENTS)]
+        for chunk in chunks[:-1]:
+            messages.append(_Message(chunk))
+        messages.append(_Message(chunks[-1] or item.title, groups[0] if groups else None))
+        for group in groups[1:]:
+            messages.append(_Message(item.title, group))
+    return messages
+
+
+def _chunks(paragraphs: list[str], limit: int) -> list[str]:
+    """``paragraphs`` joined into as few texts as each fit in ``limit`` bytes.
+
+    Cut between paragraphs. One paragraph that is over the limit by itself is
+    cut between words — nothing is dropped, which is the difference from
+    :func:`~rssignal.signal_cli.clip_body`.
+    """
+    chunks: list[str] = []
+    current = ""
+    for paragraph in paragraphs:
+        for piece in _fitting(paragraph.strip(), limit):
+            joined = f"{current}\n\n{piece}" if current else piece
+            if len(joined.encode()) <= limit:
+                current = joined
+            else:
+                chunks.append(current)
+                current = piece
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _fitting(text: str, limit: int) -> list[str]:
+    """``text`` as pieces of at most ``limit`` bytes, cut between words."""
+    pieces: list[str] = []
+    while len(text.encode()) > limit:
+        cut = text[:limit]
+        while len(cut.encode()) > limit:
+            cut = cut[:-1]
+        space = cut.rfind(" ")
+        if space > len(cut) // 2:
+            cut = cut[:space]
+        pieces.append(cut.rstrip())
+        text = text[len(cut):].lstrip()
+    if text:
+        pieces.append(text)
+    return pieces
 
 
 def _describe_file(path: str | None) -> str:

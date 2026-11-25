@@ -197,6 +197,10 @@ class FeedItem:
     kind: str | None = None
     media: str | None = None
     image: str | None = None
+    # A post with pictures in it, as it was written: headings, paragraphs and
+    # files in order, each ``{"type": "heading" | "text", "text": …}`` or
+    # ``{"type": "image" | "video" | "audio", "path": …}``. Empty otherwise.
+    body: tuple[dict, ...] = ()
 
 
 @dataclass(frozen=True)

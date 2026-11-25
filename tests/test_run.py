@@ -1776,3 +1776,156 @@ def test_run_dry_run_reports_the_parts(monkeypatch, capsys, tmp_path):
     run_feeds("feeds.json", dry_run=True)
 
     assert f"video: {video} (~105 MB, in 2 parts)" in capsys.readouterr().out
+
+
+# --- a post with pictures in it ----------------------------------------------
+
+
+def _post(body, title="Journée pHARe", link="https://ent/blog/post/1"):
+    return FeedItem(title=title, description="all of its text", link=link, kind="text", body=tuple(body))
+
+
+def _text(text, kind="text"):
+    return {"type": kind, "text": text}
+
+
+def _photo(name, kind="image"):
+    return {"type": kind, "path": f"/tmp/{name}"}
+
+
+def _send_post(monkeypatch, item, cfg=None):
+    cfg = cfg or FeedConfig(source="https://a", name="Blog")
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    monkeypatch.setattr(run, "split_temp", _whole)
+    sends = _capture_sends(monkeypatch)
+    count = run_feeds("feeds.json")
+    return count, sends
+
+
+@contextmanager
+def _whole(path, **kwargs):
+    yield [path]
+
+
+def test_a_post_goes_out_as_its_text_with_the_photos_that_follow_it(monkeypatch):
+    item = _post([
+        _text("Dans le cadre du programme."),
+        _text("Atelier 1", "heading"), _text("Un débat."), _photo("1.jpg"),
+        _text("Atelier 2", "heading"), _text("Un arbre."), _photo("2.jpg"), _photo("3.jpg"),
+        _text("À bientôt."),
+    ])
+
+    count, sends = _send_post(monkeypatch, item)
+
+    assert count == 1  # one item, however many messages it took
+    assert [(s["text"], s["attachments"]) for s in sends] == [
+        ("Journée pHARe\n\nDans le cadre du programme.\n\nAtelier 1\n\nUn débat.", ["/tmp/1.jpg"]),
+        ("Atelier 2\n\nUn arbre.", ["/tmp/2.jpg", "/tmp/3.jpg"]),
+        ("À bientôt.\n\nhttps://ent/blog/post/1", None),
+    ]
+    assert all(s["preview"] is None and s["voice_note"] is False for s in sends)
+
+
+def test_a_post_of_text_and_photos_at_its_end_is_one_message(monkeypatch):
+    item = _post([_text("Le 2 octobre."), _photo("1.jpg"), _photo("2.jpg")])
+    _count, sends = _send_post(monkeypatch, item)
+    assert [(s["text"], s["attachments"]) for s in sends] == [
+        ("Journée pHARe\n\nLe 2 octobre.\n\nhttps://ent/blog/post/1", ["/tmp/1.jpg", "/tmp/2.jpg"]),
+    ]
+
+
+def test_a_post_that_opens_with_a_photo_still_opens_with_its_title(monkeypatch):
+    item = _post([_photo("1.jpg"), _text("Voilà.")], link=None)
+    _count, sends = _send_post(monkeypatch, item)
+    assert [(s["text"], s["attachments"]) for s in sends] == [
+        ("Journée pHARe", ["/tmp/1.jpg"]),
+        ("Voilà.", None),
+    ]
+
+
+def test_a_posts_layout_is_its_own_whatever_the_feed_asks_for(monkeypatch):
+    cfg = FeedConfig(source="https://a", name="Blog", message_template="{title}!", link_preview=True)
+    _count, sends = _send_post(monkeypatch, _post([_text("Un."), _photo("1.jpg")]), cfg)
+    assert sends[0]["text"].startswith("Journée pHARe\n\nUn.")
+    assert sends[0]["preview"] is None
+
+
+def test_long_text_is_carried_over_not_cut(monkeypatch):
+    paragraphs = [f"Paragraphe {n} " + "é" * 400 for n in range(4)]  # ~815 bytes each
+    item = _post([*map(_text, paragraphs), _photo("1.jpg")], link=None)
+
+    _count, sends = _send_post(monkeypatch, item)
+
+    assert all(len(s["text"].encode()) <= run.MESSAGE_MAX_BYTES for s in sends)
+    assert "\n\n".join(s["text"] for s in sends) == "Journée pHARe\n\n" + "\n\n".join(paragraphs)
+    # The photo comes after the last of the text it follows.
+    assert [s["attachments"] for s in sends] == [None, ["/tmp/1.jpg"]]
+
+
+def test_one_paragraph_over_the_limit_is_cut_between_words():
+    text = " ".join(["mot"] * 900)  # 3599 bytes
+    pieces = run._chunks([text], run.MESSAGE_MAX_BYTES)
+    assert len(pieces) == 2
+    assert all(len(p.encode()) <= run.MESSAGE_MAX_BYTES for p in pieces)
+    assert " ".join(pieces) == text
+
+
+def test_more_photos_than_a_message_takes_go_on_in_the_next(monkeypatch):
+    photos = [_photo(f"{n}.jpg") for n in range(run.MAX_ATTACHMENTS + 3)]
+    _count, sends = _send_post(monkeypatch, _post([_text("La fête."), *photos], link=None))
+    assert [(s["text"], len(s["attachments"])) for s in sends] == [
+        ("Journée pHARe\n\nLa fête.", run.MAX_ATTACHMENTS),
+        ("Journée pHARe", 3),
+    ]
+
+
+def test_a_video_too_big_to_send_is_left_out_of_its_post(monkeypatch, capsys):
+    @contextmanager
+    def picky(path, **kwargs):
+        if path.endswith(".mp4"):
+            raise VideoTooBig("the video is too big to send")
+        yield [path]
+
+    cfg = FeedConfig(source="https://a", name="Blog")
+    item = _post([_text("Chant."), _photo("big.mp4", "video"), _photo("1.jpg")], link=None)
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    monkeypatch.setattr(run, "split_temp", picky)
+    sends = _capture_sends(monkeypatch)
+
+    assert run_feeds("feeds.json") == 1
+    assert [(s["text"], s["attachments"]) for s in sends] == [("Journée pHARe\n\nChant.", ["/tmp/1.jpg"])]
+    assert "a file left out" in capsys.readouterr().err
+
+
+def test_a_post_interrupted_part_way_is_finished_not_repeated(monkeypatch):
+    cfg = FeedConfig(source="https://a", name="Blog")
+    item = _post([_text("Un."), _photo("1.jpg"), _text("Deux."), _photo("2.jpg"), _text("Trois.")], link=None)
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    monkeypatch.setattr(run, "split_temp", _whole)
+    sent, fail = [], [True]
+
+    def flaky_send(text, recipient=None, attachments=None, voice_note=False, preview=None):
+        if text.startswith("Deux") and fail[0]:
+            fail[0] = False
+            raise SignalError("network went away")
+        sent.append(text)
+
+    monkeypatch.setattr(run, "send_msg", flaky_send)
+
+    assert run_feeds("feeds.json") == 0  # the feed failed part-way
+    assert run_feeds("feeds.json") == 1
+    assert sent == ["Journée pHARe\n\nUn.", "Deux.", "Trois."]
+
+
+def test_a_dry_run_describes_a_posts_messages(monkeypatch, capsys):
+    cfg = FeedConfig(source="https://a", name="Blog")
+    item = _post([_text("Un."), _photo("1.jpg"), _photo("2.jpg"), _text("Deux.")])
+    _patch_feeds(monkeypatch, [cfg], {"https://a": [item]})
+    sends = _capture_sends(monkeypatch)
+
+    assert run_feeds("feeds.json", dry_run=True) == 1
+
+    out = capsys.readouterr().out
+    assert sends == []
+    assert "Journée pHARe (2 message(s))" in out
+    assert "[2 file(s)]" in out

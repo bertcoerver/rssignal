@@ -10,7 +10,7 @@ nothing else, so rssignal makes no network request of its own outside Signal::
         shows/<Feed>/Season 2026/<…>.mp4    + <…>.json, <…>-thumb.jpg
         podcasts/<Feed>/feed.json           audio
         podcasts/<Feed>/<…>.mp3             + <…>.json, <…>.jpg
-        articles/<Feed>/<…>.json            text
+        articles/<Feed>/<…>.json            text; a post's photos beside it
 
 A feed in feeds.json reads the folders whose ``feed.json`` carries its
 :attr:`~rssignal.feeds.FeedConfig.library_name`, in whichever of the three
@@ -164,6 +164,9 @@ def _item(record: dict, path: str, feed_name: str) -> FeedItem | None:
     if record.get("media") and media is None:
         return None  # being pruned, or not all there
     image = _beside(folder, record.get("image"))
+    body = _body(folder, record.get("body"))
+    if body is None:
+        return None  # one of its files is missing: being pruned, or not all there
 
     fields = record.get("fields") if isinstance(record.get("fields"), dict) else {}
     extra = {
@@ -195,7 +198,32 @@ def _item(record: dict, path: str, feed_name: str) -> FeedItem | None:
         kind=str(record.get("kind") or "text"),
         media=media,
         image=image,
+        body=body,
     )
+
+
+def _body(folder: str, blocks: object) -> tuple[dict, ...] | None:
+    """A record's ``body`` with each file as a path, or ``None`` if one is missing.
+
+    A record without a body — nearly every record — has the empty one. A block
+    of a kind this rssignal does not know is passed over rather than refused:
+    the post still reads without it.
+    """
+    if not isinstance(blocks, list):
+        return ()
+    out: list[dict] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        kind = str(block.get("type") or "")
+        if isinstance(block.get("file"), str):
+            path = _beside(folder, block["file"])
+            if path is None:
+                return None
+            out.append({"type": kind, "path": path})
+        elif isinstance(block.get("text"), str) and block["text"].strip():
+            out.append({"type": kind, "text": block["text"].strip()})
+    return tuple(out)
 
 
 def _beside(folder: str, name: object) -> str | None:

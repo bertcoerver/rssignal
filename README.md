@@ -236,6 +236,11 @@ anything else as text. rssignal sends each accordingly:
 - **Video** goes out as the message's attachment: one message, with the title,
   the description and the link as its text.
 - **Text** goes out as the title, the description and the link.
+- **A post with pictures in it** — fetchit files a school blog's posts this way —
+  goes out as it reads: each stretch of text is a message, with the photos that
+  follow it attached, the title opening the first and the link closing the last.
+  Text too long for one message is carried over to the next, not cut. Its layout
+  is its own: `message_template` and link previews do not apply to it.
 
 A podcast that occasionally posts a written note gets that note as a readable
 message with a working link, instead of a linkless stub.
