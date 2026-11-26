@@ -267,7 +267,10 @@ watermark and all, so it doesn't block the items behind it.
 How many parts a video becomes depends on the quality fetchit downloaded it at.
 For a feed sent to Signal, give it `"quality": {"part_size_mb": 95}` in
 fetchit.json: the fewest 95 MB parts possible, then the best quality that fits
-in that many. Check what a run would send:
+in that many. A feed that is also watched on a media server can have both:
+`"quality": {"max_height": 1080, "small": {"part_size_mb": 95}}` downloads a
+second, smaller copy beside the sharp one, and where an item has one, that is
+the one sent. Check what a run would send:
 
 ```bash
 rssignal run --dry-run

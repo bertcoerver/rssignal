@@ -177,3 +177,37 @@ def test_an_item_without_a_body_has_the_empty_one(own_library):
     _record(blog, "2026-11-10 - Note", published="2026-11-10T17:56:07+00:00")
     (item,) = read_feed(FeedConfig(name="Blog")).items
     assert item.body == ()
+
+
+# --- a video in two sizes ---------------------------------------------------
+
+
+def _two_sizes(root, small="small/Karambolage/Season 2026/ep.mp4"):
+    season = _feed(root, "shows", "Karambolage") / "Season 2026"
+    season.mkdir()
+    (season / "ep.mp4").write_bytes(b"big")
+    _record(season, "ep", kind="video", media="ep.mp4", small=small)
+    return season
+
+
+def test_the_smaller_copy_is_the_one_to_send(own_library):
+    _two_sizes(own_library)
+    copy = own_library / "small" / "Karambolage" / "Season 2026" / "ep.mp4"
+    copy.parent.mkdir(parents=True)
+    copy.write_bytes(b"small")
+
+    (item,) = read_feed(FeedConfig(name="Karambolage")).items
+    assert item.media == str(copy.resolve())
+
+
+def test_without_its_smaller_copy_a_video_is_sent_as_it_is(own_library):
+    season = _two_sizes(own_library)  # named, but not there
+    (item,) = read_feed(FeedConfig(name="Karambolage")).items
+    assert item.media == str(season / "ep.mp4")
+
+
+def test_a_smaller_copy_is_only_ever_one_under_small(own_library):
+    season = _two_sizes(own_library, small="small/../secret.mp4")
+    (own_library / "secret.mp4").write_bytes(b"x")
+    (item,) = read_feed(FeedConfig(name="Karambolage")).items
+    assert item.media == str(season / "ep.mp4")

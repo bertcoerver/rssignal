@@ -11,7 +11,9 @@ size estimates. How many parts the file actually becomes is decided here, by
 :func:`split`, from the size of the file that landed — so an estimate that ran
 low costs one more part, never the episode. A feed downloaded at full quality
 for a media server works too; it just arrives in more parts, or not at all
-past :data:`MAX_PARTS`.
+past :data:`MAX_PARTS` — unless the feed has fetchit keep a smaller copy beside
+it (``quality.small``), in which case that copy is what is sent
+(see :mod:`rssignal.library`).
 
 Splitting is a stream copy, cut at equal lengths with ffmpeg's segment muxer.
 The picture is never re-encoded — on a Raspberry Pi that is the difference

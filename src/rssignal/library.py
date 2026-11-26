@@ -11,6 +11,7 @@ nothing else, so rssignal makes no network request of its own outside Signal::
         podcasts/<Feed>/feed.json           audio
         podcasts/<Feed>/<…>.mp3             + <…>.json, <…>.jpg
         articles/<Feed>/<…>.json            text; a post's photos beside it
+        small/<Feed>/Season 2026/<…>.mp4    a video's smaller copy, where it has one
 
 A feed in feeds.json reads the folders whose ``feed.json`` carries its
 :attr:`~rssignal.feeds.FeedConfig.library_name`, in whichever of the three
@@ -18,6 +19,13 @@ kinds it has items. An item exists when its record does: fetchit moves the
 record into place last and prunes it first, so a record is never seen before
 its media or after it — and one whose media is missing anyway is skipped
 rather than sent half.
+
+A video may come in two sizes: a feed with ``quality.small`` set in
+fetchit.json has, beside the copy for a media server, a smaller one under
+``small/`` that its record names (``small``, a path from the library's root).
+That is the one to send — it is there to fit an attachment — so it is the
+item's media wherever a record has one and the file is there, and the full
+copy otherwise.
 
 The library is read-only to rssignal. Nothing here writes to it, which is what
 lets the two run on their own schedules, against the same folder, without
@@ -41,6 +49,7 @@ DEFAULT_LIBRARY = "~/fetchit"
 FORMAT = 1
 
 KIND_DIRS = ("shows", "podcasts", "articles")
+SMALL_DIR = "small"
 FEED_FILE = "feed.json"
 RECORD_EXT = ".json"
 
@@ -93,7 +102,7 @@ def read_feed(cfg: FeedConfig, root: str | None = None) -> ParsedFeed:
             path = os.path.join(folder, os.path.basename(picture))
             image = path if os.path.isfile(path) else None
         for path, record in _records(folder):
-            item = _item(record, path, cfg.name)
+            item = _item(record, path, cfg.name, root)
             if item is not None:
                 items.append(item)
 
@@ -150,7 +159,7 @@ def _records(folder: str):
                 yield path, record
 
 
-def _item(record: dict, path: str, feed_name: str) -> FeedItem | None:
+def _item(record: dict, path: str, feed_name: str, root: str | None = None) -> FeedItem | None:
     """The :class:`FeedItem` a record describes, or ``None`` if it can't be sent yet."""
     version = record.get("format", 1)
     if not isinstance(version, int) or version > FORMAT:
@@ -163,6 +172,8 @@ def _item(record: dict, path: str, feed_name: str) -> FeedItem | None:
     media = _beside(folder, record.get("media"))
     if record.get("media") and media is None:
         return None  # being pruned, or not all there
+    if media is not None and root is not None:
+        media = _small(root, record.get("small")) or media
     image = _beside(folder, record.get("image"))
     body = _body(folder, record.get("body"))
     if body is None:
@@ -224,6 +235,17 @@ def _body(folder: str, blocks: object) -> tuple[dict, ...] | None:
         elif isinstance(block.get("text"), str) and block["text"].strip():
             out.append({"type": kind, "text": block["text"].strip()})
     return tuple(out)
+
+
+def _small(root: str, named: object) -> str | None:
+    """The smaller copy a record names, if it names one under ``small/`` and it is there."""
+    if not isinstance(named, str) or not named:
+        return None
+    base = os.path.realpath(os.path.join(root, SMALL_DIR))
+    path = os.path.realpath(os.path.join(root, *named.split("/")))
+    if not path.startswith(base + os.sep) or not os.path.isfile(path):
+        return None
+    return path
 
 
 def _beside(folder: str, name: object) -> str | None:
