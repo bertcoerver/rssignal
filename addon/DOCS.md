@@ -204,12 +204,27 @@ Signal, **turn off the Apple Shortcut automation on the Mac.** Two hosts sending
 from one account will both send, and will race each other writing the group
 descriptions that hold the watermarks.
 
+## Where rssignal can send
+
+Only to two kinds of place, whoever asks — a feed, the panel, the send API or
+Home Assistant's Signal Messenger integration:
+
+- a **group the account is in**, and
+- a **number listed in `members`** (or the account's own).
+
+Anything else is refused, with an error naming it, before a message leaves; a
+list of recipients with one such number in it sends to none of them. Likewise
+nobody outside `members` is ever added to a group. So a mistyped number in an
+automation, or something on Home Assistant's network holding the API token,
+cannot make this account message a stranger. With `members` empty, rssignal
+sends to its groups and nowhere else.
+
 ## Configuration
 
 | Option | Default | What it does |
 |---|---|---|
 | `account` | — | E.164 number to send from. Required. |
-| `members` | none | Numbers added to each group rssignal creates. For an account of rssignal's own; see 3b. |
+| `members` | none | Numbers added to each group rssignal creates, and the only numbers it will message. See 3b and "Where rssignal can send". |
 | `link_mode` | `false` | Link to Signal instead of running. See above. |
 | `on_start` | `wait` | `wait`, `dry-run` or `run` — what to do at startup, before the schedule takes over. |
 | `schedule` | `01:30`, `06:30`, `15:00` | Local times to run at. |

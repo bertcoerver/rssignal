@@ -38,6 +38,7 @@ dev = [
 
 [tool.pytest.ini_options]
 addopts = "-n auto"
+markers = ["guarded: run with the real checks on where rssignal may send"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

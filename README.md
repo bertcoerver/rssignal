@@ -87,6 +87,11 @@ this repository to the Add-on Store and install rssignal from there — see
    after you can take the account. signal-cli's data directory is then the only
    copy of the account, so back it up.
 
+   **Where it can send.** Only to groups the account is in, and to numbers in
+   `RSSIGNAL_MEMBERS` (or the account itself). `send`, `run --to`, the send API
+   and `RSSIGNAL_RECIPIENT` are all held to that, and nobody outside
+   `RSSIGNAL_MEMBERS` is ever added to a group.
+
 3. Check everything is wired up:
    ```bash
    rssignal doctor

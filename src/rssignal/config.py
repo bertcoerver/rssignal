@@ -91,6 +91,9 @@ def get_members(account: str = "") -> tuple[str, ...]:
     Apart from :func:`get_config` so that asking who to add to a group does not
     also demand an account: the call that needs one says so itself.
     """
+    # Read here too, not only in get_config: this decides who may be messaged,
+    # and must not come out empty because nothing had opened the file yet.
+    _load_dotenv_once(".env")
     members: list[str] = []
     for number in re.split(r"[,\s]+", os.environ.get("RSSIGNAL_MEMBERS", "").strip()):
         if not number or number == account or number in members:

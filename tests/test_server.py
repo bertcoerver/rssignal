@@ -213,6 +213,7 @@ def test_the_gui_page_and_status(running):
     assert status == 200
     assert info["account"] == "+31600000000" and info["linked"] is True
     assert info["schedule"] == ["06:30"] and info["next_run"]
+    assert info["members"] == []
 
 
 def test_accounts_come_from_a_running_daemon_not_a_blocking_list_accounts(monkeypatch, tmp_path):
@@ -399,3 +400,24 @@ def test_registering_is_part_of_the_gui_not_the_send_api(running):
     base, _ = start(gui_from="10.9.9.9", api_from="127.0.0.1")
     assert _call(base, "/api/register", {})[0] == 403
     assert _call(base, "/api/verify", {"code": "123456"})[0] == 403
+
+
+@pytest.mark.guarded
+def test_the_send_api_cannot_reach_a_number_that_is_not_a_member(running, monkeypatch):
+    start, sent = running
+    monkeypatch.setenv("RSSIGNAL_MEMBERS", "+31611111111")
+    monkeypatch.setattr(server.signal_cli, "list_groups", lambda *, account=None: list(GROUPS))
+    base, service = start()
+
+    status, reply = _call(base, "/v2/send", {"message": "hi", "recipients": ["Laundry", "+31699999999"]})
+    assert status == 400 and "+31699999999 is not in RSSIGNAL_MEMBERS" in reply["error"]
+    # Not even to the group that came before the stranger in the list.
+    assert sent == []
+    assert service.activity[-1]["kind"] == "refused"
+
+    assert _call(base, "/api/send", {"message": "hi", "to": ["Laundry", "+31611111111"]})[0] == 201
+    assert [s["recipient"] for s in sent] == ["group:AAAA1111+bbbb/cc=", "+31611111111"]
+
+    # A group id nobody listed is no way round it.
+    assert _call(base, "/api/send", {"message": "hi", "to": "group:NOT-MINE="})[0] == 400
+    assert len(sent) == 2

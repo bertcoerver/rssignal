@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from PIL import Image, UnidentifiedImageError
 
 from . import timing
-from .config import ConfigError, get_config
+from .config import ConfigError, get_config, get_members
 from .watermark import compose_description, read_watermark, shorten
 
 # Signal silently drops a group avatar that is too large: the upload is accepted,
@@ -226,6 +226,70 @@ class LinkPreview:
             raise ValueError("A link preview needs a url.")
         if not self.title:
             raise ValueError("A link preview needs a title; signal-cli requires it.")
+
+
+class RecipientNotAllowed(SignalError):
+    """A message, or a group invitation, was headed somewhere rssignal may not go."""
+
+
+# How long a group listing vouches for a group. Long enough that a run sending
+# a hundred messages lists once; short enough that a group this account has
+# left stops being somewhere to send within minutes.
+_MY_GROUPS_TTL = 300
+_my_groups: dict[str, tuple[float, set[str]]] = {}
+
+
+def _group_is_mine(group_id: str, account: str) -> bool:
+    """Whether ``account`` is, as far as signal-cli knows, in the group."""
+    cached = _my_groups.get(account)
+    if cached and time.time() - cached[0] < _MY_GROUPS_TTL and group_id in cached[1]:
+        return True
+    # A miss is always asked again: the group may be minutes old.
+    ids = {g.id for g in list_groups(account=account) if g.active and not g.blocked}
+    _my_groups[account] = (time.time(), ids)
+    return group_id in ids
+
+
+def check_recipient(recipient: str, account: str) -> None:
+    """Raise :class:`RecipientNotAllowed` unless rssignal may send to ``recipient``.
+
+    The whole of what rssignal may reach, whoever is asking — a feed, the GUI,
+    the send API, the command line:
+
+    * a **group this account is in**, and
+    * a **number in** ``RSSIGNAL_MEMBERS``, or the account itself.
+
+    An account that can message any number is one mistyped digit, or one
+    over-trusted caller of the send API, away from messaging a stranger. This
+    is checked in :func:`send_msg`, the one place every message passes, so
+    there is no way to send that goes around it. It does not bind signal-cli
+    itself, which whoever controls the machine can always run directly.
+    """
+    if recipient.startswith(GROUP_PREFIX):
+        if not _group_is_mine(recipient[len(GROUP_PREFIX):], account):
+            raise RecipientNotAllowed(
+                f"{recipient} is not a group {account} is in. rssignal only sends "
+                "to its own groups — `rssignal groups` lists them."
+            )
+    elif recipient.startswith("+"):
+        if recipient != account and recipient not in get_members(account):
+            raise RecipientNotAllowed(
+                f"{recipient} is not in RSSIGNAL_MEMBERS (the add-on's `members` "
+                "option). rssignal only sends to its own groups and to those "
+                "numbers; add this one there if it should get messages."
+            )
+    else:
+        raise ValueError(_bad_recipient(recipient))
+
+
+def _check_members(members: list[str], account: str) -> None:
+    """Raise unless every number about to be added to a group is a configured one."""
+    strangers = [m for m in members if m not in get_members(account)]
+    if strangers:
+        raise RecipientNotAllowed(
+            f"{', '.join(strangers)} cannot be added to a group: only the numbers in "
+            "RSSIGNAL_MEMBERS (the add-on's `members` option) ever are."
+        )
 
 
 def find_signal_cli() -> str:
@@ -878,6 +942,10 @@ def create_group(
             file=sys.stderr,
         )
 
+    # Known to be this account's from the moment it exists, without a listing.
+    stamp, mine = _my_groups.get(account, (time.time(), set()))
+    _my_groups[account] = (stamp, mine | {group_id})
+
     if members:
         try:
             update_group(group_id, members=members, account=account, timeout=timeout)
@@ -1039,6 +1107,8 @@ def update_group(
     members = list(members)
     if description is None and avatar is None and expiration is None and not members:
         return
+    if members:
+        _check_members(members, account or get_config().account)
 
     if _daemon is not None:
         try:
@@ -1314,6 +1384,8 @@ def send_msg(
             "No recipient given and RSSIGNAL_RECIPIENT is not set. Pass "
             "`recipient=` or set a default in your environment / .env file."
         )
+
+    check_recipient(recipient, account)
 
     body = clip_body(msg, preview.url if preview else None)
 

@@ -22,6 +22,22 @@ from rssignal.errorlog import DEFAULT_LOG_PATH
 
 
 @pytest.fixture(autouse=True)
+def open_door(request, monkeypatch):
+    """Let a test send anywhere, unless it is marked ``guarded``.
+
+    rssignal refuses to send to a number outside ``RSSIGNAL_MEMBERS`` or to a
+    group the account is not in, which takes a group listing to know. Nearly
+    every test is about something else and would have to stage both; the tests
+    that are about the refusal ask for the real thing with the marker.
+    """
+    if "guarded" in request.keywords:
+        monkeypatch.setattr(signal_cli, "_my_groups", {})
+        return
+    monkeypatch.setattr(signal_cli, "check_recipient", lambda recipient, account: None)
+    monkeypatch.setattr(signal_cli, "_check_members", lambda members, account: None)
+
+
+@pytest.fixture(autouse=True)
 def own_library(tmp_path, monkeypatch):
     """Point every test at a library of its own, empty until the test fills it.
 

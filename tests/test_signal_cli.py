@@ -1402,3 +1402,99 @@ def test_clip_drops_a_legacy_pace_marker_and_keeps_the_watermark():
 
     assert LEGACY_PACE not in kept
     assert kept.endswith(WATERMARK)
+
+
+# --- where rssignal may send ------------------------------------------------
+
+ME = "+31600000000"
+MINE = SignalGroup(id="MINE=", name="Feed")
+LEFT = SignalGroup(id="LEFT=", name="Old", active=False)
+
+
+@pytest.fixture
+def guarded(have_binary, monkeypatch):
+    """One configured member, one group the account is in, and a record of runs."""
+    monkeypatch.setenv("RSSIGNAL_MEMBERS", "+31611111111")
+    monkeypatch.setattr(signal_cli, "list_groups", lambda *, account=None: [MINE, LEFT])
+    runs = []
+
+    def fake_run(argv, **k):
+        runs.append(argv)
+        return _completed()
+
+    monkeypatch.setattr(signal_cli.subprocess, "run", fake_run)
+    return runs
+
+
+@pytest.mark.guarded
+@pytest.mark.parametrize("recipient", ["+31611111111", ME, "group:MINE="])
+def test_send_msg_reaches_members_itself_and_its_own_groups(guarded, recipient):
+    send_msg("hi", recipient=recipient, account=ME)
+    assert len(guarded) == 1
+
+
+@pytest.mark.guarded
+@pytest.mark.parametrize("recipient", ["+31699999999", "group:LEFT=", "group:SOMEONE-ELSES="])
+def test_send_msg_refuses_everyone_else_before_running_anything(guarded, recipient):
+    with pytest.raises(signal_cli.RecipientNotAllowed):
+        send_msg("hi", recipient=recipient, account=ME)
+    assert guarded == []
+
+
+@pytest.mark.guarded
+def test_send_msg_refuses_a_default_recipient_that_is_not_a_member(guarded, monkeypatch):
+    monkeypatch.setenv("RSSIGNAL_ACCOUNT", ME)
+    monkeypatch.setenv("RSSIGNAL_RECIPIENT", "+31699999999")
+    with pytest.raises(signal_cli.RecipientNotAllowed):
+        send_msg("hi")
+    assert guarded == []
+
+
+@pytest.mark.guarded
+def test_with_no_members_only_groups_can_be_sent_to(guarded, monkeypatch):
+    monkeypatch.delenv("RSSIGNAL_MEMBERS")
+    with pytest.raises(signal_cli.RecipientNotAllowed):
+        send_msg("hi", recipient="+31611111111", account=ME)
+    send_msg("hi", recipient="group:MINE=", account=ME)
+    assert len(guarded) == 1
+
+
+@pytest.mark.guarded
+def test_a_group_rssignal_just_created_can_be_sent_to_without_a_listing(guarded, monkeypatch):
+    listings = [[MINE]]  # the one create_group takes before creating
+    monkeypatch.setattr(signal_cli, "list_groups", lambda *, account=None: listings.pop(0))
+    guarded_run = signal_cli.subprocess.run
+    monkeypatch.setattr(
+        signal_cli.subprocess,
+        "run",
+        lambda argv, **k: _completed(stdout='{"groupId": "NEW="}') if "--name" in argv else guarded_run(argv, **k),
+    )
+
+    group = create_group("Fresh", account=ME)
+    send_msg("hi", recipient=group.recipient, account=ME)
+
+    assert listings == []
+
+
+@pytest.mark.guarded
+def test_nobody_outside_members_can_be_added_to_a_group(guarded):
+    with pytest.raises(signal_cli.RecipientNotAllowed, match=r"\+31699999999"):
+        update_group("MINE=", members=["+31611111111", "+31699999999"], account=ME)
+    assert guarded == []
+
+    update_group("MINE=", members=["+31611111111"], account=ME)
+    assert "--member" in guarded[0]
+
+
+@pytest.mark.guarded
+def test_create_group_cannot_add_a_stranger_either(guarded, monkeypatch, capsys):
+    monkeypatch.setattr(
+        signal_cli.subprocess,
+        "run",
+        lambda argv, **k: guarded.append(argv) or _completed(stdout='{"groupId": "NEW="}'),
+    )
+
+    create_group("Fresh", members=("+31699999999",), account=ME)
+
+    assert not any("--member" in argv for argv in guarded)
+    assert "cannot be added" in capsys.readouterr().err

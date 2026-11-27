@@ -204,6 +204,7 @@ async function loadStatus() {
   const setup = `<button class="small" onclick="toggleSetup()">${showSetup ? "hide setup" : "set up"}</button>`;
   const rows = [
     ["Account", `${esc(s.account || "—")} · ${linked} ${setup}`],
+    ["Members", (s.members || []).length ? `${esc(s.members.join(", "))} <span class="muted">— in every new group; the only numbers it can message</span>` : `<span class="muted">none — it can only send to its own groups</span>`],
     ["Signal", s.daemon ? `<span class="ok">connected</span>` : `<span class="muted">one call at a time</span>`],
     ["Library", `${esc(s.library)}${s.library_exists ? "" : ` <span class="bad">(missing)</span>`}`],
     ["Schedule", s.schedule.length ? esc(s.schedule.join(", ")) : `<span class="muted">none — only when asked</span>`],
@@ -226,7 +227,7 @@ async function loadStatus() {
     url: "http://${s.hostname}:8099"
     number: "${s.account || "+31600000000"}"
     recipients:
-      - "Laundry"          # a group's name, a number, or group:<id>`;
+      - "Laundry"          # a group's name, or a number from \`members\``;
   if (s.running && !currentJob) watchJob(s.running.id);
 }
 

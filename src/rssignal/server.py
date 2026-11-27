@@ -62,7 +62,7 @@ from importlib import resources
 from urllib.parse import parse_qs, urlsplit
 
 from . import __version__, signal_cli
-from .config import ConfigError, get_config
+from .config import ConfigError, get_config, get_members
 from .errorlog import log_exception, log_line, log_path
 from .feeds import (
     FeedError,
@@ -569,6 +569,10 @@ class Service:
             linked = bool(account) and not self._registering() and account in self.accounts()
         except SignalError as exc:
             linked, problem = False, str(exc)
+        try:
+            members = list(get_members(account or ""))
+        except ConfigError as exc:
+            members, problem = [], problem or str(exc)
         daemon = signal_cli._daemon
         busy = self.running()
         return {
@@ -588,6 +592,7 @@ class Service:
             "api_token": bool(self.api_token),
             "link": dict(self._link),
             "captcha_url": signal_cli.CAPTCHA_URL,
+            "members": members,
         }
 
     def feeds(self, *, refresh: bool = False) -> list[dict]:
@@ -652,6 +657,15 @@ class Service:
             if not all(_resolvable(t, groups) for t in targets):
                 groups = self.groups(refresh=True)
         recipients = [resolve_recipient(t, groups) for t in targets]
+        # All of them before any of them: a list with one stranger in it sends
+        # to nobody, rather than to everyone ahead of the stranger.
+        try:
+            account = get_config().account
+            for recipient in recipients:
+                signal_cli.check_recipient(recipient, account)
+        except signal_cli.RecipientNotAllowed as exc:
+            self.note("refused", str(exc), ok=False, via=via)
+            raise SendRefused(str(exc)) from exc
 
         with tempfile.TemporaryDirectory(prefix="rssignal-send-") as folder:
             paths = []
