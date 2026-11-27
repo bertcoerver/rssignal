@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.7
+
+- Send each feed's latest item again, from the panel or with run --latest
+
 ## 0.10.6
 
 - Create a group for notifications from the panel
