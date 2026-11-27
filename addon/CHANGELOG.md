@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.1
+
+- Send only to its own groups and to configured members
+
 ## 0.10.0
 
 - Ask for a group's members without demanding an account
