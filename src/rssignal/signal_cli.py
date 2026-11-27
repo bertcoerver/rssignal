@@ -561,8 +561,11 @@ class _JsonRpc:
             raise DaemonGone(
                 f"`signal-cli {method}` got no answer — signal-cli stopped."
             )
+        limited = _note_rate_limit(message)
         if "error" in message:
             error = message["error"] or {}
+            if limited:
+                raise RateLimited(limited)
             raise SignalSendError(
                 f"`signal-cli {method}` failed: "
                 f"{error.get('message') or error!r}"
@@ -1244,6 +1247,98 @@ def _one_shot(account: str, args: list[str], *, what: str, timeout: float = 120)
             stderr=stderr,
         )
     return result
+
+
+# Where Signal's "prove you are a person" captcha for a held-back sender lives.
+# Not the registration one: a token from either page is refused by the other.
+CHALLENGE_URL = "https://signalcaptchas.org/challenge/generate.html"
+
+# The last time Signal refused to deliver to someone until a captcha is solved,
+# or None. A new account writing to people who have never written to it gets
+# this at once, and a send to a *group* still exits 0 with it — the group
+# accepted the message, one member's delivery did not — so it is remembered
+# here for whoever can show it to a person.
+rate_limit: dict | None = None
+
+
+class RateLimited(SignalSendError):
+    """Signal is holding this account's messages back until a captcha is solved."""
+
+    def __init__(self, limit: dict) -> None:
+        self.limit = limit
+        wait = limit.get("retry_after")
+        hours = f"about {max(1, round(wait / 3600))} hour(s)" if wait else "a while"
+        if limit.get("token"):
+            how = (
+                f"Solve the captcha at {CHALLENGE_URL} and hand it over, in the "
+                f"panel or with `rssignal challenge` - or wait {hours}."
+            )
+        else:
+            how = f"There is no captcha to solve: wait {hours}."
+        super().__init__(
+            "Signal is holding messages from this account back (rate limiting), as "
+            "it does for a new account writing to someone who has never written "
+            "to it. " + how
+        )
+
+
+def _note_rate_limit(message) -> dict | None:
+    """Remember a rate-limit result anywhere in a jsonRpc answer, and return it."""
+    global rate_limit
+    found = None
+    stack = [message]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            if item.get("type") == "RATE_LIMIT_FAILURE":
+                address = item.get("recipientAddress") or {}
+                found = {
+                    "token": item.get("token") or None,
+                    "retry_after": item.get("retryAfterSeconds") or None,
+                    "to": address.get("number") if isinstance(address, dict) else None,
+                    "at": time.time(),
+                }
+                if found["token"]:
+                    break
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    if found:
+        rate_limit = found
+    return found
+
+
+def submit_challenge(captcha: str, *, account: str | None = None, challenge: str | None = None) -> None:
+    """Hand Signal a solved captcha, lifting the hold on this account's messages.
+
+    ``challenge`` is the token Signal named when it refused, remembered in
+    :data:`rate_limit`; ``captcha`` is the address of the "Open Signal" link on
+    :data:`CHALLENGE_URL`. Signal refuses a captcha solved from another network
+    than the one signal-cli is on.
+    """
+    global rate_limit
+    challenge = challenge or (rate_limit or {}).get("token")
+    if not challenge:
+        raise ValueError("Signal has not asked for a captcha: there is no challenge to answer.")
+    token = (captcha or "").strip()
+    if token.startswith(_CAPTCHA_SCHEME):
+        token = token[len(_CAPTCHA_SCHEME):]
+    if not token:
+        raise ValueError(f"Paste the address of the \"Open Signal\" link from {CHALLENGE_URL}.")
+    done = False
+    if _daemon is not None:
+        try:
+            _daemon.request("submitRateLimitChallenge", {"challenge": challenge, "captcha": token}, timeout=60)
+            done = True
+        except DaemonGone as exc:
+            _retire_daemon(exc)
+    if not done:
+        _one_shot(
+            account or get_config().account,
+            ["submitRateLimitChallenge", "--challenge", challenge, "--captcha", token],
+            what="submitRateLimitChallenge",
+        )
+    rate_limit = None
 
 
 def register(account: str, *, captcha: str | None = None, voice: bool = False) -> None:

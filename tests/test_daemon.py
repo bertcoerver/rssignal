@@ -563,3 +563,57 @@ def test_without_a_daemon_creating_a_group_is_unchanged(have_binary, monkeypatch
 
     assert group.id == "OLD="
     assert "--name" in argv_used[0]
+
+
+# --- Signal holding a new account's messages back ---------------------------
+
+_LIMITED = {"type": "RATE_LIMIT_FAILURE", "recipientAddress": {"number": "+31611111111"}, "token": "chal-1", "retryAfterSeconds": 86400}
+
+
+def test_a_rate_limited_answer_is_remembered_and_explained(monkeypatch):
+    monkeypatch.setattr(signal_cli, "rate_limit", None)
+    refused = {"error": {"code": -5, "message": "Failed to send message due to rate limiting", "data": {"response": {"results": [_LIMITED]}}}}
+
+    assert signal_cli._note_rate_limit(refused)["token"] == "chal-1"
+    assert signal_cli.rate_limit["to"] == "+31611111111"
+    message = str(signal_cli.RateLimited(signal_cli.rate_limit))
+    assert "signalcaptchas.org/challenge" in message and "24 hour(s)" in message
+
+
+def test_a_group_send_that_one_member_never_got_is_remembered_too(monkeypatch):
+    # signal-cli answers a group send with a result, not an error, when the
+    # group took the message and a member's delivery was refused.
+    monkeypatch.setattr(signal_cli, "rate_limit", None)
+    accepted = {"result": {"timestamp": 1, "results": [{"type": "SUCCESS"}, _LIMITED]}}
+
+    signal_cli._note_rate_limit(accepted)
+
+    assert signal_cli.rate_limit["token"] == "chal-1"
+
+
+def test_an_ordinary_answer_leaves_nothing_behind(monkeypatch):
+    monkeypatch.setattr(signal_cli, "rate_limit", None)
+    assert signal_cli._note_rate_limit({"result": {"timestamp": 1, "results": [{"type": "SUCCESS"}]}}) is None
+    assert signal_cli.rate_limit is None
+
+
+def test_submitting_a_captcha_answers_the_remembered_challenge(monkeypatch):
+    monkeypatch.setattr(signal_cli.shutil, "which", lambda name: "/bin/signal-cli")
+    monkeypatch.setattr(signal_cli, "_daemon", None)
+    monkeypatch.setattr(signal_cli, "rate_limit", {"token": "chal-1", "at": 0.0})
+    runs = []
+    monkeypatch.setattr(
+        signal_cli.subprocess, "run",
+        lambda argv, **k: runs.append(argv) or __import__("types").SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+
+    signal_cli.submit_challenge("signalcaptcha://signal-hcaptcha.abc", account="+31600000000")
+
+    assert runs[0][3:] == ["submitRateLimitChallenge", "--challenge", "chal-1", "--captcha", "signal-hcaptcha.abc"]
+    assert signal_cli.rate_limit is None
+
+
+def test_there_is_nothing_to_submit_without_a_challenge(monkeypatch):
+    monkeypatch.setattr(signal_cli, "rate_limit", None)
+    with pytest.raises(ValueError, match="no challenge"):
+        signal_cli.submit_challenge("tok", account="+31600000000")

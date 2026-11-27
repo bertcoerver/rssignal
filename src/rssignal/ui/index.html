@@ -69,6 +69,21 @@
   </header>
 
   <div class="grid">
+    <section id="limit-card" class="hidden wide">
+      <h2>Signal is holding messages back</h2>
+      <p id="limit-text"></p>
+      <div id="limit-form">
+        <ol>
+          <li>Open <a id="challenge-link" href="#" target="_blank" rel="noopener">Signal's captcha page</a>
+            and solve it — on the same network as this machine, or Signal refuses it.</li>
+          <li>Copy the address of the <b>Open Signal</b> link it ends with, and paste it here.</li>
+        </ol>
+        <input id="limit-captcha" placeholder="signalcaptcha://…" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <div class="actions" style="margin-top:8px"><button class="primary" id="limit-btn">Hand it to Signal</button></div>
+      </div>
+      <p id="limit-result"></p>
+    </section>
+
     <section id="link-card" class="hidden wide">
       <h2>Connect to Signal</h2>
       <p id="link-text"><b>Link to your own account.</b> rssignal becomes a secondary device,
@@ -214,6 +229,17 @@ async function loadStatus() {
   if (s.problem) rows.push(["Problem", `<span class="bad">${esc(s.problem)}</span>`]);
   $("status").innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
 
+  const limit = s.rate_limit;
+  $("limit-card").classList.toggle("hidden", !limit);
+  if (limit) {
+    $("challenge-link").href = s.challenge_url;
+    $("limit-form").classList.toggle("hidden", !limit.captcha);
+    $("limit-text").innerHTML = `Since ${esc(when(limit.since))} Signal refuses to deliver this account's messages`
+      + (limit.to ? ` to <b>${esc(limit.to)}</b>` : "")
+      + `. It does that to a new account writing to someone who has never written to it. Group messages still count as sent, and do not arrive. `
+      + (limit.captcha ? "A captcha lifts it" + (limit.until ? `; otherwise it ends around ${esc(when(limit.until))}.` : ".")
+                       : (limit.until ? `There is no captcha for this one: it ends around ${esc(when(limit.until))}.` : "There is no captcha for this one: it ends by itself."));
+  }
   const link = s.link || {state: "idle"};
   const showLink = showSetup || !s.linked || !["idle", "linked"].includes(link.state) || (link.warnings || []).length > 0;
   $("link-card").classList.toggle("hidden", !showLink);
@@ -373,6 +399,16 @@ $("send-form").addEventListener("submit", async (event) => {
 $("link-btn").addEventListener("click", async () => {
   $("link-btn").disabled = true;
   try { renderLink(await api("api/link", {method: "POST", body: {}})); } catch (e) { renderLink({state: "failed", error: e.message}); }
+});
+$("limit-btn").addEventListener("click", async () => {
+  $("limit-btn").disabled = true;
+  $("limit-result").textContent = "Asking Signal…";
+  try {
+    await api("api/challenge", {method: "POST", body: {captcha: $("limit-captcha").value.trim()}});
+    $("limit-captcha").value = ""; $("limit-result").textContent = "";
+    loadStatus(); loadActivity();
+  } catch (e) { $("limit-result").innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
+  $("limit-btn").disabled = false;
 });
 $("reg-btn").addEventListener("click", () => register(false));
 $("reg-voice-btn").addEventListener("click", () => register(true));

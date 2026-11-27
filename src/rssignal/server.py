@@ -593,6 +593,8 @@ class Service:
             "link": dict(self._link),
             "captcha_url": signal_cli.CAPTCHA_URL,
             "members": members,
+            "rate_limit": self._rate_limit(),
+            "challenge_url": signal_cli.CHALLENGE_URL,
         }
 
     def feeds(self, *, refresh: bool = False) -> list[dict]:
@@ -715,6 +717,25 @@ class Service:
         threading.Thread(target=wait, daemon=True, name="rssignal-link").start()
         return dict(self._link)
 
+
+    def _rate_limit(self) -> dict | None:
+        """What Signal is holding back, for the GUI — without the token itself."""
+        limit = signal_cli.rate_limit
+        if not limit:
+            return None
+        wait = limit.get("retry_after")
+        if wait and time.time() > limit["at"] + wait:
+            signal_cli.rate_limit = None
+            return None
+        return {"captcha": bool(limit.get("token")), "to": limit.get("to"), "since": _iso(limit["at"]),
+                "until": _iso(limit["at"] + wait) if wait else None}
+
+    def challenge(self, captcha: str) -> dict:
+        """Answer Signal's captcha, so held-back messages go out again."""
+        signal_cli.submit_challenge(captcha)
+        self.note("link", "Signal accepted the captcha; messages are no longer held back")
+        log_line("serve: rate-limit captcha accepted")
+        return {"ok": True}
 
     # registering: an account of rssignal's own, instead of a link to yours
 
@@ -950,6 +971,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.ACCEPTED, svc.refresh_images(dry_run=bool(body.get("dry_run"))).view())
             elif path == "/api/link":
                 self._json(HTTPStatus.OK, svc.link())
+            elif path == "/api/challenge":
+                self._json(HTTPStatus.OK, svc.challenge(str(body.get("captcha") or "")))
             elif path == "/api/register":
                 self._json(HTTPStatus.OK, svc.register(captcha=str(body.get("captcha") or ""), voice=bool(body.get("voice"))))
             elif path == "/api/verify":

@@ -421,3 +421,25 @@ def test_the_send_api_cannot_reach_a_number_that_is_not_a_member(running, monkey
     # A group id nobody listed is no way round it.
     assert _call(base, "/api/send", {"message": "hi", "to": "group:NOT-MINE="})[0] == 400
     assert len(sent) == 2
+
+
+def test_the_gui_shows_a_rate_limit_and_takes_the_captcha(running, monkeypatch):
+    start, _ = running
+    monkeypatch.setattr(server.signal_cli, "rate_limit", {"token": "chal-1", "retry_after": 86400, "to": "+31611111111", "at": time.time()})
+    submitted = []
+
+    def fake_submit(captcha):
+        submitted.append(captcha)
+        server.signal_cli.rate_limit = None
+
+    monkeypatch.setattr(server.signal_cli, "submit_challenge", fake_submit)
+    base, _ = start()
+
+    shown = _call(base, "/api/status")[1]["rate_limit"]
+    assert shown["captcha"] is True and shown["to"] == "+31611111111" and shown["until"]
+    # The token stays on the server: the page has no use for it.
+    assert "token" not in shown
+
+    assert _call(base, "/api/challenge", {"captcha": "signalcaptcha://x"})[0] == 200
+    assert submitted == ["signalcaptcha://x"]
+    assert _call(base, "/api/status")[1]["rate_limit"] is None

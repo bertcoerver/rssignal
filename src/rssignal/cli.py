@@ -143,6 +143,12 @@ def _cmd_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_challenge(args: argparse.Namespace) -> int:
+    signal_cli.submit_challenge(args.captcha, challenge=args.challenge)
+    print("Signal accepted the captcha.")
+    return 0
+
+
 def _cmd_send(args: argparse.Namespace) -> int:
     send_msg(args.message, recipient=args.to)
     print("Message sent.")
@@ -367,6 +373,13 @@ def _build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--pin", help="registration lock PIN: the number's existing one, or one to set")
     verify.add_argument("--name", default="rssignal", help="the name messages come from (default: rssignal)")
     verify.set_defaults(func=_cmd_verify)
+
+    challenge = subparsers.add_parser(
+        "challenge", help="answer the captcha Signal wants before it delivers this account's messages"
+    )
+    challenge.add_argument("challenge", help="the challenge token from the failed send")
+    challenge.add_argument("captcha", help=f"the token from {signal_cli.CHALLENGE_URL}")
+    challenge.set_defaults(func=_cmd_challenge)
 
     send = subparsers.add_parser("send", help="send a text message")
     send.add_argument("message", help="the message text to send")
