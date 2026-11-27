@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.1
+
+- Go back to sending the one file a video has
+
 ## 0.9.0
 
 - Send a video's smaller copy where fetchit keeps one
