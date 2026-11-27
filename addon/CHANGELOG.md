@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.10.0
+
+- Ask for a group's members without demanding an account
+- Register a number as rssignal's own Signal account
+
 ## 0.9.1
 
 - Go back to sending the one file a video has
