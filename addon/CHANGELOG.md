@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.3
+
+- Show when Signal holds messages back, and take the captcha that lifts it
+
 ## 0.10.2
 
 - Add members missing from a feed's group at the start of each run
