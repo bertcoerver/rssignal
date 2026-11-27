@@ -378,6 +378,14 @@ def test_run_to_is_threaded_through(monkeypatch):
     }
 
 
+def test_run_latest_is_threaded_through(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(cli, "run_feeds", lambda config, **kwargs: captured.update(kwargs) or 0)
+
+    assert cli.main(["run", "--latest"]) == 0
+    assert captured["latest"] is True
+
+
 def test_run_since_is_parsed_and_threaded_through(monkeypatch):
     captured = _capture_run_feeds(monkeypatch)
 

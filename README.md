@@ -740,6 +740,13 @@ Worth knowing:
 
   The marker still ends up on the newest item actually sent, so a replay leaves it
   correct rather than rewound.
+- **`--latest` sends each feed's newest item again**, sent before or not — for
+  members who joined a group after everything had gone out. The panel has it as
+  **Send each feed's latest item again**.
+
+  ```bash
+  rssignal run --latest
+  ```
 - **A send that fails part-way is safe.** Items go out oldest first, each marked
   just before it is sent. If that send then fails, the previous description is
   put back, so the item is retried on the next run along with everything queued

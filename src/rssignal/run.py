@@ -221,6 +221,7 @@ def run_feeds(
     dry_run: bool = False,
     to: str | None = None,
     since: datetime | None = None,
+    latest: bool = False,
 ) -> int:
     """Process every feed in ``config_path`` and send whatever is new.
 
@@ -228,7 +229,9 @@ def run_feeds(
     first send if it doesn't exist. ``to`` overrides that for every feed at once
     and touches no group — the safe way to try a real send against your own
     number. ``since`` overrides every stored watermark, for replaying a stretch
-    of a feed by hand.
+    of a feed by hand. ``latest`` sets every watermark aside the other way: each
+    feed sends its newest item, sent before or not — for groups whose members
+    joined after everything had already gone out.
 
     Returns the number of items sent (or, in ``dry_run`` mode, that would be
     sent). With ``dry_run`` set nothing is sent, created, or recorded — each
@@ -255,7 +258,9 @@ def run_feeds(
     with ExitStack() as outer:
         if not dry_run:
             outer.enter_context(single_run())
-        return _locked_run(config_path, dry_run=dry_run, to=to, since=since)
+        return _locked_run(
+            config_path, dry_run=dry_run, to=to, since=since, latest=latest
+        )
 
 
 def _locked_run(
@@ -264,6 +269,7 @@ def _locked_run(
     dry_run: bool,
     to: str | None,
     since: datetime | None,
+    latest: bool = False,
 ) -> int:
     """The body of :func:`run_feeds`, with the run lock already held."""
     feeds = load_feeds(config_path)
@@ -272,6 +278,8 @@ def _locked_run(
     started = time.monotonic()
     started_wall = time.time()
     kind = " (dry run)" if dry_run else ""
+    if latest:
+        kind += " (latest item of each feed again)"
     log_line(f"run started{kind}: {len(feeds)} feed(s)")
     try:
         with signal_daemon():
@@ -280,7 +288,7 @@ def _locked_run(
             if not dry_run and to is None:
                 _ensure_members(feeds, resolver)
             sent = _run_prepared(
-                feeds, resolver, dry_run=dry_run, to=to, since=since
+                feeds, resolver, dry_run=dry_run, to=to, since=since, latest=latest
             )
             # After sending, so it never holds an episode up, and inside the
             # daemon, so the uploads don't each pay for a JVM. --to touches no
@@ -539,6 +547,7 @@ def _run_prepared(
     dry_run: bool,
     to: str | None,
     since: datetime | None,
+    latest: bool = False,
 ) -> int:
     """The body of a run, with one ``signal-cli`` already up and waiting."""
 
@@ -552,7 +561,7 @@ def _run_prepared(
             if prep.error is not None:
                 raise prep.error
             sent += _send_prepared(
-                cfg, prep, resolver, dry_run=dry_run, to=to, since=since
+                cfg, prep, resolver, dry_run=dry_run, to=to, since=since, latest=latest
             )
         except SourceMissing as exc:
             # Nothing went wrong yet: fetchit has not filed anything for this
@@ -638,6 +647,7 @@ def _send_prepared(
     dry_run: bool,
     to: str | None,
     since: datetime | None,
+    latest: bool = False,
 ) -> int:
     """Send one feed's new items, and record how far it got. Returns the count.
 
@@ -663,6 +673,11 @@ def _send_prepared(
     # a send that has no effect on rssignal's idea of where a feed got to.
     group = None if to else resolver.find(cfg.name)
     mark = since or (read_watermark(group.description) if group else None)
+    if latest:
+        # Asked to forget how far the feed got: the newest item goes out as if
+        # the group were new, and the watermark ends up on it, where it most
+        # likely already was.
+        mark = None
 
     if mark is None:
         # Nothing remembered yet. One item, not the whole back catalogue.

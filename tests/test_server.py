@@ -258,6 +258,27 @@ def test_a_run_from_the_gui_reports_what_it_printed(running, monkeypatch):
     assert "[Laundry] -> group:AAAA1111+bbbb/cc=: done" in job["output"]
 
 
+def test_the_latest_items_can_be_sent_again_from_the_gui(running, monkeypatch):
+    start, _ = running
+    asked = []
+
+    def fake_run(config, **kwargs):
+        asked.append(kwargs)
+        return 16
+
+    monkeypatch.setattr(server, "run_feeds", fake_run)
+    base, _ = start()
+    status, job = _call(base, "/api/resend-latest", {})
+    assert status == 202
+    for _ in range(100):
+        status, job = _call(base, f"/api/jobs/{job['id']}")
+        if not job["running"]:
+            break
+        time.sleep(0.05)
+    assert asked == [{"dry_run": False, "latest": True}]
+    assert job["result"] == "16 latest item(s) sent again."
+
+
 def test_feeds_overview_reads_the_library_and_the_groups(running, own_library):
     start, _ = running
     folder = own_library / "articles" / "Laundry"

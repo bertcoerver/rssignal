@@ -515,6 +515,19 @@ class Service:
 
         return self.start_job("dry-run" if dry_run else "run", work)
 
+    def resend_latest(self, *, dry_run: bool = False) -> Job:
+        """Send every feed's newest item again, whatever its group remembers."""
+
+        def work() -> str:
+            try:
+                sent = run_feeds(self.config_path, dry_run=dry_run, latest=True)
+            except AlreadyRunning as exc:
+                return f"Nothing to do: {exc}."
+            self._groups = None
+            return f"{sent} latest item(s) {'would be sent' if dry_run else 'sent'} again."
+
+        return self.start_job("resend-latest", work)
+
     def refresh_images(self, *, dry_run: bool = False, force: bool = False) -> Job:
         def work() -> str:
             changed = refresh_group_images(self.config_path, dry_run=dry_run, force=force)
@@ -1014,6 +1027,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.CREATED, svc.create_group(str(body.get("name") or "")))
             elif path == "/api/profile":
                 self._json(HTTPStatus.OK, svc.rename(str(body.get("name") or "")))
+            elif path == "/api/resend-latest":
+                self._json(HTTPStatus.ACCEPTED, svc.resend_latest(dry_run=bool(body.get("dry_run"))).view())
             elif path == "/api/reinvite":
                 self._json(HTTPStatus.ACCEPTED, svc.reinvite().view())
             elif path == "/api/link":

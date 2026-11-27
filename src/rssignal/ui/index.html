@@ -148,6 +148,7 @@
         <button data-run="dry-run">Dry run</button>
         <button data-run="refresh-images">Refresh group pictures</button>
         <button data-run="force-images" title="Uploads every group's picture again, also where it was already set. Each group shows a 'changed the group picture' line.">Upload all pictures again</button>
+        <button data-run="resend-latest" title="Sends the newest item of every feed to its group once more, also where it was sent before. For members who joined after it went out.">Send each feed's latest item again</button>
         <button data-run="reinvite" title="For members whose group invitations never showed up on their phone">Send invitations again</button>
       </div>
       <p class="muted" id="job-line" style="margin:10px 0 0">No run started from here yet.</p>
@@ -391,9 +392,11 @@ async function watchJob(id) {
 
 document.querySelectorAll("[data-run]").forEach(button => button.addEventListener("click", async () => {
   const kind = button.dataset.run;
+  if (kind === "resend-latest" && !confirm("Send the newest item of every feed to its group again? Everyone in those groups receives it, also if they already had it.")) return;
   try {
     const job = kind === "refresh-images" ? await api("api/refresh-images", {method: "POST", body: {}})
       : kind === "force-images" ? await api("api/refresh-images", {method: "POST", body: {force: true}})
+      : kind === "resend-latest" ? await api("api/resend-latest", {method: "POST", body: {}})
       : kind === "reinvite" ? await api("api/reinvite", {method: "POST", body: {}})
       : await api("api/run", {method: "POST", body: {dry_run: kind === "dry-run"}});
     watchJob(job.id);

@@ -1035,6 +1035,22 @@ def test_run_since_overrides_the_stored_watermark(monkeypatch):
     assert [s["text"].splitlines()[0] for s in sends] == ["Oldest", "Middle", "Latest"]
 
 
+def test_run_latest_sends_the_newest_item_again(monkeypatch):
+    _patch_feeds(
+        monkeypatch,
+        [_blog()],
+        {"https://a": [LATEST, MIDDLE, OLDEST]},
+        groups=[_group_at(LATEST.published)],
+    )
+    sends = _capture_sends(monkeypatch)
+
+    # Nothing is new, so a plain run sends nothing...
+    assert run_feeds("feeds.json") == 0
+    # ...and asked for the latest again, exactly that one goes out.
+    assert run_feeds("feeds.json", latest=True) == 1
+    assert [s["text"].splitlines()[0] for s in sends] == ["Latest"]
+
+
 def test_run_to_reads_and_writes_no_watermark(monkeypatch):
     calls = _patch_feeds(
         monkeypatch,

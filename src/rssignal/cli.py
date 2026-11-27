@@ -171,6 +171,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 dry_run=args.dry_run,
                 to=args.to,
                 since=_parse_since(args.since),
+                **({"latest": True} if getattr(args, "latest", False) else {}),
             )
         except AlreadyRunning as exc:
             # Exit 0: the last run being slow is not this run's failure, and an
@@ -430,6 +431,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "send items published after this ISO timestamp, ignoring what each "
             "group remembers (e.g. 2026-07-01, or 2026-07-01T09:00+02:00)"
+        ),
+    )
+    run.add_argument(
+        "--latest",
+        action="store_true",
+        help=(
+            "send each feed's newest item again, ignoring what each group "
+            "remembers (for members who joined after it went out)"
         ),
     )
     run.add_argument(
