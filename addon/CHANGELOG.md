@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.5
+
+- Make members admins of feed groups, and upload pictures again on request
+
 ## 0.10.4
 
 - Invite members again from the panel, and rename the account there
