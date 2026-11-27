@@ -58,7 +58,7 @@ from datetime import datetime, timezone
 from typing import Iterator
 
 from . import artwork, cache, pending, timing
-from .config import get_config
+from .config import get_members
 from .errorlog import log_exception, log_line
 from .feeds import (
     FeedConfig,
@@ -199,7 +199,7 @@ class _GroupResolver:
         # Only an rssignal with an account of its own has anyone to add; as a
         # linked device the group appears on the phone, and people are invited
         # from there.
-        members = get_config().members
+        members = get_members(os.environ.get("RSSIGNAL_ACCOUNT", "").strip())
         group = create_group(
             name,
             description=parsed.description or None,

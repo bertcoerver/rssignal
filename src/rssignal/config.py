@@ -85,6 +85,25 @@ class Config:
     members: tuple[str, ...] = ()
 
 
+def get_members(account: str = "") -> tuple[str, ...]:
+    """The numbers in ``RSSIGNAL_MEMBERS``, without ``account`` or repeats.
+
+    Apart from :func:`get_config` so that asking who to add to a group does not
+    also demand an account: the call that needs one says so itself.
+    """
+    members: list[str] = []
+    for number in re.split(r"[,\s]+", os.environ.get("RSSIGNAL_MEMBERS", "").strip()):
+        if not number or number == account or number in members:
+            continue
+        if not E164_RE.match(number):
+            raise ConfigError(
+                f"RSSIGNAL_MEMBERS has {number!r}, which is not a phone number in "
+                "international form (e.g. +31600000000)."
+            )
+        members.append(number)
+    return tuple(members)
+
+
 def get_config(env_file: str = ".env") -> Config:
     """Build a :class:`Config` from the environment, loading ``env_file`` first.
 
@@ -112,14 +131,4 @@ def get_config(env_file: str = ".env") -> Config:
 
     recipient = os.environ.get("RSSIGNAL_RECIPIENT", "").strip() or None
 
-    members: list[str] = []
-    for number in re.split(r"[,\s]+", os.environ.get("RSSIGNAL_MEMBERS", "").strip()):
-        if not number or number == account or number in members:
-            continue
-        if not E164_RE.match(number):
-            raise ConfigError(
-                f"RSSIGNAL_MEMBERS has {number!r}, which is not a phone number in "
-                "international form (e.g. +31600000000)."
-            )
-        members.append(number)
-    return Config(account=account, recipient=recipient, members=tuple(members))
+    return Config(account=account, recipient=recipient, members=get_members(account))
