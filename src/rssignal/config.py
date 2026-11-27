@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import functools
 import os
+import re
 from dataclasses import dataclass
+
+
+# A phone number the way Signal wants it: a plus, a country code, digits.
+E164_RE = re.compile(r"^\+[1-9][0-9]{6,14}$")
 
 
 class ConfigError(Exception):
@@ -74,14 +79,19 @@ class Config:
 
     account: str
     recipient: str | None = None
+    # Numbers added to every group rssignal creates. Only useful when rssignal
+    # has a Signal account of its own: a group holding nobody but the sender is
+    # one nobody reads.
+    members: tuple[str, ...] = ()
 
 
 def get_config(env_file: str = ".env") -> Config:
     """Build a :class:`Config` from the environment, loading ``env_file`` first.
 
-    Reads ``RSSIGNAL_ACCOUNT`` (required, E.164) and ``RSSIGNAL_RECIPIENT``
-    (optional default recipient). Raises :class:`ConfigError` if the account is
-    not set.
+    Reads ``RSSIGNAL_ACCOUNT`` (required, E.164), ``RSSIGNAL_RECIPIENT``
+    (optional default recipient) and ``RSSIGNAL_MEMBERS`` (optional, E.164
+    numbers separated by commas, added to each group rssignal creates). Raises
+    :class:`ConfigError` if the account is not set or a member is not a number.
 
     The ``.env`` file is read once per path rather than on every call. Every
     ``signal-cli`` wrapper asks for the config, so a run was re-opening and
@@ -101,4 +111,15 @@ def get_config(env_file: str = ".env") -> Config:
         )
 
     recipient = os.environ.get("RSSIGNAL_RECIPIENT", "").strip() or None
-    return Config(account=account, recipient=recipient)
+
+    members: list[str] = []
+    for number in re.split(r"[,\s]+", os.environ.get("RSSIGNAL_MEMBERS", "").strip()):
+        if not number or number == account or number in members:
+            continue
+        if not E164_RE.match(number):
+            raise ConfigError(
+                f"RSSIGNAL_MEMBERS has {number!r}, which is not a phone number in "
+                "international form (e.g. +31600000000)."
+            )
+        members.append(number)
+    return Config(account=account, recipient=recipient, members=tuple(members))

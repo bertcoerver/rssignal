@@ -817,9 +817,10 @@ def test_create_group_builds_correct_argv(have_binary, monkeypatch):
     assert group.recipient == "group:ZZZ="
 
 
-def test_create_group_never_adds_members(have_binary, monkeypatch):
-    # The whole point of this command: it must not be able to add anyone.
+def test_create_group_adds_nobody_unless_told_to(have_binary, monkeypatch):
     calls = _patch_create(monkeypatch, stdout='{"groupId": "ZZZ="}')
+    updates = []
+    monkeypatch.setattr(signal_cli, "update_group", lambda gid, **k: updates.append(k))
 
     create_group("Just me", description="d", account="+31600000000")
 
@@ -829,6 +830,112 @@ def test_create_group_never_adds_members(have_binary, monkeypatch):
     assert "--admin" not in argv
     # Nor does it read the contact store to find anyone.
     assert "listContacts" not in argv
+    assert not any(k.get("members") for k in updates)
+
+
+def test_create_group_adds_the_members_it_is_given_once_the_group_exists(have_binary, monkeypatch):
+    calls = _patch_create(monkeypatch, stdout='{"groupId": "ZZZ="}')
+    updates = []
+    monkeypatch.setattr(signal_cli, "update_group", lambda gid, **k: updates.append((gid, k)))
+
+    create_group("Feed", members=("+31611111111",), account="+31600000000")
+
+    # Not on the creating call, which is the one known to drop things.
+    assert "--member" not in calls["argv"]
+    assert updates[-1][0] == "ZZZ=" and updates[-1][1]["members"] == ("+31611111111",)
+
+
+def test_create_group_keeps_the_group_when_adding_members_fails(have_binary, monkeypatch, capsys):
+    _patch_create(monkeypatch, stdout='{"groupId": "ZZZ="}')
+
+    def fake_update(gid, **k):
+        if k.get("members"):
+            raise SignalSendError("unregistered user")
+
+    monkeypatch.setattr(signal_cli, "update_group", fake_update)
+
+    group = create_group("Feed", members=("+31611111111",), account="+31600000000")
+
+    assert group.id == "ZZZ="
+    assert "adding +31611111111 failed" in capsys.readouterr().err
+
+
+def test_update_group_adds_members(have_binary, monkeypatch):
+    seen = {}
+
+    def fake_run(argv, **k):
+        seen["argv"] = argv
+        return _completed()
+
+    monkeypatch.setattr(signal_cli.subprocess, "run", fake_run)
+
+    update_group("ZZZ=", members=["+31611111111", "+31622222222"], account="+31600000000")
+
+    argv = seen["argv"]
+    at = argv.index("--member")
+    assert argv[at + 1 : at + 3] == ["+31611111111", "+31622222222"]
+
+
+# --- registering an account of its own --------------------------------------
+
+
+def _record_runs(monkeypatch, result=None):
+    runs = []
+
+    def fake_run(argv, **k):
+        runs.append(argv)
+        return result or _completed()
+
+    monkeypatch.setattr(signal_cli.subprocess, "run", fake_run)
+    return runs
+
+
+def test_register_asks_for_a_code(have_binary, monkeypatch):
+    runs = _record_runs(monkeypatch)
+    signal_cli.register("+31600000000")
+    assert runs == [[FAKE_BIN, "-a", "+31600000000", "register"]]
+
+
+def test_register_passes_the_captcha_without_its_scheme(have_binary, monkeypatch):
+    runs = _record_runs(monkeypatch)
+    signal_cli.register("+31600000000", captcha=" signalcaptcha://signal-hcaptcha.abc.def ", voice=True)
+    assert runs[0][3:] == ["register", "--voice", "--captcha", "signal-hcaptcha.abc.def"]
+
+
+def test_register_says_when_signal_wants_a_captcha(have_binary, monkeypatch):
+    _record_runs(monkeypatch, _completed(returncode=3, stderr="Captcha required for verification, use --captcha CAPTCHA"))
+    with pytest.raises(signal_cli.CaptchaRequired, match="signalcaptchas.org"):
+        signal_cli.register("+31600000000")
+
+
+def test_register_reports_any_other_failure_as_itself(have_binary, monkeypatch):
+    _record_runs(monkeypatch, _completed(returncode=3, stderr="WARN something\nRate limited, try again later"))
+    with pytest.raises(SignalSendError, match="Rate limited") as caught:
+        signal_cli.register("+31600000000")
+    assert not isinstance(caught.value, signal_cli.CaptchaRequired)
+
+
+def test_verify_sends_the_code_and_the_pin(have_binary, monkeypatch):
+    runs = _record_runs(monkeypatch)
+    signal_cli.verify("+31600000000", "123-456", pin="hunter2")
+    assert runs[0][3:] == ["verify", "123456", "--pin", "hunter2"]
+
+
+def test_verify_refuses_something_that_is_not_a_code(have_binary, monkeypatch):
+    runs = _record_runs(monkeypatch)
+    with pytest.raises(ValueError):
+        signal_cli.verify("+31600000000", "--pin")
+    assert runs == []
+
+
+def test_set_pin_and_profile_name(have_binary, monkeypatch):
+    runs = _record_runs(monkeypatch)
+    signal_cli.set_pin("+31600000000", " 4711 ")
+    signal_cli.set_profile_name("+31600000000", "rssignal")
+    assert runs[0][3:] == ["setPin", "4711"]
+    assert runs[1][3:] == ["updateProfile", "--given-name", "rssignal"]
+    with pytest.raises(ValueError):
+        signal_cli.set_pin("+31600000000", "  ")
 
 
 def test_create_group_omits_group_id_so_signal_cli_creates_one(have_binary, monkeypatch):

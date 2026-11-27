@@ -53,6 +53,10 @@ export RSSIGNAL_LOG="/data/rssignal.log"
 RSSIGNAL_ACCOUNT="$(bashio::config 'account')"
 export RSSIGNAL_ACCOUNT
 
+# Who to add to a group rssignal creates, when it has an account of its own.
+RSSIGNAL_MEMBERS="$(jq -r '(.members // []) | join(",")' /data/options.json)"
+export RSSIGNAL_MEMBERS
+
 # The library the fetchit add-on fills, under /media. Every feed's items come
 # from here; rssignal downloads nothing itself.
 RSSIGNAL_LIBRARY="$(bashio::config 'library')"

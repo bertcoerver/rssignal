@@ -13,8 +13,9 @@ the run.
 What it serves, on one port:
 
 ``/``
-    The GUI: status, feeds, run buttons, a send form, the log, and linking a
-    Signal account by QR code. Only for clients in :data:`GUI_FROM_ENV`, which
+    The GUI: status, feeds, run buttons, a send form, the log, and connecting
+    to Signal — linking to an account by QR code, or registering a number as an
+    account of its own. Only for clients in :data:`GUI_FROM_ENV`, which
     under Home Assistant is its ingress proxy — HA has already checked who you
     are by the time a request arrives.
 ``/api/send``
@@ -393,7 +394,7 @@ class Service:
                 current.stop()
             try:
                 account = get_config().account
-                if account not in self.accounts():
+                if self._registering() or account not in self.accounts():
                     return False
             except (ConfigError, SignalError):
                 return False
@@ -565,7 +566,7 @@ class Service:
         else:
             problem = None
         try:
-            linked = bool(account) and account in self.accounts()
+            linked = bool(account) and not self._registering() and account in self.accounts()
         except SignalError as exc:
             linked, problem = False, str(exc)
         daemon = signal_cli._daemon
@@ -586,6 +587,7 @@ class Service:
             "hostname": socket.gethostname(),
             "api_token": bool(self.api_token),
             "link": dict(self._link),
+            "captcha_url": signal_cli.CAPTCHA_URL,
         }
 
     def feeds(self, *, refresh: bool = False) -> list[dict]:
@@ -697,6 +699,62 @@ class Service:
                 self._link = {"state": "failed", "error": err[-1] if err else f"signal-cli link exited {code}"}
 
         threading.Thread(target=wait, daemon=True, name="rssignal-link").start()
+        return dict(self._link)
+
+
+    # registering: an account of rssignal's own, instead of a link to yours
+
+    def _registering(self) -> bool:
+        """Whether a code is out and not yet typed in.
+
+        signal-cli lists a number from the moment a code is asked for, which is
+        before the account can do anything. A daemon started then would hold
+        the account's lock against the very ``verify`` that finishes the job.
+        """
+        return self._link.get("state") in ("captcha", "code-sent")
+
+    def register(self, *, captcha: str | None = None, voice: bool = False) -> dict:
+        """Ask Signal to text the configured number a code; the GUI asks for it."""
+        account = get_config().account
+        daemon = signal_cli._daemon
+        if daemon is not None and daemon.account == account and daemon._proc is not None and daemon._proc.poll() is None:
+            raise SendRefused(f"{account} is already connected to Signal. To start over, set a different account first.")
+        try:
+            signal_cli.register(account, captcha=captcha, voice=voice)
+        except signal_cli.CaptchaRequired:
+            again = " That token was refused: solve a new one." if captcha else ""
+            self._link = {"state": "captcha", "account": account, "note": "Signal wants a captcha first." + again}
+            return dict(self._link)
+        self._accounts_seen = None
+        self._link = {"state": "code-sent", "account": account, "voice": voice}
+        log_line(f"serve: asked Signal for a verification code for {account}")
+        return dict(self._link)
+
+    def verify(self, code: str, *, pin: str | None = None, name: str = "rssignal") -> dict:
+        """Finish registering with the code, then name the account and lock it."""
+        account = get_config().account
+        pin = (pin or "").strip() or None
+        signal_cli.verify(account, code, pin=pin)
+        warnings = []
+        # Registered from here on, whatever the next two say: neither a missing
+        # name nor a missing lock is a reason to make someone register twice.
+        for what, work in (
+            ("name the account", lambda: signal_cli.set_profile_name(account, name)),
+            ("set the registration lock PIN", (lambda: signal_cli.set_pin(account, pin)) if pin else None),
+        ):
+            if work is None:
+                continue
+            try:
+                work()
+            except (SignalError, ValueError) as exc:
+                warnings.append(f"Could not {what}: {exc}")
+                log_exception(f"serve: {what}", exc)
+        self._link = {"state": "linked", "registered": True, "locked": bool(pin) and not any("PIN" in w for w in warnings), "warnings": warnings}
+        self._accounts_seen = None
+        self._groups = None
+        self.note("link", f"registered {account} with Signal")
+        log_line(f"serve: registered {account} with Signal")
+        self.ensure_daemon()
         return dict(self._link)
 
 
@@ -878,6 +936,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.ACCEPTED, svc.refresh_images(dry_run=bool(body.get("dry_run"))).view())
             elif path == "/api/link":
                 self._json(HTTPStatus.OK, svc.link())
+            elif path == "/api/register":
+                self._json(HTTPStatus.OK, svc.register(captcha=str(body.get("captcha") or ""), voice=bool(body.get("voice"))))
+            elif path == "/api/verify":
+                self._json(HTTPStatus.OK, svc.verify(str(body.get("code") or ""), pin=str(body.get("pin") or "")))
             else:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
         except SendRefused as exc:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -727,19 +728,24 @@ def create_group(
     description: str | None = None,
     avatar: str | None = None,
     announcement_only: bool = False,
+    members: tuple[str, ...] | list[str] = (),
     account: str | None = None,
     timeout: float = 120,
 ) -> SignalGroup:
-    """Create a new Signal group containing only you, and return it.
+    """Create a new Signal group and return it.
 
     Runs ``signal-cli updateGroup`` with no ``--group-id``, which is how
     signal-cli creates a group rather than editing one. The account creating the
     group is its only member and its admin.
 
-    **No one else is ever added.** There is deliberately no ``members``
-    parameter: adding someone to a group is an action they cannot undo without
-    leaving it, and rssignal exists to send feeds, not to manage anyone's
-    contacts. Invite people from Signal on your phone once the group exists.
+    **No one else is added unless ``members`` says so.** Adding someone to a
+    group is an action they cannot undo without leaving it, so it is never a
+    default. As a linked device there is no need for it: the group shows up on
+    your phone, and you invite people from there. An account of rssignal's own
+    has no phone, so its groups would be read by nobody; ``members`` (from
+    ``RSSIGNAL_MEMBERS``) are the numbers it sends for. They are added by a
+    call of their own, after the group exists, and one that fails costs a
+    warning rather than the group.
 
     ``avatar`` is a **local image file path** (signal-cli uploads it), not a URL.
     ``announcement_only`` restricts sending to admins, which is usually what you
@@ -872,6 +878,16 @@ def create_group(
             file=sys.stderr,
         )
 
+    if members:
+        try:
+            update_group(group_id, members=members, account=account, timeout=timeout)
+        except SignalError as exc:
+            print(
+                f"Group {name!r} was created, but adding {', '.join(members)} "
+                f"failed: {exc}",
+                file=sys.stderr,
+            )
+
     # The description comes back on the group so the caller doesn't have to
     # re-list to find out what actually landed there — empty if it didn't.
     return SignalGroup(id=group_id, name=name, description=applied)
@@ -988,6 +1004,7 @@ def update_group(
     description: str | None = None,
     avatar: str | None = None,
     expiration: int | None = None,
+    members: tuple[str, ...] | list[str] = (),
     account: str | None = None,
     timeout: float = 120,
 ) -> None:
@@ -1003,9 +1020,11 @@ def update_group(
     ``--avatar`` on the call that creates a group. Anything left as ``None`` is
     not touched, and asking for no change at all runs nothing.
 
-    Membership is deliberately not settable here, for the same reason
-    :func:`create_group` has no ``members``: who is in a group is not rssignal's
-    decision to make.
+    ``members`` are numbers to add. Nothing in rssignal passes any but
+    :func:`create_group`, for the group it has just made: who is in a group
+    that already exists is not rssignal's decision to make. Someone who has
+    never exchanged a message with this account is invited rather than added,
+    and joins by accepting on their phone.
     """
     if avatar is not None and not os.path.isfile(avatar):
         raise ValueError(
@@ -1017,7 +1036,8 @@ def update_group(
             f"Message expiry must be a number of seconds, not {expiration!r}. "
             "Use 0 to turn disappearing messages off."
         )
-    if description is None and avatar is None and expiration is None:
+    members = list(members)
+    if description is None and avatar is None and expiration is None and not members:
         return
 
     if _daemon is not None:
@@ -1030,6 +1050,8 @@ def update_group(
                     params["avatar"] = stack.enter_context(_avatar_within_limits(avatar))
                 if expiration is not None:
                     params["expiration"] = int(expiration)
+                if members:
+                    params["member"] = members
                 _daemon.request("updateGroup", params, timeout=timeout)
             return
         except DaemonGone as exc:
@@ -1051,6 +1073,8 @@ def update_group(
             argv.extend(["--avatar", stack.enter_context(_avatar_within_limits(avatar))])
         if expiration is not None:
             argv.extend(["--expiration", str(expiration)])
+        if members:
+            argv.extend(["--member", *members])
 
         try:
             with timing.step("signal-cli", "updateGroup"):
@@ -1092,6 +1116,105 @@ def check_account(account: str) -> None:
     """Raise :class:`AccountNotLinked` if ``account`` is not registered."""
     if not is_account_registered(account):
         raise AccountNotLinked(account)
+
+
+# Where a person proves they are one. Signal asks for this on nearly every
+# registration; the page ends in an "Open Signal" link whose address is the
+# token.
+CAPTCHA_URL = "https://signalcaptchas.org/registration/generate.html"
+_CAPTCHA_SCHEME = "signalcaptcha://"
+
+
+class CaptchaRequired(SignalError):
+    """Signal wants a captcha solved before it sends a verification code."""
+
+    def __init__(self, detail: str = "") -> None:
+        self.detail = detail
+        super().__init__(
+            f"Signal wants a captcha first. Open {CAPTCHA_URL}, solve it, copy "
+            'the address of the "Open Signal" link (it starts with '
+            f"{_CAPTCHA_SCHEME}) and pass that along. A token is good for a "
+            "few minutes and for one try."
+        )
+
+
+def _one_shot(account: str, args: list[str], *, what: str, timeout: float = 120):
+    """Run one ``signal-cli -a <account>`` command to its end, or raise."""
+    binary = find_signal_cli()
+    try:
+        result = subprocess.run(
+            [binary, "-a", account, *args], capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        raise SignalSendError(f"`signal-cli {what}` timed out after {timeout}s.")
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        if what == "register" and "captcha" in stderr.lower():
+            raise CaptchaRequired(stderr)
+        last = stderr.splitlines()[-1] if stderr else f"exit status {result.returncode}"
+        raise SignalSendError(
+            f"`signal-cli {what}` failed: {last}",
+            returncode=result.returncode,
+            stderr=stderr,
+        )
+    return result
+
+
+def register(account: str, *, captcha: str | None = None, voice: bool = False) -> None:
+    """Ask Signal to send ``account`` a verification code.
+
+    This makes ``account`` a Signal account of its own, with signal-cli as its
+    one and only device — unlike :func:`link_device`, which joins an account
+    that lives on a phone. **A number registered here is logged out everywhere
+    else**, so it must never be the number your own Signal runs on.
+
+    The code arrives by SMS, or by a call with ``voice`` — which Signal only
+    agrees to about a minute after an SMS was asked for. Raises
+    :class:`CaptchaRequired` when Signal wants a captcha, which is most of the
+    time; ``captcha`` is the token from :data:`CAPTCHA_URL`, with or without
+    its ``signalcaptcha://`` prefix. Follow with :func:`verify`.
+    """
+    args = ["register"]
+    if voice:
+        args.append("--voice")
+    token = (captcha or "").strip()
+    if token.startswith(_CAPTCHA_SCHEME):
+        token = token[len(_CAPTCHA_SCHEME):]
+    if token:
+        args.extend(["--captcha", token])
+    _one_shot(account, args, what="register")
+
+
+def verify(account: str, code: str, *, pin: str | None = None) -> None:
+    """Finish what :func:`register` started, with the code Signal sent.
+
+    ``pin`` is the registration lock PIN, needed only if the number already has
+    one — signal-cli ignores it otherwise. Setting one is :func:`set_pin`.
+    """
+    digits = re.sub(r"[\s-]", "", code or "")
+    if not digits.isdigit():
+        raise ValueError("The verification code is the six digits Signal sent.")
+    args = ["verify", digits]
+    if pin:
+        args.extend(["--pin", pin])
+    _one_shot(account, args, what="verify")
+
+
+def set_pin(account: str, pin: str) -> None:
+    """Set the registration lock PIN: registering this number again needs it.
+
+    What stands between the account and whoever is handed the number next, once
+    a prepaid SIM lapses. Signal drops the lock after a week without the
+    account connecting; an rssignal that runs daily never gets there.
+    """
+    if not pin or not pin.strip():
+        raise ValueError("A registration lock PIN can't be empty.")
+    _one_shot(account, ["setPin", pin.strip()], what="setPin")
+
+
+def set_profile_name(account: str, name: str) -> None:
+    """Give the account the name people see its messages come from."""
+    _one_shot(account, ["updateProfile", "--given-name", name], what="updateProfile")
 
 
 def link_device(device_name: str = DEFAULT_DEVICE_NAME, *, print_qr: bool = True) -> None:

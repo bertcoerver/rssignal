@@ -82,3 +82,22 @@ def test_get_config_missing_account_raises(tmp_path, monkeypatch):
 
     with pytest.raises(ConfigError):
         get_config(env_file=str(tmp_path / "missing.env"))
+
+
+def test_get_config_reads_members(tmp_path, monkeypatch):
+    monkeypatch.setenv("RSSIGNAL_ACCOUNT", "+31600000000")
+    # The account itself is already in every group it creates, and a number
+    # listed twice is added once.
+    monkeypatch.setenv("RSSIGNAL_MEMBERS", "+31611111111, +31622222222,+31600000000 +31611111111")
+
+    config = get_config(env_file=str(tmp_path / "missing.env"))
+
+    assert config.members == ("+31611111111", "+31622222222")
+
+
+def test_get_config_refuses_a_member_that_is_not_a_number(tmp_path, monkeypatch):
+    monkeypatch.setenv("RSSIGNAL_ACCOUNT", "+31600000000")
+    monkeypatch.setenv("RSSIGNAL_MEMBERS", "0612345678")
+
+    with pytest.raises(ConfigError, match="RSSIGNAL_MEMBERS"):
+        get_config(env_file=str(tmp_path / "missing.env"))

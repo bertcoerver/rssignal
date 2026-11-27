@@ -55,6 +55,8 @@
   ul.activity time { color: var(--muted); font-size: 12px; white-space: nowrap; padding-top: 2px; }
   .qr svg { width: 260px; height: 260px; background: #fff; border-radius: 8px; padding: 6px; }
   .hidden { display: none !important; }
+  hr { border: 0; border-top: 1px solid var(--line); margin: 16px 0; }
+  ol { margin: 8px 0; padding-left: 22px; }
   .row { display: flex; gap: 8px; } .row > * { flex: 1; }
   code { background: var(--code); border-radius: 4px; padding: 0 4px; font-size: 13px; }
 </style>
@@ -68,13 +70,46 @@
 
   <div class="grid">
     <section id="link-card" class="hidden wide">
-      <h2>Link to Signal</h2>
-      <p id="link-text">This machine is not linked to a Signal account yet. Link it as a
-        secondary device, like Signal Desktop: press the button, then scan the code from
-        Signal on your phone, under <b>Settings → Linked Devices → Link New Device</b>.</p>
+      <h2>Connect to Signal</h2>
+      <p id="link-text"><b>Link to your own account.</b> rssignal becomes a secondary device,
+        like Signal Desktop, and its messages come from you — which is also why your phone
+        stays silent for them. Press the button, then scan the code from Signal on your
+        phone, under <b>Settings → Linked Devices → Link New Device</b>.</p>
       <div class="actions"><button class="primary" id="link-btn">Show the QR code</button></div>
       <div class="qr" id="qr"></div>
       <p class="muted" id="link-uri"></p>
+
+      <hr>
+      <p><b>Or give rssignal a number of its own</b>, so its messages arrive from someone
+        else and your phone notifies you. The number is the configured account,
+        <code id="reg-account">—</code>, and it only has to receive one text.
+        <span class="bad">Never do this with the number your own Signal runs on: it would be
+        logged out.</span></p>
+      <ol>
+        <li>Open <a id="captcha-link" href="#" target="_blank" rel="noopener">Signal's captcha page</a>
+          and solve it.</li>
+        <li>Copy the address of the <b>Open Signal</b> link it ends with — right-click or
+          long-press it, <i>Copy link</i>. It starts with <code>signalcaptcha://</code>.</li>
+        <li>Paste it here within a few minutes and ask for the code.</li>
+      </ol>
+      <label for="reg-captcha">Captcha</label>
+      <input id="reg-captcha" placeholder="signalcaptcha://…" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <div class="actions" style="margin-top:8px">
+        <button id="reg-btn">Text me the code</button>
+        <button id="reg-voice-btn" title="Signal allows this about a minute after a text was asked for">Call me instead</button>
+      </div>
+      <div id="verify-box" class="hidden">
+        <div class="row">
+          <div><label for="reg-code">The code Signal sent</label>
+            <input id="reg-code" inputmode="numeric" placeholder="123456" autocomplete="one-time-code"></div>
+          <div><label for="reg-pin">Registration lock PIN (recommended)</label>
+            <input id="reg-pin" type="password" placeholder="keep it somewhere safe" autocomplete="new-password"></div>
+        </div>
+        <p class="muted">The PIN stops whoever gets this number after you from taking the
+          account over. If the number already has one, type that one.</p>
+        <div class="actions"><button class="primary" id="verify-btn">Verify</button></div>
+      </div>
+      <p id="reg-result"></p>
     </section>
 
     <section>
@@ -158,14 +193,17 @@ async function api(path, options = {}) {
 
 let currentJob = null;
 let status = null;
+let showSetup = false;
+let regBusy = false;
 
 async function loadStatus() {
   try { status = await api("api/status"); } catch (e) { $("meta").textContent = "Cannot reach rssignal: " + e.message; return; }
   const s = status;
   $("meta").textContent = `version ${s.version} · ${s.account || "no account set"}`;
   const linked = s.linked ? `<span class="ok">linked</span>` : `<span class="bad">not linked</span>`;
+  const setup = `<button class="small" onclick="toggleSetup()">${showSetup ? "hide setup" : "set up"}</button>`;
   const rows = [
-    ["Account", `${esc(s.account || "—")} · ${linked}`],
+    ["Account", `${esc(s.account || "—")} · ${linked} ${setup}`],
     ["Signal", s.daemon ? `<span class="ok">connected</span>` : `<span class="muted">one call at a time</span>`],
     ["Library", `${esc(s.library)}${s.library_exists ? "" : ` <span class="bad">(missing)</span>`}`],
     ["Schedule", s.schedule.length ? esc(s.schedule.join(", ")) : `<span class="muted">none — only when asked</span>`],
@@ -175,9 +213,12 @@ async function loadStatus() {
   if (s.problem) rows.push(["Problem", `<span class="bad">${esc(s.problem)}</span>`]);
   $("status").innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
 
-  const showLink = !s.linked || (s.link && s.link.state !== "idle" && s.link.state !== "linked");
+  const link = s.link || {state: "idle"};
+  const showLink = showSetup || !s.linked || !["idle", "linked"].includes(link.state) || (link.warnings || []).length > 0;
   $("link-card").classList.toggle("hidden", !showLink);
-  renderLink(s.link);
+  $("reg-account").textContent = s.account || "none set";
+  $("captcha-link").href = s.captcha_url;
+  renderLink(link);
   $("ha-yaml").textContent =
 `notify:
   - platform: signal_messenger
@@ -189,17 +230,56 @@ async function loadStatus() {
   if (s.running && !currentJob) watchJob(s.running.id);
 }
 
+function toggleSetup() { showSetup = !showSetup; loadStatus(); }
+
 function renderLink(link) {
   if (!link) return;
   if (link.state === "waiting") {
     $("link-btn").disabled = true;
     $("qr").innerHTML = link.svg || "";
     $("link-uri").textContent = link.svg ? "Waiting for your phone…" : "No qrencode here: open this link on your phone instead — " + link.uri;
-  } else if (link.state === "linked") {
+  } else if (link.state === "linked" && !link.registered) {
     $("qr").innerHTML = ""; $("link-uri").innerHTML = `<span class="ok">Linked.</span>`; $("link-btn").disabled = true;
   } else if (link.state === "failed") {
     $("qr").innerHTML = ""; $("link-uri").innerHTML = `<span class="bad">${esc(link.error)}</span>`; $("link-btn").disabled = false;
   }
+  // Registering. Left alone while a request is out, so a poll can't wipe its "…".
+  if (regBusy) return;
+  $("verify-box").classList.toggle("hidden", link.state !== "code-sent");
+  if (link.state === "captcha") {
+    $("reg-result").innerHTML = `<span class="warn">${esc(link.note)}</span>`;
+  } else if (link.state === "code-sent") {
+    $("reg-result").innerHTML = `<span class="ok">Signal is ${link.voice ? "calling" : "texting"} ${esc(link.account)}.</span> Type the code above.`;
+  } else if (link.registered) {
+    const notes = (link.warnings || []).map(w => `<br><span class="warn">${esc(w)}</span>`).join("");
+    $("reg-result").innerHTML = `<span class="ok">Registered${link.locked ? ", with a registration lock" : ""}.</span>${notes}`;
+  }
+}
+
+async function register(voice) {
+  regBusy = true;
+  $("reg-btn").disabled = $("reg-voice-btn").disabled = true;
+  $("reg-result").textContent = "Asking Signal…";
+  let link;
+  try { link = await api("api/register", {method: "POST", body: {captcha: $("reg-captcha").value.trim(), voice}}); }
+  catch (e) { link = null; $("reg-result").innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
+  regBusy = false;
+  $("reg-btn").disabled = $("reg-voice-btn").disabled = false;
+  // A token is spent by the try, whichever way it went.
+  $("reg-captcha").value = "";
+  if (link) renderLink(link);
+}
+
+async function verify() {
+  regBusy = true;
+  $("verify-btn").disabled = true;
+  $("reg-result").textContent = "Verifying…";
+  let link;
+  try { link = await api("api/verify", {method: "POST", body: {code: $("reg-code").value.trim(), pin: $("reg-pin").value}}); }
+  catch (e) { link = null; $("reg-result").innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
+  regBusy = false;
+  $("verify-btn").disabled = false;
+  if (link) { $("reg-code").value = $("reg-pin").value = ""; renderLink(link); loadStatus(); loadGroups(); }
 }
 
 async function loadFeeds(refresh = false) {
@@ -293,6 +373,9 @@ $("link-btn").addEventListener("click", async () => {
   $("link-btn").disabled = true;
   try { renderLink(await api("api/link", {method: "POST", body: {}})); } catch (e) { renderLink({state: "failed", error: e.message}); }
 });
+$("reg-btn").addEventListener("click", () => register(false));
+$("reg-voice-btn").addEventListener("click", () => register(true));
+$("verify-btn").addEventListener("click", verify);
 $("feeds-refresh").addEventListener("click", () => loadFeeds(true));
 $("log-refresh").addEventListener("click", loadLog);
 

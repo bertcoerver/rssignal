@@ -3,6 +3,8 @@
 Subcommands:
     doctor          check the signal-cli install, linked accounts, and config
     link [--name]   link this machine to your Signal account (scan a QR code)
+    register        make the configured number a Signal account of its own
+    verify <code>   finish `register` with the code Signal sent
     send MESSAGE    send a text message (uses configured account/recipient)
     run [--config]  read each feed from the library and send whatever is new
                     to the Signal group named after it (created if missing)
@@ -23,7 +25,7 @@ from datetime import datetime, timezone
 
 from dataclasses import replace
 
-from . import timing
+from . import signal_cli, timing
 from .config import ConfigError, get_config
 from .errorlog import log_exception, log_line, log_path
 from .feeds import (
@@ -106,6 +108,38 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
 def _cmd_link(args: argparse.Namespace) -> int:
     link_device(args.name)
     print("Linking complete.")
+    return 0
+
+
+def _cmd_register(args: argparse.Namespace) -> int:
+    account = get_config().account
+    try:
+        signal_cli.register(account, captcha=args.captcha, voice=args.voice)
+    except signal_cli.CaptchaRequired as exc:
+        print(exc, file=sys.stderr)
+        print('\nThen: rssignal register --captcha "signalcaptcha://..."', file=sys.stderr)
+        return 1
+    print(
+        f"Signal is {'calling' if args.voice else 'texting'} {account}. "
+        "Finish with: rssignal verify <code> --pin <a PIN of your choosing>"
+    )
+    return 0
+
+
+def _cmd_verify(args: argparse.Namespace) -> int:
+    account = get_config().account
+    signal_cli.verify(account, args.code, pin=args.pin)
+    print(f"{account} is registered with Signal.")
+    # Registered either way: neither of these failing is a reason to do it twice.
+    try:
+        signal_cli.set_profile_name(account, args.name)
+        if args.pin:
+            signal_cli.set_pin(account, args.pin)
+            print("Registration lock PIN set. Keep it: registering this number again needs it.")
+        else:
+            print(f"No registration lock: whoever gets this number next can take the account. Set one with: signal-cli -a {account} setPin <pin>")
+    except SignalError as exc:
+        print(f"warning: {exc}", file=sys.stderr)
     return 0
 
 
@@ -319,6 +353,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="device name shown in Signal (default: rssignal)",
     )
     link.set_defaults(func=_cmd_link)
+
+    register = subparsers.add_parser(
+        "register",
+        help="make the configured number a Signal account of its own (not your own number!)",
+    )
+    register.add_argument("--captcha", help=f"the token from {signal_cli.CAPTCHA_URL}")
+    register.add_argument("--voice", action="store_true", help="get the code by a call instead of a text")
+    register.set_defaults(func=_cmd_register)
+
+    verify = subparsers.add_parser("verify", help="finish `register` with the code Signal sent")
+    verify.add_argument("code", help="the six digits")
+    verify.add_argument("--pin", help="registration lock PIN: the number's existing one, or one to set")
+    verify.add_argument("--name", default="rssignal", help="the name messages come from (default: rssignal)")
+    verify.set_defaults(func=_cmd_verify)
 
     send = subparsers.add_parser("send", help="send a text message")
     send.add_argument("message", help="the message text to send")

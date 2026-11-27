@@ -71,6 +71,22 @@ this repository to the Add-on Store and install rssignal from there — see
    Link New Device**. The command blocks until linking and the initial sync
    finish.
 
+   **Or give rssignal a number of its own.** A linked device sends as you, and
+   Signal does not notify you about your own messages. With a second number —
+   a prepaid SIM that receives one text — rssignal can be an account of its own
+   instead. Set `RSSIGNAL_ACCOUNT` to that number (never the one your own
+   Signal runs on: registering logs a number out everywhere else) and
+   `RSSIGNAL_MEMBERS` to the numbers that should be in the groups it creates,
+   separated by commas. Then:
+   ```bash
+   rssignal register                     # says where to solve a captcha
+   rssignal register --captcha "signalcaptcha://..."
+   rssignal verify 123456 --pin <a PIN>  # the code from the text
+   ```
+   The PIN is a registration lock: without it, whoever is given the number
+   after you can take the account. signal-cli's data directory is then the only
+   copy of the account, so back it up.
+
 3. Check everything is wired up:
    ```bash
    rssignal doctor

@@ -315,3 +315,87 @@ def test_fetchit_news_needs_api_access(running):
     assert _call(base, "/api/fetched", {"feeds": ["Laundry"]})[0] == 403
     status, reply = _call(base, "/api/fetched", {"feeds": ["Nope"]}, headers={"Authorization": "Bearer s3cret"})
     assert status == 202 and reply["started"] is False
+
+
+# --- registering an account of its own --------------------------------------
+
+
+@pytest.fixture
+def unregistered(running, monkeypatch):
+    """A server whose configured number signal-cli has never heard of."""
+    start, _ = running
+    known = []
+    calls = []
+    monkeypatch.setattr(server, "list_accounts", lambda: list(known))
+
+    def fake_register(account, *, captcha=None, voice=False):
+        calls.append(("register", account, captcha, voice))
+        if not captcha:
+            raise server.signal_cli.CaptchaRequired()
+        # signal-cli lists the number from here on, long before it works.
+        known.append(account)
+
+    def fake_verify(account, code, *, pin=None):
+        calls.append(("verify", account, code, pin))
+        if code != "123456":
+            raise server.signal_cli.SignalSendError("`signal-cli verify` failed: Invalid verification code")
+
+    monkeypatch.setattr(server.signal_cli, "register", fake_register)
+    monkeypatch.setattr(server.signal_cli, "verify", fake_verify)
+    monkeypatch.setattr(server.signal_cli, "set_profile_name", lambda account, name: calls.append(("name", name)))
+    monkeypatch.setattr(server.signal_cli, "set_pin", lambda account, pin: calls.append(("pin", pin)))
+    base, service = start()
+    return base, service, calls
+
+
+def test_registering_a_number_from_the_gui(unregistered):
+    base, _service, calls = unregistered
+    assert _call(base, "/api/status")[1]["linked"] is False
+
+    status, reply = _call(base, "/api/register", {})
+    assert status == 200 and reply["state"] == "captcha"
+
+    status, reply = _call(base, "/api/register", {"captcha": "signalcaptcha://tok"})
+    assert status == 200 and reply == {"state": "code-sent", "account": "+31600000000", "voice": False}
+    # Listed by signal-cli already, and still not an account that can send.
+    assert _call(base, "/api/status")[1]["linked"] is False
+
+    status, reply = _call(base, "/api/verify", {"code": "000000"})
+    assert status == 502 and "Invalid verification code" in reply["error"]
+    assert _call(base, "/api/status")[1]["link"]["state"] == "code-sent"
+
+    status, reply = _call(base, "/api/verify", {"code": "123456", "pin": "4711"})
+    assert status == 200 and reply["registered"] is True and reply["locked"] is True
+    assert reply["warnings"] == []
+    assert calls[-3:] == [("verify", "+31600000000", "123456", "4711"), ("name", "rssignal"), ("pin", "4711")]
+    assert _call(base, "/api/status")[1]["linked"] is True
+
+
+def test_a_registration_survives_a_lock_pin_that_could_not_be_set(unregistered, monkeypatch):
+    base, _service, calls = unregistered
+
+    def no_pin(account, pin):
+        raise server.signal_cli.SignalSendError("`signal-cli setPin` failed: nope")
+
+    monkeypatch.setattr(server.signal_cli, "set_pin", no_pin)
+    _call(base, "/api/register", {"captcha": "tok"})
+
+    status, reply = _call(base, "/api/verify", {"code": "123456", "pin": "4711"})
+
+    assert status == 200 and reply["state"] == "linked" and reply["locked"] is False
+    assert len(reply["warnings"]) == 1 and "PIN" in reply["warnings"][0]
+
+
+def test_verifying_without_a_pin_sets_no_lock(unregistered):
+    base, _service, calls = unregistered
+    _call(base, "/api/register", {"captcha": "tok"})
+    status, reply = _call(base, "/api/verify", {"code": "123456"})
+    assert status == 200 and reply["locked"] is False
+    assert not any(call[0] == "pin" for call in calls)
+
+
+def test_registering_is_part_of_the_gui_not_the_send_api(running):
+    start, _ = running
+    base, _ = start(gui_from="10.9.9.9", api_from="127.0.0.1")
+    assert _call(base, "/api/register", {})[0] == 403
+    assert _call(base, "/api/verify", {"code": "123456"})[0] == 403

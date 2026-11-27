@@ -491,3 +491,28 @@ def test_doctor_says_when_there_is_no_library(monkeypatch, capsys, own_library):
 
     assert cli.main(["doctor"]) == 0
     assert "does not exist (set RSSIGNAL_LIBRARY" in capsys.readouterr().out
+
+
+def test_register_explains_the_captcha(monkeypatch, capsys):
+    monkeypatch.setenv("RSSIGNAL_ACCOUNT", "+31600000000")
+
+    def wants_captcha(account, *, captcha=None, voice=False):
+        raise cli.signal_cli.CaptchaRequired()
+
+    monkeypatch.setattr(cli.signal_cli, "register", wants_captcha)
+
+    assert cli.main(["register"]) == 1
+    assert "signalcaptchas.org" in capsys.readouterr().err
+
+
+def test_verify_names_the_account_and_sets_the_lock(monkeypatch, capsys):
+    monkeypatch.setenv("RSSIGNAL_ACCOUNT", "+31600000000")
+    calls = []
+    monkeypatch.setattr(cli.signal_cli, "verify", lambda account, code, *, pin=None: calls.append(("verify", code, pin)))
+    monkeypatch.setattr(cli.signal_cli, "set_profile_name", lambda account, name: calls.append(("name", name)))
+    monkeypatch.setattr(cli.signal_cli, "set_pin", lambda account, pin: calls.append(("pin", pin)))
+
+    assert cli.main(["verify", "123456", "--pin", "4711"]) == 0
+
+    assert calls == [("verify", "123456", "4711"), ("name", "rssignal"), ("pin", "4711")]
+    assert "Registration lock PIN set" in capsys.readouterr().out

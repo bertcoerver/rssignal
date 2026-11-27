@@ -58,6 +58,7 @@ from datetime import datetime, timezone
 from typing import Iterator
 
 from . import artwork, cache, pending, timing
+from .config import get_config
 from .errorlog import log_exception, log_line
 from .feeds import (
     FeedConfig,
@@ -186,7 +187,7 @@ class _GroupResolver:
     def resolve(self, cfg: FeedConfig, parsed: ParsedFeed) -> SignalGroup:
         """Return the group called ``cfg.name``, creating it if it doesn't exist.
 
-        A new group holds only this account, is announcement-only (it exists to
+        A new group holds this account and any ``RSSIGNAL_MEMBERS``, is announcement-only (it exists to
         receive a feed, not to be a chat), and takes the feed's own artwork and
         blurb from the library as its picture and description.
         """
@@ -195,11 +196,16 @@ class _GroupResolver:
         if group is not None:
             return group
 
+        # Only an rssignal with an account of its own has anyone to add; as a
+        # linked device the group appears on the phone, and people are invited
+        # from there.
+        members = get_config().members
         group = create_group(
             name,
             description=parsed.description or None,
             avatar=parsed.image or None,
             announcement_only=True,
+            **({"members": members} if members else {}),
         )
 
         # Creating a group is not something to do quietly: a typo in a feed's

@@ -47,6 +47,7 @@ map:
 
 options:
   account: ""
+  members: []
   link_mode: false
   on_start: wait
   schedule:
@@ -61,8 +62,13 @@ options:
 
 schema:
   # The E.164 number rssignal sends from — the account linked with
-  # `link_mode` below. Required; the add-on refuses to start without it.
+  # `link_mode` below, or a number of rssignal's own, registered from the
+  # panel. Required; the add-on refuses to start without it.
   account: str
+  # Numbers added to every group rssignal creates. For an account of its own:
+  # nobody else is in its groups otherwise. Leave empty when linked to yours.
+  members:
+    - match(^\+[1-9][0-9]{6,14}$)
   # Turn on, start the add-on, scan the QR code it puts in the Media browser,
   # turn off again. Nothing is sent while this is on. It exists because Home
   # Assistant 2026.6 removed the setting that allowed a shell into an add-on,

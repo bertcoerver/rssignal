@@ -157,6 +157,46 @@ itself.
 > Signal *group description*, on the server — so a freshly linked device picks
 > up exactly where the old one left off.
 
+### 3b. Or: give rssignal a number of its own
+
+A linked device sends as *you*, and Signal never notifies you about your own
+messages — so a feed arriving makes no sound. If you want notifications,
+rssignal needs to be somebody else: a Signal account of its own, on a second
+number. A prepaid SIM or eSIM does; it has to receive one text, once.
+
+> **Never register the number your own Signal runs on.** Registering a number
+> logs it out everywhere else. Your phone's Signal app is not involved in any of
+> this and does not need to change.
+
+1. **Configuration** tab → set `account` to the new number and `members` to your
+   own number (and anyone else who should be in the feed groups) → Save, and
+   let the add-on restart.
+2. Open the **rssignal** panel. It says the account is not linked and shows
+   **Connect to Signal**. Use the lower half.
+3. Open the captcha page it links to, solve it, and copy the address of the
+   **Open Signal** link at the end (right-click or long-press → *Copy link*).
+   Paste it in and press **Text me the code**. A token lasts a few minutes.
+4. Type the code from the text, choose a **registration lock PIN**, press
+   **Verify**. Write the PIN down.
+
+From then on rssignal has no groups, so each feed gets a new one the next time
+it has something to send, with the `members` in it. The first time, Signal shows
+you an invitation to accept rather than adding you outright: you have never
+talked to this account. A new group starts by sending that feed's latest item,
+once. The old groups, and the *rssignal* entry under **Signal → Settings →
+Linked Devices**, can go when you are happy with the new ones.
+
+Two things to know about a number that exists only for this:
+
+- **The PIN is what keeps the account yours.** A prepaid number that is not
+  topped up is eventually given to someone else, who could register it with
+  Signal and take the account over. The registration lock stops that, for as
+  long as rssignal keeps connecting — Signal drops it after a week of silence.
+- **`/data` is now the only copy of the account.** There is no phone to link
+  again from. A Home Assistant backup that includes this add-on is the way
+  back; without one, a lost `/data` means registering again, which needs the
+  number to still receive a text.
+
 ### 4. Start it, then retire the old one
 
 Start the add-on and watch the log. Once you have seen a real run arrive in
@@ -169,6 +209,7 @@ descriptions that hold the watermarks.
 | Option | Default | What it does |
 |---|---|---|
 | `account` | — | E.164 number to send from. Required. |
+| `members` | none | Numbers added to each group rssignal creates. For an account of rssignal's own; see 3b. |
 | `link_mode` | `false` | Link to Signal instead of running. See above. |
 | `on_start` | `wait` | `wait`, `dry-run` or `run` — what to do at startup, before the schedule takes over. |
 | `schedule` | `01:30`, `06:30`, `15:00` | Local times to run at. |
