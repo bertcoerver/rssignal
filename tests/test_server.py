@@ -455,3 +455,27 @@ def test_the_gui_can_rename_the_account(running, monkeypatch):
 
     assert status == 200 and reply == {"name": "📻 Radio"}
     assert named == [("+31600000000", " 📻 Radio ")]
+
+
+def test_the_gui_can_create_a_group_for_notifications(running, monkeypatch):
+    start, _ = running
+    monkeypatch.setenv("RSSIGNAL_MEMBERS", "+31611111111")
+    made = []
+
+    def fake_create(name, *, members=()):
+        made.append((name, tuple(members)))
+        return SignalGroup(id="NEW=", name=name)
+
+    monkeypatch.setattr(server.signal_cli, "create_group", fake_create)
+    monkeypatch.setattr(server.signal_cli, "update_group", lambda gid, **k: made.append((gid, k)))
+    base, _ = start()
+
+    status, reply = _call(base, "/api/create-group", {"name": " Home "})
+    assert status == 201 and reply["recipient"] == "group:NEW=" and reply["members"] == ["+31611111111"]
+    assert made == [("Home", ("+31611111111",)), ("NEW=", {"admins": ("+31611111111",)})]
+
+    # Not a second one beside a group that is already there, whatever its case.
+    status, reply = _call(base, "/api/create-group", {"name": "laundry"})
+    assert status == 400 and "already a group" in reply["error"]
+    assert _call(base, "/api/create-group", {"name": "  "})[0] == 400
+    assert len(made) == 2

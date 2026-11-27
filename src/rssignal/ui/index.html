@@ -167,6 +167,12 @@
           <span id="send-result" class="muted" style="align-self:center"></span>
         </div>
       </form>
+      <label for="group-name">A new group, for notifications — with the members in it</label>
+      <div class="row">
+        <input id="group-name" placeholder="Home" maxlength="32">
+        <button id="group-btn" style="flex:0 0 auto">Create the group</button>
+      </div>
+      <p id="group-result" class="muted"></p>
     </section>
 
     <section class="wide">
@@ -430,6 +436,17 @@ $("name-btn").addEventListener("click", async () => {
     $("name-input").value = "";
   } catch (e) { $("name-result").innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
   $("name-btn").disabled = false;
+});
+$("group-btn").addEventListener("click", async () => {
+  $("group-btn").disabled = true;
+  $("group-result").textContent = "Creating…";
+  try {
+    const made = await api("api/create-group", {method: "POST", body: {name: $("group-name").value}});
+    $("group-result").innerHTML = `<span class="ok">Created ${esc(made.name)}.</span>`;
+    $("group-name").value = "";
+    loadGroups(); loadActivity();
+  } catch (e) { $("group-result").innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
+  $("group-btn").disabled = false;
 });
 $("reg-btn").addEventListener("click", () => register(false));
 $("reg-voice-btn").addEventListener("click", () => register(true));

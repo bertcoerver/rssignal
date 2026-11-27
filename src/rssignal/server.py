@@ -694,6 +694,32 @@ class Service:
                 self.note("send", f"to {target}: {_short(message)}", via=via)
         return recipients
 
+    def create_group(self, name: str) -> dict:
+        """Make a group for notifications, with the configured members in it.
+
+        The way to a group that is not a feed's — "Home", for what the house
+        has to say. An account of rssignal's own cannot be handed one: it never
+        accepts an invitation, so a group made on a phone is one it is not in.
+        """
+        name = (name or "").strip()
+        if not name:
+            raise SendRefused("A group needs a name.")
+        self.ensure_daemon()
+        if match_group(self.groups(refresh=True), name) is not None:
+            raise SendRefused(f"There is already a group called {name!r}.")
+        account = get_config().account
+        members = get_members(account)
+        group = signal_cli.create_group(name, members=members)
+        try:
+            # Admins too, where they could be added outright rather than invited.
+            signal_cli.update_group(group.id, admins=members)
+        except SignalError:
+            pass
+        self._groups = None
+        self.note("link", f"created the group {name}")
+        log_line(f"serve: created the group {name!r} with {', '.join(members) or 'nobody else'}")
+        return {"name": group.name, "recipient": group.recipient, "members": list(members)}
+
     # linking
 
     def link(self, device_name: str = "rssignal") -> dict:
@@ -984,6 +1010,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.ACCEPTED, svc.run(dry_run=bool(body.get("dry_run"))).view())
             elif path == "/api/refresh-images":
                 self._json(HTTPStatus.ACCEPTED, svc.refresh_images(dry_run=bool(body.get("dry_run")), force=bool(body.get("force"))).view())
+            elif path == "/api/create-group":
+                self._json(HTTPStatus.CREATED, svc.create_group(str(body.get("name") or "")))
             elif path == "/api/profile":
                 self._json(HTTPStatus.OK, svc.rename(str(body.get("name") or "")))
             elif path == "/api/reinvite":
