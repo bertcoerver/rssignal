@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.4
+
+- Invite members again from the panel, and rename the account there
+
 ## 0.10.3
 
 - Show when Signal holds messages back, and take the captcha that lifts it
