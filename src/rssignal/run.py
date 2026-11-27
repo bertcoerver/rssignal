@@ -352,6 +352,47 @@ def _ensure_members(feeds: list[FeedConfig], resolver: _GroupResolver) -> None:
             )
 
 
+def reinvite_members(config_path: str = "feeds.json") -> int:
+    """Invite again every configured member whose invitation is still open.
+
+    A phone learns it was invited from one message, sent when the invitation is
+    made. If that message never arrives — Signal holds a new account's messages
+    back, and says nothing of it for a group — the invitation sits on the
+    server where nobody can see it, and nothing would ever send it twice. So
+    this withdraws it and makes it again, which sends the message again; and a
+    member who has since written to this account is then simply added, with
+    nothing left to accept.
+
+    Asked for, never automatic: someone who just has not got round to accepting
+    should not be invited again on every run. Only feed groups, only numbers
+    from ``RSSIGNAL_MEMBERS``, only invitations — nobody who is in a group is
+    taken out of it. Returns how many invitations were made again.
+    """
+    feeds = load_feeds(config_path)
+    again = 0
+    with ExitStack() as outer:
+        outer.enter_context(single_run())
+        with signal_daemon():
+            resolver = _GroupResolver()
+            members = get_members(os.environ.get("RSSIGNAL_ACCOUNT", "").strip())
+            for cfg in feeds:
+                group = resolver.find(cfg.name) if cfg.name else None
+                waiting = [m for m in members if group and m in group.invited and m not in group.members]
+                if not waiting:
+                    continue
+                try:
+                    update_group(group.id, uninvite=waiting)
+                    update_group(group.id, members=waiting)
+                except Exception as exc:
+                    print(f"Could not invite {', '.join(waiting)} to {group.name!r} again: {exc}", file=sys.stderr)
+                    log_line(f"members: could not invite {', '.join(waiting)} to {group.name!r} again: {exc}")
+                    continue
+                again += len(waiting)
+                print(f"Invited {', '.join(waiting)} to {group.name!r} again.")
+    log_line(f"members: {again} invitation(s) made again")
+    return again
+
+
 def _refresh_artwork(feeds: list[FeedConfig], resolver: _GroupResolver) -> None:
     """The group picture refresh, which must never fail a run.
 

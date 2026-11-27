@@ -125,6 +125,15 @@
         <div class="actions"><button class="primary" id="verify-btn">Verify</button></div>
       </div>
       <p id="reg-result"></p>
+
+      <hr>
+      <p><b>The name its messages come from.</b> For an account of rssignal's own; emoji are
+        fine. People see the new name once it next writes to them.</p>
+      <div class="row">
+        <input id="name-input" placeholder="📻 rssignal" maxlength="40">
+        <button id="name-btn" style="flex:0 0 auto">Change the name</button>
+      </div>
+      <p id="name-result"></p>
     </section>
 
     <section>
@@ -138,6 +147,7 @@
         <button class="primary" data-run="run">Run now</button>
         <button data-run="dry-run">Dry run</button>
         <button data-run="refresh-images">Refresh group pictures</button>
+        <button data-run="reinvite" title="For members whose group invitations never showed up on their phone">Send invitations again</button>
       </div>
       <p class="muted" id="job-line" style="margin:10px 0 0">No run started from here yet.</p>
       <pre id="job-output" class="hidden"></pre>
@@ -375,8 +385,8 @@ async function watchJob(id) {
 document.querySelectorAll("[data-run]").forEach(button => button.addEventListener("click", async () => {
   const kind = button.dataset.run;
   try {
-    const job = kind === "refresh-images"
-      ? await api("api/refresh-images", {method: "POST", body: {}})
+    const job = kind === "refresh-images" ? await api("api/refresh-images", {method: "POST", body: {}})
+      : kind === "reinvite" ? await api("api/reinvite", {method: "POST", body: {}})
       : await api("api/run", {method: "POST", body: {dry_run: kind === "dry-run"}});
     watchJob(job.id);
   } catch (e) { $("job-line").innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
@@ -409,6 +419,15 @@ $("limit-btn").addEventListener("click", async () => {
     loadStatus(); loadActivity();
   } catch (e) { $("limit-result").innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
   $("limit-btn").disabled = false;
+});
+$("name-btn").addEventListener("click", async () => {
+  $("name-btn").disabled = true;
+  try {
+    const done = await api("api/profile", {method: "POST", body: {name: $("name-input").value}});
+    $("name-result").innerHTML = `<span class="ok">Now called ${esc(done.name)}.</span>`;
+    $("name-input").value = "";
+  } catch (e) { $("name-result").innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
+  $("name-btn").disabled = false;
 });
 $("reg-btn").addEventListener("click", () => register(false));
 $("reg-voice-btn").addEventListener("click", () => register(true));

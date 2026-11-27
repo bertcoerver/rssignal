@@ -617,3 +617,17 @@ def test_there_is_nothing_to_submit_without_a_challenge(monkeypatch):
     monkeypatch.setattr(signal_cli, "rate_limit", None)
     with pytest.raises(ValueError, match="no challenge"):
         signal_cli.submit_challenge("tok", account="+31600000000")
+
+
+def test_a_name_with_emoji_goes_through_the_daemon(monkeypatch):
+    asked = []
+
+    class Daemon:
+        def request(self, method, params=None, timeout=None):
+            asked.append((method, params))
+
+    monkeypatch.setattr(signal_cli, "_daemon", Daemon())
+    signal_cli.set_profile_name("+31600000000", " 📻 Radio ")
+    assert asked == [("updateProfile", {"givenName": "📻 Radio"})]
+    with pytest.raises(ValueError):
+        signal_cli.set_profile_name("+31600000000", "  ")

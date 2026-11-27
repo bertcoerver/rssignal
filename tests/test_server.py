@@ -443,3 +443,15 @@ def test_the_gui_shows_a_rate_limit_and_takes_the_captcha(running, monkeypatch):
     assert _call(base, "/api/challenge", {"captcha": "signalcaptcha://x"})[0] == 200
     assert submitted == ["signalcaptcha://x"]
     assert _call(base, "/api/status")[1]["rate_limit"] is None
+
+
+def test_the_gui_can_rename_the_account(running, monkeypatch):
+    start, _ = running
+    named = []
+    monkeypatch.setattr(server.signal_cli, "set_profile_name", lambda account, name: named.append((account, name)))
+    base, _ = start()
+
+    status, reply = _call(base, "/api/profile", {"name": " 📻 Radio "})
+
+    assert status == 200 and reply == {"name": "📻 Radio"}
+    assert named == [("+31600000000", " 📻 Radio ")]

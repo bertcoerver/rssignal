@@ -73,7 +73,7 @@ from .feeds import (
     load_feeds,
 )
 from .library import library_root, read_feed
-from .run import AlreadyRunning, refresh_group_images, run_feeds
+from .run import AlreadyRunning, refresh_group_images, reinvite_members, run_feeds
 from .signal_cli import (
     GROUP_PREFIX,
     SignalError,
@@ -522,6 +522,14 @@ class Service:
 
         return self.start_job("refresh-images", work)
 
+    def reinvite(self) -> Job:
+        def work() -> str:
+            again = reinvite_members(self.config_path)
+            self._groups = None
+            return f"{again} invitation(s) made again." if again else "No invitation is waiting to be accepted."
+
+        return self.start_job("reinvite", work)
+
     def _schedule_loop(self) -> None:
         log_line(f"serve: scheduled at {', '.join(f'{h:02d}:{m:02d}' for h, m in self.schedule)}")
         while not self._stop.is_set():
@@ -729,6 +737,13 @@ class Service:
             return None
         return {"captcha": bool(limit.get("token")), "to": limit.get("to"), "since": _iso(limit["at"]),
                 "until": _iso(limit["at"] + wait) if wait else None}
+
+    def rename(self, name: str) -> dict:
+        """Change the name the account's messages come from."""
+        signal_cli.set_profile_name(get_config().account, name)
+        self.note("link", f"now called {name.strip()}")
+        log_line(f"serve: profile name set to {name.strip()}")
+        return {"name": name.strip()}
 
     def challenge(self, captcha: str) -> dict:
         """Answer Signal's captcha, so held-back messages go out again."""
@@ -969,6 +984,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.ACCEPTED, svc.run(dry_run=bool(body.get("dry_run"))).view())
             elif path == "/api/refresh-images":
                 self._json(HTTPStatus.ACCEPTED, svc.refresh_images(dry_run=bool(body.get("dry_run"))).view())
+            elif path == "/api/profile":
+                self._json(HTTPStatus.OK, svc.rename(str(body.get("name") or "")))
+            elif path == "/api/reinvite":
+                self._json(HTTPStatus.ACCEPTED, svc.reinvite().view())
             elif path == "/api/link":
                 self._json(HTTPStatus.OK, svc.link())
             elif path == "/api/challenge":

@@ -1511,3 +1511,14 @@ def test_list_groups_reads_who_is_in_a_group_and_who_was_invited(have_binary, mo
     (group,) = list_groups(account="+31600000000")
 
     assert group.members == {"+31600000000"} and group.invited == {"+31611111111"}
+
+
+@pytest.mark.guarded
+def test_only_a_configured_member_can_be_uninvited(guarded):
+    with pytest.raises(signal_cli.RecipientNotAllowed):
+        update_group("MINE=", uninvite=["+31699999999"], account=ME)
+    assert guarded == []
+
+    update_group("MINE=", uninvite=["+31611111111"], account=ME)
+    at = guarded[0].index("--remove-member")
+    assert guarded[0][at + 1] == "+31611111111"

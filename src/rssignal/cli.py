@@ -38,7 +38,7 @@ from .feeds import (
     render_message,
 )
 from .library import LIBRARY_ENV, library_root, read_feed
-from .run import AlreadyRunning, refresh_group_images, run_feeds
+from .run import AlreadyRunning, refresh_group_images, reinvite_members, run_feeds
 from .signal_cli import (
     SignalError,
     create_group,
@@ -140,6 +140,12 @@ def _cmd_verify(args: argparse.Namespace) -> int:
             print(f"No registration lock: whoever gets this number next can take the account. Set one with: signal-cli -a {account} setPin <pin>")
     except SignalError as exc:
         print(f"warning: {exc}", file=sys.stderr)
+    return 0
+
+
+def _cmd_reinvite(args: argparse.Namespace) -> int:
+    again = reinvite_members(args.config)
+    print(f"{again} invitation(s) made again." if again else "No invitation is waiting to be accepted.")
     return 0
 
 
@@ -380,6 +386,12 @@ def _build_parser() -> argparse.ArgumentParser:
     challenge.add_argument("challenge", help="the challenge token from the failed send")
     challenge.add_argument("captcha", help=f"the token from {signal_cli.CHALLENGE_URL}")
     challenge.set_defaults(func=_cmd_challenge)
+
+    reinvite = subparsers.add_parser(
+        "reinvite", help="invite again the members whose group invitations never arrived"
+    )
+    reinvite.add_argument("--config", default="feeds.json", help="path to the feeds config (default: feeds.json)")
+    reinvite.set_defaults(func=_cmd_reinvite)
 
     send = subparsers.add_parser("send", help="send a text message")
     send.add_argument("message", help="the message text to send")

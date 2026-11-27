@@ -287,8 +287,9 @@ def _check_members(members: list[str], account: str) -> None:
     strangers = [m for m in members if m not in get_members(account)]
     if strangers:
         raise RecipientNotAllowed(
-            f"{', '.join(strangers)} cannot be added to a group: only the numbers in "
-            "RSSIGNAL_MEMBERS (the add-on's `members` option) ever are."
+            f"{', '.join(strangers)} cannot be added to a group, or taken out of "
+            "one: rssignal only does that with the numbers in RSSIGNAL_MEMBERS "
+            "(the add-on's `members` option)."
         )
 
 
@@ -1092,6 +1093,7 @@ def update_group(
     avatar: str | None = None,
     expiration: int | None = None,
     members: tuple[str, ...] | list[str] = (),
+    uninvite: tuple[str, ...] | list[str] = (),
     account: str | None = None,
     timeout: float = 120,
 ) -> None:
@@ -1112,6 +1114,10 @@ def update_group(
     that already exists is not rssignal's decision to make. Someone who has
     never exchanged a message with this account is invited rather than added,
     and joins by accepting on their phone.
+
+    ``uninvite`` takes numbers back out, and exists for one thing: withdrawing
+    an invitation that never reached a phone so it can be made again. It is
+    held to the same list as ``members``, so it cannot be turned on anyone else.
     """
     if avatar is not None and not os.path.isfile(avatar):
         raise ValueError(
@@ -1123,11 +1129,11 @@ def update_group(
             f"Message expiry must be a number of seconds, not {expiration!r}. "
             "Use 0 to turn disappearing messages off."
         )
-    members = list(members)
-    if description is None and avatar is None and expiration is None and not members:
+    members, uninvite = list(members), list(uninvite)
+    if description is None and avatar is None and expiration is None and not members and not uninvite:
         return
-    if members:
-        _check_members(members, account or get_config().account)
+    if members or uninvite:
+        _check_members(members + uninvite, account or get_config().account)
 
     if _daemon is not None:
         try:
@@ -1141,6 +1147,8 @@ def update_group(
                     params["expiration"] = int(expiration)
                 if members:
                     params["member"] = members
+                if uninvite:
+                    params["removeMember"] = uninvite
                 _daemon.request("updateGroup", params, timeout=timeout)
             return
         except DaemonGone as exc:
@@ -1164,6 +1172,8 @@ def update_group(
             argv.extend(["--expiration", str(expiration)])
         if members:
             argv.extend(["--member", *members])
+        if uninvite:
+            argv.extend(["--remove-member", *uninvite])
 
         try:
             with timing.step("signal-cli", "updateGroup"):
@@ -1394,7 +1404,20 @@ def set_pin(account: str, pin: str) -> None:
 
 
 def set_profile_name(account: str, name: str) -> None:
-    """Give the account the name people see its messages come from."""
+    """Give the account the name people see its messages come from.
+
+    Anything Signal takes as a name, emoji included. Goes through the daemon
+    when there is one, which holds the account a one-shot could not open.
+    """
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("A name can't be empty.")
+    if _daemon is not None:
+        try:
+            _daemon.request("updateProfile", {"givenName": name}, timeout=60)
+            return
+        except DaemonGone as exc:
+            _retire_daemon(exc)
     _one_shot(account, ["updateProfile", "--given-name", name], what="updateProfile")
 
 

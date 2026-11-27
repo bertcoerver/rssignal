@@ -1988,3 +1988,27 @@ def test_a_member_who_cannot_be_added_is_tried_once_and_reported(monkeypatch, tm
 def test_no_members_means_no_group_is_touched(monkeypatch, tmp_path):
     updates, log = _ensure(monkeypatch, tmp_path, [SignalGroup(id="A=", name="Alone")], members="")
     assert updates == [] and log == ""
+
+
+def test_an_invitation_that_never_arrived_is_withdrawn_and_made_again(monkeypatch, tmp_path):
+    monkeypatch.setenv("RSSIGNAL_ACCOUNT", "+31600000000")
+    monkeypatch.setenv("RSSIGNAL_MEMBERS", "+31611111111")
+    monkeypatch.setenv("RSSIGNAL_LOG", str(tmp_path / "log"))
+    monkeypatch.setenv("RSSIGNAL_LOCK", str(tmp_path / "lock"))
+    groups = [
+        SignalGroup(id="A=", name="Waiting", invited=frozenset({"+31611111111"})),
+        SignalGroup(id="B=", name="Joined", members=frozenset({"+31611111111"})),
+        # Somebody else's open invitation is not rssignal's to touch.
+        SignalGroup(id="C=", name="Stranger", invited=frozenset({"+31699999999"})),
+    ]
+    config = tmp_path / "feeds.json"
+    config.write_text(__import__("json").dumps({"feeds": [{"name": g.name} for g in groups]}))
+    monkeypatch.setattr(run, "receive", lambda: None)
+    monkeypatch.setattr(run, "list_groups", lambda: list(groups))
+    calls = []
+    monkeypatch.setattr(run, "update_group", lambda gid, **k: calls.append((gid, k)))
+
+    assert run.reinvite_members(str(config)) == 1
+
+    assert calls == [("A=", {"uninvite": ["+31611111111"]}), ("A=", {"members": ["+31611111111"]})]
+    assert "1 invitation(s) made again" in (tmp_path / "log").read_text()
