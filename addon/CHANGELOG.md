@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.2
+
+- Add members missing from a feed's group at the start of each run
+
 ## 0.10.1
 
 - Send only to its own groups and to configured members
