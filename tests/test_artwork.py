@@ -128,3 +128,12 @@ def test_dry_run_reports_and_changes_nothing(monkeypatch, own_library, capsys):
     assert f"group image would be updated from {folder / 'cover.jpg'}" in capsys.readouterr().out
     # Nothing remembered either, so the real run still uploads it.
     assert artwork.refresh(_feeds("Pod"), _groups("Pod")) == 1
+
+
+def test_force_uploads_a_picture_that_is_remembered_as_set(monkeypatch, own_library):
+    _shelve(own_library, "Pod", b"pod")
+    updated = _patch_uploads(monkeypatch)
+    artwork.refresh(_feeds("Pod"), _groups("Pod"))
+
+    assert artwork.refresh(_feeds("Pod"), _groups("Pod"), force=True) == 1
+    assert len(updated) == 2

@@ -147,6 +147,7 @@
         <button class="primary" data-run="run">Run now</button>
         <button data-run="dry-run">Dry run</button>
         <button data-run="refresh-images">Refresh group pictures</button>
+        <button data-run="force-images" title="Uploads every group's picture again, also where it was already set. Each group shows a 'changed the group picture' line.">Upload all pictures again</button>
         <button data-run="reinvite" title="For members whose group invitations never showed up on their phone">Send invitations again</button>
       </div>
       <p class="muted" id="job-line" style="margin:10px 0 0">No run started from here yet.</p>
@@ -386,6 +387,7 @@ document.querySelectorAll("[data-run]").forEach(button => button.addEventListene
   const kind = button.dataset.run;
   try {
     const job = kind === "refresh-images" ? await api("api/refresh-images", {method: "POST", body: {}})
+      : kind === "force-images" ? await api("api/refresh-images", {method: "POST", body: {force: true}})
       : kind === "reinvite" ? await api("api/reinvite", {method: "POST", body: {}})
       : await api("api/run", {method: "POST", body: {dry_run: kind === "dry-run"}});
     watchJob(job.id);

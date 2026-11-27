@@ -515,9 +515,9 @@ class Service:
 
         return self.start_job("dry-run" if dry_run else "run", work)
 
-    def refresh_images(self, *, dry_run: bool = False) -> Job:
+    def refresh_images(self, *, dry_run: bool = False, force: bool = False) -> Job:
         def work() -> str:
-            changed = refresh_group_images(self.config_path, dry_run=dry_run)
+            changed = refresh_group_images(self.config_path, dry_run=dry_run, force=force)
             return f"{changed} group picture(s) {'would be ' if dry_run else ''}updated."
 
         return self.start_job("refresh-images", work)
@@ -983,7 +983,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/run":
                 self._json(HTTPStatus.ACCEPTED, svc.run(dry_run=bool(body.get("dry_run"))).view())
             elif path == "/api/refresh-images":
-                self._json(HTTPStatus.ACCEPTED, svc.refresh_images(dry_run=bool(body.get("dry_run"))).view())
+                self._json(HTTPStatus.ACCEPTED, svc.refresh_images(dry_run=bool(body.get("dry_run")), force=bool(body.get("force"))).view())
             elif path == "/api/profile":
                 self._json(HTTPStatus.OK, svc.rename(str(body.get("name") or "")))
             elif path == "/api/reinvite":

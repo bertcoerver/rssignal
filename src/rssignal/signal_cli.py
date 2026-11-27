@@ -287,8 +287,8 @@ def _check_members(members: list[str], account: str) -> None:
     strangers = [m for m in members if m not in get_members(account)]
     if strangers:
         raise RecipientNotAllowed(
-            f"{', '.join(strangers)} cannot be added to a group, or taken out of "
-            "one: rssignal only does that with the numbers in RSSIGNAL_MEMBERS "
+            f"{', '.join(strangers)} cannot be added to a group, made its admin or "
+            "taken out of it: rssignal only does that with the numbers in RSSIGNAL_MEMBERS "
             "(the add-on's `members` option)."
         )
 
@@ -420,6 +420,7 @@ class SignalGroup:
     # members, never shown.
     members: frozenset[str] = frozenset()
     invited: frozenset[str] = frozenset()
+    admins: frozenset[str] = frozenset()
 
     @property
     def recipient(self) -> str:
@@ -713,6 +714,7 @@ def list_groups(*, account: str | None = None) -> list[SignalGroup]:
             description=entry.get("description") or "",
             members=_numbers(entry.get("members")),
             invited=_numbers(entry.get("pendingMembers")),
+            admins=_numbers(entry.get("admins")),
         )
         for entry in raw
         if entry.get("id")
@@ -1094,6 +1096,7 @@ def update_group(
     expiration: int | None = None,
     members: tuple[str, ...] | list[str] = (),
     uninvite: tuple[str, ...] | list[str] = (),
+    admins: tuple[str, ...] | list[str] = (),
     account: str | None = None,
     timeout: float = 120,
 ) -> None:
@@ -1118,6 +1121,10 @@ def update_group(
     ``uninvite`` takes numbers back out, and exists for one thing: withdrawing
     an invitation that never reached a phone so it can be made again. It is
     held to the same list as ``members``, so it cannot be turned on anyone else.
+
+    ``admins`` makes people who are already in the group its admins, and is
+    held to that list as well. A group of rssignal's own has no phone behind
+    it, so without one of its members as admin nobody can manage it at all.
     """
     if avatar is not None and not os.path.isfile(avatar):
         raise ValueError(
@@ -1129,11 +1136,11 @@ def update_group(
             f"Message expiry must be a number of seconds, not {expiration!r}. "
             "Use 0 to turn disappearing messages off."
         )
-    members, uninvite = list(members), list(uninvite)
-    if description is None and avatar is None and expiration is None and not members and not uninvite:
+    members, uninvite, admins = list(members), list(uninvite), list(admins)
+    if description is None and avatar is None and expiration is None and not (members or uninvite or admins):
         return
-    if members or uninvite:
-        _check_members(members + uninvite, account or get_config().account)
+    if members or uninvite or admins:
+        _check_members(members + uninvite + admins, account or get_config().account)
 
     if _daemon is not None:
         try:
@@ -1149,6 +1156,8 @@ def update_group(
                     params["member"] = members
                 if uninvite:
                     params["removeMember"] = uninvite
+                if admins:
+                    params["admin"] = admins
                 _daemon.request("updateGroup", params, timeout=timeout)
             return
         except DaemonGone as exc:
@@ -1174,6 +1183,8 @@ def update_group(
             argv.extend(["--member", *members])
         if uninvite:
             argv.extend(["--remove-member", *uninvite])
+        if admins:
+            argv.extend(["--admin", *admins])
 
         try:
             with timing.step("signal-cli", "updateGroup"):

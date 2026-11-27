@@ -329,7 +329,7 @@ def _cmd_create_group(args: argparse.Namespace) -> int:
 
 def _cmd_refresh_images(args: argparse.Namespace) -> int:
     try:
-        count = refresh_group_images(args.config, dry_run=args.dry_run)
+        count = refresh_group_images(args.config, dry_run=args.dry_run, **({"force": True} if args.force else {}))
     except AlreadyRunning as exc:
         print(f"Nothing to do: {exc}.", file=sys.stderr)
         return 0
@@ -542,6 +542,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="report which groups would get a new picture without changing any",
+    )
+    refresh.add_argument(
+        "--force",
+        action="store_true",
+        help="upload every picture again, including the ones already set",
     )
     refresh.set_defaults(func=_cmd_refresh_images)
 

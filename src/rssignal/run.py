@@ -306,7 +306,8 @@ def _locked_run(
 
 
 def _ensure_members(feeds: list[FeedConfig], resolver: _GroupResolver) -> None:
-    """Add the configured members to any feed group that lacks them.
+    """Add the configured members to any feed group that lacks them, and make
+    those who are in it its admins.
 
     Members are added when a group is created, and that can fail, or the list
     can grow afterwards; either way the group exists and nothing would ever add
@@ -343,8 +344,29 @@ def _ensure_members(feeds: list[FeedConfig], resolver: _GroupResolver) -> None:
 
     for number, count in added.items():
         log_line(f"members: added {number} to {count} group(s)")
+
+    # Admins, once they are in: an invitation cannot be made one. The account
+    # has no phone, so a member is the only one who could ever manage a group
+    # by hand — tidy an invitation, let somebody else in, say something.
+    promoted: dict[str, int] = {}
+    for group in groups:
+        plain = [m for m in members if m in group.members and m not in group.admins]
+        if not plain:
+            continue
+        try:
+            update_group(group.id, admins=plain)
+        except Exception as exc:
+            print(f"Could not make {', '.join(plain)} an admin of {group.name!r}: {exc}", file=sys.stderr)
+            log_line(f"members: could not make {', '.join(plain)} an admin of {group.name!r}: {exc}")
+            break
+        for number in plain:
+            promoted[number] = promoted.get(number, 0) + 1
+    for number, count in promoted.items():
+        log_line(f"members: made {number} an admin of {count} group(s)")
     for number in members:
-        waiting = sum(1 for group in groups if number in group.invited)
+        # Someone in a group is not waiting on it, whatever old invitation
+        # of theirs the group still lists.
+        waiting = sum(1 for group in groups if number in group.invited and number not in group.members)
         if waiting:
             log_line(
                 f"members: {number} has {waiting} group invitation(s) not accepted yet "
@@ -412,7 +434,7 @@ def _refresh_artwork(feeds: list[FeedConfig], resolver: _GroupResolver) -> None:
         log_line(f"group images refreshed: {changed} updated")
 
 
-def refresh_group_images(config_path: str = "feeds.json", *, dry_run: bool = False) -> int:
+def refresh_group_images(config_path: str = "feeds.json", *, dry_run: bool = False, force: bool = False) -> int:
     """Bring every feed group's picture in line with the library, now.
 
     What a run does on its own after sending, on demand. Returns how many groups
@@ -427,7 +449,7 @@ def refresh_group_images(config_path: str = "feeds.json", *, dry_run: bool = Fal
             outer.enter_context(single_run())
         with signal_daemon():
             resolver = _GroupResolver()
-            changed = artwork.refresh(feeds, resolver.groups(), dry_run=dry_run)
+            changed = artwork.refresh(feeds, resolver.groups(), dry_run=dry_run, force=force)
     cache.save()
     return changed
 

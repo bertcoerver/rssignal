@@ -214,7 +214,8 @@ Home Assistant's Signal Messenger integration:
 
 Anything else is refused, with an error naming it, before a message leaves; a
 list of recipients with one such number in it sends to none of them. Likewise
-nobody outside `members` is ever added to a group. So a mistyped number in an
+nobody outside `members` is ever added to a group. The members themselves are
+made admins of the feed groups, so somebody with a phone can manage them. So a mistyped number in an
 automation, or something on Home Assistant's network holding the API token,
 cannot make this account message a stranger. With `members` empty, rssignal
 sends to its groups and nowhere else.

@@ -1965,6 +1965,8 @@ def test_members_missing_from_a_feed_group_are_added(monkeypatch, tmp_path):
         SignalGroup(id="A=", name="Alone"),
         SignalGroup(id="B=", name="Has them", members=frozenset({"+31611111111"})),
         SignalGroup(id="C=", name="Asked already", invited=frozenset({"+31611111111"})),
+        # In it, with a stale invitation still listed: not waiting on anything.
+        SignalGroup(id="D=", name="Both", members=frozenset({"+31611111111"}), invited=frozenset({"+31611111111"})),
     ]
 
     updates, log = _ensure(monkeypatch, tmp_path, groups)
@@ -2012,3 +2014,23 @@ def test_an_invitation_that_never_arrived_is_withdrawn_and_made_again(monkeypatc
 
     assert calls == [("A=", {"uninvite": ["+31611111111"]}), ("A=", {"members": ["+31611111111"]})]
     assert "1 invitation(s) made again" in (tmp_path / "log").read_text()
+
+
+def test_members_in_a_group_are_made_its_admins(monkeypatch, tmp_path):
+    monkeypatch.setenv("RSSIGNAL_ACCOUNT", "+31600000000")
+    monkeypatch.setenv("RSSIGNAL_MEMBERS", "+31611111111")
+    monkeypatch.setenv("RSSIGNAL_LOG", str(tmp_path / "log"))
+    me = frozenset({"+31611111111"})
+    groups = [
+        SignalGroup(id="A=", name="Plain member", members=me),
+        SignalGroup(id="B=", name="Admin already", members=me, admins=me),
+        # An invitation cannot be made an admin; that waits until it is accepted.
+        SignalGroup(id="C=", name="Only invited", invited=me),
+    ]
+    calls = []
+    monkeypatch.setattr(run, "update_group", lambda gid, **k: calls.append((gid, k)))
+
+    run._ensure_members([FeedConfig(source="https://a", name=g.name) for g in groups], _Found(groups))
+
+    assert calls == [("A=", {"admins": ["+31611111111"]})]
+    assert "made +31611111111 an admin of 1 group(s)" in (tmp_path / "log").read_text()

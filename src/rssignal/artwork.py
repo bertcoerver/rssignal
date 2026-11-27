@@ -36,7 +36,7 @@ _AVATAR_NS = "group-avatar"
 
 
 def refresh(
-    feeds: list[FeedConfig], groups: list[SignalGroup], *, dry_run: bool = False
+    feeds: list[FeedConfig], groups: list[SignalGroup], *, dry_run: bool = False, force: bool = False
 ) -> int:
     """Put each feed's artwork from the library on its group. Returns how many changed.
 
@@ -45,6 +45,10 @@ def refresh(
     stray empty group that rule exists to prevent. A feed with no artwork in
     the library leaves its group's picture alone rather than clearing it, and
     so does a feed with ``refresh_image`` turned off.
+
+    ``force`` uploads every picture whether or not it is the one remembered as
+    being there. For a group whose picture did not land, or does not show: what
+    is remembered is what was sent, which is not always what arrived.
 
     Each feed is its own attempt. One whose picture won't upload is reported and
     skipped, and the rest carry on — a picture is decoration, and nothing about
@@ -59,7 +63,7 @@ def refresh(
             group = match_group(groups, cfg.name)
             if group is None:
                 continue
-            changed += _refresh_one(cfg, group, label, dry_run=dry_run)
+            changed += _refresh_one(cfg, group, label, dry_run=dry_run, force=force)
         except Exception as exc:
             print(f"[{label}] group image not refreshed: {exc}", file=sys.stderr)
             log_line(f"[{label}] group image not refreshed: {exc}")
@@ -67,7 +71,7 @@ def refresh(
 
 
 def _refresh_one(
-    cfg: FeedConfig, group: SignalGroup, label: str, *, dry_run: bool
+    cfg: FeedConfig, group: SignalGroup, label: str, *, dry_run: bool, force: bool = False
 ) -> bool:
     """Refresh one group's picture. Whether it changed (or, dry, would have)."""
     path = feed_image(cfg)
@@ -75,7 +79,7 @@ def _refresh_one(
         return False
 
     digest = _digest(path)
-    if cache.get(_AVATAR_NS, group.id) == digest:
+    if not force and cache.get(_AVATAR_NS, group.id) == digest:
         return False
     if dry_run:
         print(f"[{label}] group image would be updated from {path}")
