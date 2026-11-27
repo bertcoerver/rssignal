@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.6
+
+- Create a group for notifications from the panel
+
 ## 0.10.5
 
 - Make members admins of feed groups, and upload pictures again on request
