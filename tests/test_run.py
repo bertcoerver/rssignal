@@ -1929,3 +1929,62 @@ def test_a_dry_run_describes_a_posts_messages(monkeypatch, capsys):
     assert sends == []
     assert "Journée pHARe (2 message(s))" in out
     assert "[2 file(s)]" in out
+
+
+# --- members of groups that already exist ----------------------------------
+
+
+class _Found:
+    def __init__(self, groups):
+        self._groups = {g.name: g for g in groups}
+
+    def find(self, name):
+        return self._groups.get(name)
+
+
+def _ensure(monkeypatch, tmp_path, groups, *, members="+31611111111", fail=False):
+    monkeypatch.setenv("RSSIGNAL_ACCOUNT", "+31600000000")
+    monkeypatch.setenv("RSSIGNAL_MEMBERS", members)
+    monkeypatch.setenv("RSSIGNAL_LOG", str(tmp_path / "log"))
+    updates = []
+
+    def fake_update_group(group_id, *, members=()):
+        updates.append((group_id, list(members)))
+        if fail:
+            raise run.SignalError("Unregistered user")
+
+    monkeypatch.setattr(run, "update_group", fake_update_group)
+    feeds = [FeedConfig(source="https://a", name=g.name) for g in groups] + [FeedConfig(source="https://b", name="No group yet")]
+    run._ensure_members(feeds, _Found(groups))
+    log = (tmp_path / "log").read_text() if (tmp_path / "log").exists() else ""
+    return updates, log
+
+
+def test_members_missing_from_a_feed_group_are_added(monkeypatch, tmp_path):
+    groups = [
+        SignalGroup(id="A=", name="Alone"),
+        SignalGroup(id="B=", name="Has them", members=frozenset({"+31611111111"})),
+        SignalGroup(id="C=", name="Asked already", invited=frozenset({"+31611111111"})),
+    ]
+
+    updates, log = _ensure(monkeypatch, tmp_path, groups)
+
+    assert updates == [("A=", ["+31611111111"])]
+    assert "added +31611111111 to 1 group(s)" in log
+    # The other way a phone stays silent, said where someone will look.
+    assert "1 group invitation(s) not accepted yet" in log
+
+
+def test_a_member_who_cannot_be_added_is_tried_once_and_reported(monkeypatch, tmp_path, capsys):
+    groups = [SignalGroup(id="A=", name="One"), SignalGroup(id="B=", name="Two")]
+
+    updates, log = _ensure(monkeypatch, tmp_path, groups, fail=True)
+
+    assert len(updates) == 1
+    assert "could not add +31611111111 to 'One': Unregistered user" in log
+    assert "Could not add" in capsys.readouterr().err
+
+
+def test_no_members_means_no_group_is_touched(monkeypatch, tmp_path):
+    updates, log = _ensure(monkeypatch, tmp_path, [SignalGroup(id="A=", name="Alone")], members="")
+    assert updates == [] and log == ""

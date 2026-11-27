@@ -275,6 +275,10 @@ def _locked_run(
     log_line(f"run started{kind}: {len(feeds)} feed(s)")
     try:
         with signal_daemon():
+            # Before sending, so whoever was missing from a group is there for
+            # what this run sends to it.
+            if not dry_run and to is None:
+                _ensure_members(feeds, resolver)
             sent = _run_prepared(
                 feeds, resolver, dry_run=dry_run, to=to, since=since
             )
@@ -299,6 +303,53 @@ def _locked_run(
         f"{_sleep_note(started, started_wall, sent)}"
     )
     return sent
+
+
+def _ensure_members(feeds: list[FeedConfig], resolver: _GroupResolver) -> None:
+    """Add the configured members to any feed group that lacks them.
+
+    Members are added when a group is created, and that can fail, or the list
+    can grow afterwards; either way the group exists and nothing would ever add
+    them again. Only groups named by a feed are touched, only numbers from
+    ``RSSIGNAL_MEMBERS`` are added, and nobody is ever removed. Someone invited
+    who has not accepted counts as there: asking twice changes nothing.
+
+    Says what it found in the log, because "I got no messages" has two causes
+    that look alike from the phone — never added, or invited and not accepted.
+    """
+    try:
+        members = get_members(os.environ.get("RSSIGNAL_ACCOUNT", "").strip())
+        if not members:
+            return
+        groups = [g for g in (resolver.find(cfg.name) for cfg in feeds if cfg.name) if g is not None]
+    except Exception as exc:  # a run is not given up on for this
+        log_line(f"members: could not check the groups: {exc}")
+        return
+
+    added: dict[str, int] = {}
+    for group in groups:
+        missing = [m for m in members if m not in group.members and m not in group.invited]
+        if not missing:
+            continue
+        try:
+            update_group(group.id, members=missing)
+        except Exception as exc:
+            # The next group would fail the same way: it is the same number.
+            print(f"Could not add {', '.join(missing)} to {group.name!r}: {exc}", file=sys.stderr)
+            log_line(f"members: could not add {', '.join(missing)} to {group.name!r}: {exc}")
+            break
+        for number in missing:
+            added[number] = added.get(number, 0) + 1
+
+    for number, count in added.items():
+        log_line(f"members: added {number} to {count} group(s)")
+    for number in members:
+        waiting = sum(1 for group in groups if number in group.invited)
+        if waiting:
+            log_line(
+                f"members: {number} has {waiting} group invitation(s) not accepted yet "
+                "- look under message requests in Signal"
+            )
 
 
 def _refresh_artwork(feeds: list[FeedConfig], resolver: _GroupResolver) -> None:

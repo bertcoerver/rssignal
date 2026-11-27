@@ -1498,3 +1498,16 @@ def test_create_group_cannot_add_a_stranger_either(guarded, monkeypatch, capsys)
 
     assert not any("--member" in argv for argv in guarded)
     assert "cannot be added" in capsys.readouterr().err
+
+
+def test_list_groups_reads_who_is_in_a_group_and_who_was_invited(have_binary, monkeypatch):
+    listing = [{
+        "id": "A=", "name": "Feed", "isMember": True,
+        "members": [{"number": "+31600000000", "uuid": "u1"}, {"number": None, "uuid": "u2"}],
+        "pendingMembers": [{"number": "+31611111111", "uuid": "u3"}],
+    }]
+    monkeypatch.setattr(signal_cli.subprocess, "run", lambda *a, **k: _completed(stdout=json.dumps(listing)))
+
+    (group,) = list_groups(account="+31600000000")
+
+    assert group.members == {"+31600000000"} and group.invited == {"+31611111111"}

@@ -414,6 +414,11 @@ class SignalGroup:
     active: bool = True
     blocked: bool = False
     description: str = ""
+    # Numbers in the group, and numbers invited to it who have not accepted.
+    # Only what signal-cli knows a number for; compared against the configured
+    # members, never shown.
+    members: frozenset[str] = frozenset()
+    invited: frozenset[str] = frozenset()
 
     @property
     def recipient(self) -> str:
@@ -702,10 +707,21 @@ def list_groups(*, account: str | None = None) -> list[SignalGroup]:
             active=bool(entry.get("isMember", True)),
             blocked=bool(entry.get("isBlocked", False)),
             description=entry.get("description") or "",
+            members=_numbers(entry.get("members")),
+            invited=_numbers(entry.get("pendingMembers")),
         )
         for entry in raw
         if entry.get("id")
     ]
+
+
+def _numbers(people) -> frozenset[str]:
+    """The phone numbers in one of listGroups' lists of people."""
+    return frozenset(
+        person["number"]
+        for person in people or ()
+        if isinstance(person, dict) and person.get("number")
+    )
 
 
 def match_group(groups: list[SignalGroup], name: str) -> SignalGroup | None:
